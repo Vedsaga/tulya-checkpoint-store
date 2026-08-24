@@ -55,8 +55,8 @@
 
   <rect class="background" width="1040" height="470" rx="12" />
 
-  <text class="title" x="520" y="30" text-anchor="middle">One history, two retries</text>
-  <text class="note" x="520" y="54" text-anchor="middle">Illustrative logical model: an 800-message checkpoint forks into +3 and +4 message branches</text>
+  <text class="title" x="520" y="30" text-anchor="middle">Best-fit shape: append, then fork</text>
+  <text class="note" x="520" y="54" text-anchor="middle">Illustrative pattern—not the benchmark corpus</text>
   <line class="divider" x1="520" y1="78" x2="520" y2="445" />
 
   <text class="heading" x="260" y="96" text-anchor="middle">Repeated full snapshots</text>

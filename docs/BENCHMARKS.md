@@ -5,6 +5,49 @@ natural branch-history workload, it occupied less reopened storage than the
 tested checkpoint backends while reconstructing every historical checkpoint
 exactly.
 
+## Exact workload contract
+
+The headline result uses only a frozen evaluation subset of
+[`nebius/SWE-rebench-openhands-trajectories`](https://huggingface.co/datasets/nebius/SWE-rebench-openhands-trajectories/commit/35455389ab51bf5e2306bfd436ef72d0f98bf882),
+not arbitrary application state and not the entire source dataset.
+
+```text
+source revision:
+35455389ab51bf5e2306bfd436ef72d0f98bf882
+
+frozen evaluation SHA-256:
+a931c659530c083933b7da5fd886bcee0068c8c8df3ce57f6aea43fae18df12e
+```
+
+Each source row is a complete OpenHands attempt to resolve a software issue.
+The freezer preserves normalized system, user, assistant/tool-call, and tool
+messages. Every next message becomes one checkpoint whose only operation is
+`append_message` against the exact parent history.
+
+| Workload property | Value |
+| --- | ---: |
+| Software-task instances | 8 |
+| Independent attempts | 91 |
+| Observed checkpoints | 11,549 |
+| Unique checkpoint nodes | 11,383 |
+| Messages per attempt | 123 median; 197 p95; 77–201 range |
+| Appended-message JSON | 529 B median; 6,018 B p95 |
+| Resulting cumulative state | 112,204 B median; 257,973 B p95 |
+| Append / resulting-state size | 0.71% median; 8.26% p95 |
+| Sum of unique full-snapshot states | 1,382,359,956 logical bytes |
+| Reused exact-prefix observations | 166 |
+
+This is a favorable shape for persistent sequences: the parent is usually
+large and the next operation is relatively small. Cross-attempt reuse existed,
+but it was modest; the result was not produced by a corpus of mostly identical
+branches.
+
+The exact machine-readable shape and definitions are in
+[`benchmarks/evidence/evaluation_workload_shape.json`](../benchmarks/evidence/evaluation_workload_shape.json).
+No published ratio should be transferred to arbitrary blobs, in-place state
+replacement, approximate similarity, compressed/encrypted state, or a
+different checkpoint geometry without a new same-work measurement.
+
 ## Published result
 
 The frozen OpenHands evaluation contains 11,383 unique checkpoints from a
@@ -97,12 +140,16 @@ one-fsync-per-checkpoint ingestion without labeling the difference.
 
 ## Dataset availability
 
-The pinned datasets are public but are not bundled into the crate:
+The headline claim uses this source only:
+
+- [`nebius/SWE-rebench-openhands-trajectories`](https://huggingface.co/datasets/nebius/SWE-rebench-openhands-trajectories)
+  at `35455389ab51bf5e2306bfd436ef72d0f98bf882` (about 2.08 GB).
+
+The runner can also freeze a separate SWE-agent source for engineering
+comparisons, but results from that source are not the 12.38x headline claim:
 
 - `nebius/SWE-agent-trajectories` at
   `a8a64e57e7bd7ccbd1add6c4f8637c5d3834570b` (about 1.1 GB);
-- `nebius/SWE-rebench-openhands-trajectories` at
-  `35455389ab51bf5e2306bfd436ef72d0f98bf882` (about 2.08 GB).
 
 Download and hash them with:
 

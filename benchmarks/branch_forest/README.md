@@ -5,6 +5,12 @@ It consumes a natural repeated-attempt coding-agent corpus, preserves its exact
 branch DAG, performs one durable transaction per checkpoint, reopens every
 backend, and reconstructs every historical state before reporting measurements.
 
+The frozen benchmark is not arbitrary state. It canonicalizes an ordered
+OpenHands `messages` history, then creates exactly one `append_message`
+operation per checkpoint. The published ratios apply to that append-only state
+shape. They do not predict storage for opaque full-state blobs or in-place
+replacement.
+
 It uses one benchmark contract, `TULYA_BRANCH_FOREST_BENCHMARK_V1`, and the
 released Tulya checkpoint format. The Tulya arm uses only the crate's
 normal public API; it does not encode private WAL transactions.

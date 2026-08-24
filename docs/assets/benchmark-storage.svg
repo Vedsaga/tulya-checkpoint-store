@@ -43,7 +43,7 @@
   <rect class="background" width="1040" height="500" rx="12" />
 
   <text class="title" x="520" y="30" text-anchor="middle">Marginal reopened storage</text>
-  <text class="subtitle" x="520" y="54" text-anchor="middle">11,383 OpenHands agent checkpoints · exact reconstruction in every arm</text>
+  <text class="subtitle" x="520" y="54" text-anchor="middle">11,383 unique nodes · append-only OpenHands subset @ 35455389 · exact in every arm</text>
 
   <line class="grid" x1="330" y1="82" x2="330" y2="424" />
   <line class="grid" x1="477" y1="82" x2="477" y2="424" />
@@ -81,6 +81,6 @@
   <text class="value" x="844" y="392">68.00 MB</text>
   <text class="ratio" x="990" y="392" text-anchor="end">12.38×</text>
 
-  <text class="footnote" x="20" y="458">Clean public-API reproduction on the pinned evaluation corpus; allocated bytes after reopen.</text>
+  <text class="footnote" x="20" y="458">Clean public-API reproduction of frozen corpus a931c659…; allocated bytes after reopen.</text>
   <text class="footnote" x="20" y="480">Packed Git was the closest storage comparator and did not fsync one transaction per checkpoint.</text>
 </svg>

@@ -1,0 +1,104 @@
+{
+  "evidence_schema": 1,
+  "claim_id": "TULYA-BF-OH-EVAL-R1",
+  "claim_bearing": false,
+  "purpose": "Describe the exact state shape behind the published benchmark so its ratios are not generalized to arbitrary state.",
+  "source": {
+    "dataset_id": "nebius/SWE-rebench-openhands-trajectories",
+    "dataset_url": "https://huggingface.co/datasets/nebius/SWE-rebench-openhands-trajectories",
+    "source_revision": "35455389ab51bf5e2306bfd436ef72d0f98bf882",
+    "source_row_count": 67074,
+    "frozen_partition": "evaluation",
+    "frozen_evaluation_sha256": "a931c659530c083933b7da5fd886bcee0068c8c8df3ce57f6aea43fae18df12e",
+    "frozen_evaluation_size_bytes": 24540161,
+    "selection_seed": "real-world-repeated-attempt-branch-forest-r0-v1",
+    "minimum_attempts_per_selected_instance": 4
+  },
+  "checkpoint_semantics": {
+    "state_schema": "canonical JSON object with one ordered messages array",
+    "transition": "exactly one append_message operation per checkpoint node",
+    "normalized_source_fields": {
+      "assistant": [
+        "role",
+        "content",
+        "tool_calls"
+      ],
+      "tool": [
+        "role",
+        "content",
+        "name",
+        "tool_call_id"
+      ],
+      "other_roles": [
+        "role",
+        "content"
+      ]
+    },
+    "shared_node_rule": "parent checkpoint identity and appended message SHA-256 must both match exactly",
+    "approximate_similarity_used": false,
+    "arbitrary_blob_diffing_used": false,
+    "in_place_state_mutation_used": false
+  },
+  "geometry": {
+    "software_task_instance_count": 8,
+    "attempt_count": 91,
+    "attempts_per_instance": {
+      "min": 6,
+      "p50": 11,
+      "max": 23,
+      "values": [
+        6,
+        7,
+        8,
+        8,
+        11,
+        11,
+        17,
+        23
+      ]
+    },
+    "root_count": 8,
+    "observed_checkpoint_count": 11549,
+    "unique_checkpoint_node_count": 11383,
+    "reused_exact_prefix_observations": 166,
+    "messages_per_attempt": {
+      "min": 77,
+      "p50": 123,
+      "p95": 197,
+      "max": 201
+    },
+    "appended_message_json_bytes": {
+      "min": 136,
+      "p50": 529,
+      "p95": 6018,
+      "p99": 21366,
+      "max": 32175,
+      "sum": 19389426
+    },
+    "resulting_cumulative_state_bytes": {
+      "min": 11754,
+      "p50": 112204,
+      "p95": 257973,
+      "p99": 327260,
+      "max": 509897
+    },
+    "appended_message_percent_of_resulting_state": {
+      "p50": 0.7121810800168371,
+      "p95": 8.264558874811112,
+      "p99": 23.77721974438739
+    },
+    "sum_of_unique_full_snapshot_state_bytes": 1382359956
+  },
+  "derivation": {
+    "input": "the frozen evaluation JSONL identified by frozen_evaluation_sha256",
+    "percentile_index": "round(p * (count - 1)) after ascending sort, matching benchmarks/branch_forest/profile_source.py",
+    "appended_message_bytes": "root logical_state_len minus the empty messages wrapper; otherwise child logical_state_len minus parent logical_state_len minus one comma byte",
+    "resulting_state_bytes": "the logical_state_len stored and independently verified for each unique checkpoint node"
+  },
+  "interpretation": [
+    "The benchmark exercises long append-only persistent sequences whose child state is an exact parent plus one message.",
+    "The median appended message is less than one percent of the resulting cumulative state.",
+    "Only 166 observed checkpoints reused an exact node across attempts, so the result is not dominated by broad cross-attempt deduplication.",
+    "The result does not predict storage for arbitrary full-state blobs, compressed or encrypted snapshots, approximate similarity, or in-place mutation."
+  ]
+}
