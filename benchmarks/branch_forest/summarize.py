@@ -29,6 +29,7 @@ def nested(value: dict[str, Any], *keys: str) -> Any:
 
 def arm_record(arm: dict[str, Any]) -> dict[str, Any]:
     result = arm.get("result", {})
+    exactness = result.get("exactness", {})
     total = nested(result, "storage", "reopened", "allocated_bytes")
     empty = nested(result, "storage", "empty", "allocated_bytes")
     marginal = None
@@ -56,6 +57,17 @@ def arm_record(arm: dict[str, Any]) -> dict[str, Any]:
             "read_latency",
             "p50_ns",
         ),
+        "exactness": {
+            state: {
+                "checkpoint_count": record.get("checkpoint_count"),
+                "exact": record.get("exact"),
+                "state_failures": record.get("state_failures", 0),
+                "internal_failures": record.get("internal_failures", 0),
+                "metadata_failures": record.get("metadata_failures", 0),
+            }
+            for state, record in sorted(exactness.items())
+            if isinstance(record, dict) and "exact" in record
+        },
         "claims": result.get("claims"),
     }
 

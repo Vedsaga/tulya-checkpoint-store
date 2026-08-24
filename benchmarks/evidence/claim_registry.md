@@ -1,6 +1,6 @@
 # Branch-forest claim registry r1
 
-Date: 2026-08-23
+Date: 2026-08-24
 
 This is the public-claim firewall for the first Tulya wedge.
 
@@ -32,6 +32,7 @@ Primary evidence:
 | claim ID | safe statement | state |
 |---|---|---|
 | `TULYA-BF-TWO-FAMILY-R1` | Zero reconstruction failures across the complete ten-arm SWE-agent and OpenHands engineering matrices. | measured |
+| `TULYA-BF-POST-REFACTOR-R1` | At clean commit `55f26a0`, the standalone public API passed the current nine-arm matrix on both engineering corpora: 4,070 SWE-agent checkpoints and 7,573 OpenHands checkpoints, exact after reopen in every arm and exact in Tulya's hot, sealed, and reopened states. Reserved holdouts were not accessed. | measured regression evidence |
 | `TULYA-CRASH-PROCESS-R2` | Current production store body passed 32 forced process-exit cases across two seal generations, plus append after reclaim/reopen. | measured |
 | `TULYA-PACKAGE-R1` | Root Cargo package is self-contained after separating two private Kramanvaya research binaries; `cargo package --locked --no-default-features` passes. | measured |
 | `TULYA-SHADOW-R0` | A real LangGraph `StateGraph` with SQLite authoritative can shadow a root and two siblings into Tulya, verify, seal and verify again. | integration smoke |
@@ -71,3 +72,10 @@ The honest sentence is:
 > retained-storage and historical-read point than the tested agent-framework
 > and custom delta baselines. We are seeking design partners to measure whether
 > that frontier removes real retained-state or replay cost.
+
+The compact post-refactor regression records are
+`post_refactor_swe_engineering_55f26a0.json` and
+`post_refactor_openhands_engineering_55f26a0.json`. They bind the results to
+the source commit, input hashes, raw-summary hashes, environment, arm outcomes,
+and reconstruction states. They are same-machine engineering reruns, not an
+independent evaluation or authorization to widen the published economic claim.

@@ -1,0 +1,388 @@
+{
+  "arms": {
+    "cas_delta": {
+      "attempt_ref_count": 147,
+      "backend": "sqlite-cas-delta",
+      "checkpoint_node_count": 4070,
+      "claims": {
+        "holdout_accessed": false,
+        "performance_claim": false,
+        "storage_advantage_claim": false
+      },
+      "durable_append_p50_ns": 692252,
+      "exactness": {
+        "active": {
+          "checkpoint_count": 4070,
+          "exact": true,
+          "internal_failures": 0,
+          "metadata_failures": 0,
+          "state_failures": 0
+        },
+        "reopened": {
+          "checkpoint_count": 4070,
+          "exact": true,
+          "internal_failures": 0,
+          "metadata_failures": 0,
+          "state_failures": 0
+        }
+      },
+      "marginal_reopened_allocated_bytes": 5738496,
+      "pass": true,
+      "peak_rss_bytes": 47517696,
+      "reopened_read_p50_ns": 269715,
+      "returncode": 0,
+      "wall_elapsed_ns": 5967438094
+    },
+    "git": {
+      "attempt_ref_count": 147,
+      "backend": "git-full-snapshot-aggressive-pack",
+      "checkpoint_node_count": 4070,
+      "claims": {
+        "durable_append_claim": false,
+        "holdout_accessed": false,
+        "performance_claim": false,
+        "storage_advantage_claim": false
+      },
+      "durable_append_p50_ns": null,
+      "exactness": {
+        "active": {
+          "checkpoint_count": 4070,
+          "exact": true,
+          "internal_failures": 0,
+          "metadata_failures": 0,
+          "state_failures": 0
+        },
+        "reopened_after_aggressive_pack": {
+          "checkpoint_count": 4070,
+          "exact": true,
+          "internal_failures": 0,
+          "metadata_failures": 0,
+          "state_failures": 0
+        }
+      },
+      "marginal_reopened_allocated_bytes": 3153920,
+      "pass": true,
+      "peak_rss_bytes": 43642880,
+      "reopened_read_p50_ns": 28340,
+      "returncode": 0,
+      "wall_elapsed_ns": 6972703401
+    },
+    "langgraph_delta": {
+      "attempt_ref_count": 147,
+      "backend": "langgraph-sqlite-delta",
+      "checkpoint_node_count": 4070,
+      "claims": {
+        "holdout_accessed": false,
+        "performance_claim": false,
+        "storage_advantage_claim": false
+      },
+      "durable_append_p50_ns": 4341158,
+      "exactness": {
+        "active": {
+          "checkpoint_count": 4070,
+          "exact": true,
+          "internal_failures": 0,
+          "metadata_failures": 0,
+          "state_failures": 0
+        },
+        "reopened": {
+          "checkpoint_count": 4070,
+          "exact": true,
+          "internal_failures": 0,
+          "metadata_failures": 0,
+          "state_failures": 0
+        }
+      },
+      "marginal_reopened_allocated_bytes": 19664896,
+      "pass": true,
+      "peak_rss_bytes": 113098752,
+      "reopened_read_p50_ns": 1795830,
+      "returncode": 0,
+      "wall_elapsed_ns": 48299793626
+    },
+    "langgraph_full": {
+      "attempt_ref_count": 147,
+      "backend": "langgraph-sqlite-full",
+      "checkpoint_node_count": 4070,
+      "claims": {
+        "holdout_accessed": false,
+        "performance_claim": false,
+        "storage_advantage_claim": false
+      },
+      "durable_append_p50_ns": 3098602,
+      "exactness": {
+        "active": {
+          "checkpoint_count": 4070,
+          "exact": true,
+          "internal_failures": 0,
+          "metadata_failures": 0,
+          "state_failures": 0
+        },
+        "reopened": {
+          "checkpoint_count": 4070,
+          "exact": true,
+          "internal_failures": 0,
+          "metadata_failures": 0,
+          "state_failures": 0
+        }
+      },
+      "marginal_reopened_allocated_bytes": 286785536,
+      "pass": true,
+      "peak_rss_bytes": 111828992,
+      "reopened_read_p50_ns": 247106,
+      "returncode": 0,
+      "wall_elapsed_ns": 18729730938
+    },
+    "postgres_full": {
+      "attempt_ref_count": 147,
+      "backend": "langgraph-postgres-full",
+      "checkpoint_node_count": 4070,
+      "claims": {
+        "holdout_accessed": false,
+        "performance_claim": false,
+        "storage_advantage_claim": false
+      },
+      "durable_append_p50_ns": 4122922,
+      "exactness": {
+        "active": {
+          "checkpoint_count": 4070,
+          "exact": true,
+          "internal_failures": 0,
+          "metadata_failures": 0,
+          "state_failures": 0
+        },
+        "reopened": {
+          "checkpoint_count": 4070,
+          "exact": true,
+          "internal_failures": 0,
+          "metadata_failures": 0,
+          "state_failures": 0
+        }
+      },
+      "marginal_reopened_allocated_bytes": 68157440,
+      "pass": true,
+      "peak_rss_bytes": 419332096,
+      "reopened_read_p50_ns": 942054,
+      "returncode": 0,
+      "wall_elapsed_ns": 41078518726
+    },
+    "snapshot_raw": {
+      "attempt_ref_count": 147,
+      "backend": "sqlite-snapshot-raw",
+      "checkpoint_node_count": 4070,
+      "claims": {
+        "holdout_accessed": false,
+        "performance_claim": false,
+        "storage_advantage_claim": false
+      },
+      "durable_append_p50_ns": 958399,
+      "exactness": {
+        "active": {
+          "checkpoint_count": 4070,
+          "exact": true,
+          "internal_failures": 0,
+          "metadata_failures": 0,
+          "state_failures": 0
+        },
+        "reopened": {
+          "checkpoint_count": 4070,
+          "exact": true,
+          "internal_failures": 0,
+          "metadata_failures": 0,
+          "state_failures": 0
+        }
+      },
+      "marginal_reopened_allocated_bytes": 143175680,
+      "pass": true,
+      "peak_rss_bytes": 47484928,
+      "reopened_read_p50_ns": 104799,
+      "returncode": 0,
+      "wall_elapsed_ns": 5912758607
+    },
+    "snapshot_zstd": {
+      "attempt_ref_count": 147,
+      "backend": "sqlite-snapshot-zstd",
+      "checkpoint_node_count": 4070,
+      "claims": {
+        "holdout_accessed": false,
+        "performance_claim": false,
+        "storage_advantage_claim": false
+      },
+      "durable_append_p50_ns": 899610,
+      "exactness": {
+        "active": {
+          "checkpoint_count": 4070,
+          "exact": true,
+          "internal_failures": 0,
+          "metadata_failures": 0,
+          "state_failures": 0
+        },
+        "reopened": {
+          "checkpoint_count": 4070,
+          "exact": true,
+          "internal_failures": 0,
+          "metadata_failures": 0,
+          "state_failures": 0
+        }
+      },
+      "marginal_reopened_allocated_bytes": 35573760,
+      "pass": true,
+      "peak_rss_bytes": 47607808,
+      "reopened_read_p50_ns": 47076,
+      "returncode": 0,
+      "wall_elapsed_ns": 4630249769
+    },
+    "sqlite": {
+      "attempt_ref_count": 147,
+      "backend": "sqlite-normalized-parent-operation",
+      "checkpoint_node_count": 4070,
+      "claims": {
+        "holdout_accessed": false,
+        "performance_claim": false,
+        "storage_advantage_claim": false
+      },
+      "durable_append_p50_ns": 668223,
+      "exactness": {
+        "active": {
+          "checkpoint_count": 4070,
+          "exact": true,
+          "internal_failures": 0,
+          "metadata_failures": 0,
+          "state_failures": 0
+        },
+        "reopened": {
+          "checkpoint_count": 4070,
+          "exact": true,
+          "internal_failures": 0,
+          "metadata_failures": 0,
+          "state_failures": 0
+        }
+      },
+      "marginal_reopened_allocated_bytes": 9633792,
+      "pass": true,
+      "peak_rss_bytes": 21700608,
+      "reopened_read_p50_ns": 176053,
+      "returncode": 0,
+      "wall_elapsed_ns": 4896858602
+    },
+    "tulya": {
+      "attempt_ref_count": 147,
+      "backend": "production-tulya-checkpoint-store",
+      "checkpoint_node_count": 4070,
+      "claims": {
+        "holdout_accessed": false,
+        "performance_claim": false,
+        "power_loss_claim": false,
+        "process_crash_claim": false,
+        "storage_advantage_claim": false
+      },
+      "durable_append_p50_ns": 316197,
+      "exactness": {
+        "hot": {
+          "checkpoint_count": 4070,
+          "exact": true,
+          "internal_failures": 0,
+          "metadata_failures": 0,
+          "state_failures": 0
+        },
+        "reopened": {
+          "checkpoint_count": 4070,
+          "exact": true,
+          "internal_failures": 0,
+          "metadata_failures": 0,
+          "state_failures": 0
+        },
+        "sealed": {
+          "checkpoint_count": 4070,
+          "exact": true,
+          "internal_failures": 0,
+          "metadata_failures": 0,
+          "state_failures": 0
+        }
+      },
+      "marginal_reopened_allocated_bytes": 1359872,
+      "pass": true,
+      "peak_rss_bytes": 29126656,
+      "reopened_read_p50_ns": 4068,
+      "returncode": 0,
+      "wall_elapsed_ns": 2622025240
+    }
+  },
+  "comparison": {
+    "cas_delta_marginal_reopened_allocated_bytes": 5738496,
+    "cas_delta_over_tulya_durable_append_p50_ratio": 2.1893060338965897,
+    "cas_delta_over_tulya_marginal_storage_ratio": 4.219879518072289,
+    "cas_delta_over_tulya_reopened_read_p50_ratio": 66.30162241887906,
+    "counts_equal": true,
+    "git_marginal_reopened_allocated_bytes": 3153920,
+    "git_over_tulya_marginal_storage_ratio": 2.319277108433735,
+    "git_over_tulya_reopened_read_p50_ratio": 6.966568338249754,
+    "langgraph_delta_marginal_reopened_allocated_bytes": 19664896,
+    "langgraph_delta_over_tulya_marginal_storage_ratio": 14.460843373493976,
+    "langgraph_full_marginal_reopened_allocated_bytes": 286785536,
+    "langgraph_full_over_tulya_marginal_storage_ratio": 210.89156626506025,
+    "postgres_full_database_growth_bytes": 68280320,
+    "postgres_full_over_tulya_durable_append_p50_ratio": 13.039092717514714,
+    "postgres_full_over_tulya_reopened_read_p50_ratio": 231.57669616519175,
+    "postgres_full_relation_marginal_allocated_bytes": 68157440,
+    "postgres_full_wal_generated_workload_bytes": 71816728,
+    "postgres_storage_ratio_comparable_to_tulya": false,
+    "snapshot_raw_marginal_reopened_allocated_bytes": 143175680,
+    "snapshot_raw_over_tulya_durable_append_p50_ratio": 3.0310186371154693,
+    "snapshot_raw_over_tulya_marginal_storage_ratio": 105.28614457831326,
+    "snapshot_raw_over_tulya_reopened_read_p50_ratio": 25.7617994100295,
+    "snapshot_zstd_marginal_reopened_allocated_bytes": 35573760,
+    "snapshot_zstd_over_tulya_durable_append_p50_ratio": 2.8450934069583202,
+    "snapshot_zstd_over_tulya_marginal_storage_ratio": 26.15963855421687,
+    "snapshot_zstd_over_tulya_reopened_read_p50_ratio": 11.572271386430678,
+    "sqlite_marginal_reopened_allocated_bytes": 9633792,
+    "sqlite_over_tulya_durable_append_p50_ratio": 2.1133122705149003,
+    "sqlite_over_tulya_marginal_storage_ratio": 7.0843373493975905,
+    "sqlite_over_tulya_reopened_read_p50_ratio": 43.277531956735494,
+    "sqlite_over_tulya_total_storage_ratio": 4.0,
+    "tulya_marginal_reopened_allocated_bytes": 1359872,
+    "tulya_over_langgraph_delta_peak_rss_ratio": 0.2575329566854991,
+    "tulya_over_langgraph_full_peak_rss_ratio": 0.26045710936927696,
+    "tulya_over_sqlite_peak_rss_ratio": 1.3422046055115138
+  },
+  "contract": "TULYA_BRANCH_FOREST_BENCHMARK_V1",
+  "corpus": {
+    "name": "engineering.jsonl",
+    "sha256": "f1872fef22f3cded330c38a6cce4012e92646e7bc01f69d9a3ec8c57f1b95e76",
+    "size_bytes": 6446990
+  },
+  "environment": {
+    "cpu_count": 12,
+    "output_filesystem": {
+      "available": true,
+      "options": "rw,noatime",
+      "source": "/dev/nvme0n1p2",
+      "target": "/",
+      "type": "ext4"
+    },
+    "platform": "Linux-7.1.8-arch1-3-x86_64-with-glibc2.44",
+    "python": "3.14.7",
+    "volatile_filesystem": false
+  },
+  "evidence_schema": 1,
+  "holdout_accessed": false,
+  "next_gate": "Have an independent evaluator run the reserved holdout once from this clean release commit, without tuning after observation.",
+  "pass": true,
+  "performance_claim": false,
+  "phase": "clean-reproduction",
+  "raw_summary_sha256": "6b7f52f4b6d0bf52982c7e7a48901055483d454fbe7c950634f63ba642c3ec1a",
+  "source": {
+    "git": {
+      "available": true,
+      "clean_after": true,
+      "clean_before": true,
+      "head": "55f26a0f7198eb8b5654c873a521c52408980cc1"
+    },
+    "tree_before_build": {
+      "file_count": 70,
+      "sha256": "81a16dafbaf99431abb71858ee101db6234695c93647a2b0266f065f3d211f30",
+      "total_bytes": 775288
+    }
+  },
+  "storage_advantage_claim": false
+}

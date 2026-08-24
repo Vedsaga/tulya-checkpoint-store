@@ -107,6 +107,28 @@ clean same-machine public-API reproduction is
 it confirms extraction portability but is not the reserved independent
 holdout.
 
+## Post-refactor regression rerun
+
+On 2026-08-24, the standalone repository at clean commit `55f26a0` was rerun
+against both available engineering partitions through the current public API
+adapter and the complete current nine-arm matrix.
+
+| Corpus | Input SHA-256 | Attempts | Unique checkpoints | Result |
+| --- | --- | ---: | ---: | --- |
+| SWE-agent engineering | `f1872fef22f3cded330c38a6cce4012e92646e7bc01f69d9a3ec8c57f1b95e76` | 147 | 4,070 | All nine arms passed and reconstructed exactly after reopen; Tulya was exact hot, sealed, and reopened. |
+| OpenHands engineering | `a006bd2923eae9607cda3dfd1ab64e3117c53f5fbc493e6cf18ecbf7621656d5` | 51 | 7,573 | All nine arms passed and reconstructed exactly after reopen; Tulya was exact hot, sealed, and reopened. |
+
+Portable records:
+
+- [`post_refactor_swe_engineering_55f26a0.json`](../benchmarks/evidence/post_refactor_swe_engineering_55f26a0.json)
+- [`post_refactor_openhands_engineering_55f26a0.json`](../benchmarks/evidence/post_refactor_openhands_engineering_55f26a0.json)
+
+Both campaigns recorded a clean tree before and after execution, all comparator
+counts equal, all frozen engineering thresholds passing, and
+`holdout_accessed: false`. These are same-machine regression checks. They show
+that the refactor did not break the tested branch-history contract; they do not
+replace an independent reserved-holdout run or prove customer economics.
+
 ## Reproduce it
 
 The release smoke benchmark needs no dataset download and makes no performance
