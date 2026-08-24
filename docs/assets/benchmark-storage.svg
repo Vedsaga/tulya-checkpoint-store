@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="500" viewBox="0 0 1040 500" role="img" aria-labelledby="title description">
+  <title id="title">Marginal storage after reopen for 11,383 agent checkpoints</title>
+  <desc id="description">Horizontal bars compare Tulya at 5.49 megabytes, packed Git at 19.67 megabytes, content-addressed SQLite delta at 37.10 megabytes, normalized SQLite delta at 38.24 megabytes, and LangGraph SQLite DeltaChannel at 68.00 megabytes. All arms reconstructed every checkpoint exactly before and after reopen.</desc>
+  <style>
+    .background { fill: #ffffff; }
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #1f2328; }
+    .title { font-size: 22px; font-weight: 600; }
+    .subtitle, .axis, .footnote { font-size: 13px; fill: #59636e; }
+    .name { font-size: 14px; font-weight: 600; }
+    .value { font-size: 14px; font-variant-numeric: tabular-nums; }
+    .ratio { font-size: 13px; font-weight: 600; fill: #59636e; }
+    .grid { stroke: #d0d7de; stroke-width: 1; }
+    .bar-tulya { fill: #1a7f37; }
+    .bar-other { fill: #8c959f; }
+    .bar-langgraph { fill: #57606a; }
+    @media (prefers-color-scheme: dark) {
+      .background { fill: #0d1117; }
+      text { fill: #f0f6fc; }
+      .subtitle, .axis, .footnote, .ratio { fill: #9da7b3; }
+      .grid { stroke: #30363d; }
+      .bar-tulya { fill: #3fb950; }
+      .bar-other { fill: #6e7681; }
+      .bar-langgraph { fill: #8c959f; }
+    }
+  </style>
+
+  <rect class="background" width="1040" height="500" rx="12" />
+
+  <text class="title" x="520" y="30" text-anchor="middle">Marginal reopened storage</text>
+  <text class="subtitle" x="520" y="54" text-anchor="middle">11,383 OpenHands agent checkpoints · exact reconstruction in every arm</text>
+
+  <line class="grid" x1="330" y1="82" x2="330" y2="424" />
+  <line class="grid" x1="477" y1="82" x2="477" y2="424" />
+  <line class="grid" x1="624" y1="82" x2="624" y2="424" />
+  <line class="grid" x1="771" y1="82" x2="771" y2="424" />
+  <line class="grid" x1="830" y1="82" x2="830" y2="424" />
+  <text class="axis" x="330" y="74" text-anchor="middle">0 MB</text>
+  <text class="axis" x="477" y="74" text-anchor="middle">20</text>
+  <text class="axis" x="624" y="74" text-anchor="middle">40</text>
+  <text class="axis" x="771" y="74" text-anchor="middle">60</text>
+  <text class="axis" x="830" y="74" text-anchor="middle">68</text>
+
+  <text class="name" x="20" y="128">Tulya</text>
+  <rect class="bar-tulya" x="330" y="102" width="40" height="38" rx="5" />
+  <text class="value" x="844" y="128">5.49 MB</text>
+  <text class="ratio" x="990" y="128" text-anchor="end">1.00×</text>
+
+  <text class="name" x="20" y="194">Packed Git</text>
+  <rect class="bar-other" x="330" y="168" width="145" height="38" rx="5" />
+  <text class="value" x="844" y="194">19.67 MB</text>
+  <text class="ratio" x="990" y="194" text-anchor="end">3.58×</text>
+
+  <text class="name" x="20" y="260">SQLite CAS delta</text>
+  <rect class="bar-other" x="330" y="234" width="273" height="38" rx="5" />
+  <text class="value" x="844" y="260">37.10 MB</text>
+  <text class="ratio" x="990" y="260" text-anchor="end">6.75×</text>
+
+  <text class="name" x="20" y="326">SQLite normalized delta</text>
+  <rect class="bar-other" x="330" y="300" width="281" height="38" rx="5" />
+  <text class="value" x="844" y="326">38.24 MB</text>
+  <text class="ratio" x="990" y="326" text-anchor="end">6.96×</text>
+
+  <text class="name" x="20" y="392">LangGraph SQLite DeltaChannel</text>
+  <rect class="bar-langgraph" x="330" y="366" width="500" height="38" rx="5" />
+  <text class="value" x="844" y="392">68.00 MB</text>
+  <text class="ratio" x="990" y="392" text-anchor="end">12.38×</text>
+
+  <text class="footnote" x="20" y="458">Clean public-API reproduction on the pinned evaluation corpus; allocated bytes after reopen.</text>
+  <text class="footnote" x="20" y="480">Packed Git was the closest storage comparator and did not fsync one transaction per checkpoint.</text>
+</svg>

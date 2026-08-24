@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="470" viewBox="0 0 1040 470" role="img" aria-labelledby="title description">
+  <title id="title">Full-snapshot duplication compared with Tulya structural sharing</title>
+  <desc id="description">An illustrative 800-message checkpoint forks into retries with three and four new messages. Full snapshots repeat the 800-message prefix three times. Tulya represents the prefix once and attaches the two divergent additions while retaining three exact checkpoints.</desc>
+  <style>
+    .background { fill: #ffffff; }
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #1f2328; }
+    .title { font-size: 22px; font-weight: 600; }
+    .heading { font-size: 17px; font-weight: 600; }
+    .label { font-size: 14px; font-weight: 600; }
+    .note { font-size: 13px; fill: #59636e; }
+    .prefix { fill: #dbeafe; stroke: #0969da; stroke-width: 1.5; }
+    .addition { fill: #dafbe1; stroke: #1a7f37; stroke-width: 1.5; }
+    .checkpoint { fill: #f6f8fa; stroke: #8c959f; stroke-width: 1.5; }
+    .guide { fill: none; stroke: #8c959f; stroke-width: 2; }
+    .divider { stroke: #d0d7de; stroke-width: 1; }
+    @media (prefers-color-scheme: dark) {
+      .background { fill: #0d1117; }
+      text { fill: #f0f6fc; }
+      .note { fill: #9da7b3; }
+      .prefix { fill: #0d2948; stroke: #58a6ff; }
+      .addition { fill: #143d25; stroke: #56d364; }
+      .checkpoint { fill: #161b22; stroke: #6e7681; }
+      .guide { stroke: #6e7681; }
+      .divider { stroke: #30363d; }
+    }
+  </style>
+
+  <rect class="background" width="1040" height="470" rx="12" />
+
+  <text class="title" x="520" y="30" text-anchor="middle">One history, two retries</text>
+  <text class="note" x="520" y="54" text-anchor="middle">Illustrative logical model: an 800-message checkpoint forks into +3 and +4 message branches</text>
+  <line class="divider" x1="520" y1="78" x2="520" y2="445" />
+
+  <text class="heading" x="260" y="96" text-anchor="middle">Repeated full snapshots</text>
+
+  <rect class="prefix" x="54" y="122" width="405" height="58" rx="8" />
+  <text class="label" x="256" y="147" text-anchor="middle">checkpoint 0</text>
+  <text class="note" x="256" y="168" text-anchor="middle">800-message prefix</text>
+
+  <rect class="prefix" x="54" y="220" width="392" height="58" rx="8" />
+  <rect class="addition" x="446" y="220" width="13" height="58" rx="5" />
+  <text class="label" x="250" y="245" text-anchor="middle">retry A copies the same 800</text>
+  <text class="note" x="250" y="266" text-anchor="middle">then adds 3 messages</text>
+
+  <rect class="prefix" x="54" y="318" width="390" height="58" rx="8" />
+  <rect class="addition" x="444" y="318" width="15" height="58" rx="5" />
+  <text class="label" x="250" y="343" text-anchor="middle">retry B copies the same 800</text>
+  <text class="note" x="250" y="364" text-anchor="middle">then adds 4 messages</text>
+
+  <text class="label" x="260" y="417" text-anchor="middle">2,407 logical message-values across three snapshots</text>
+  <text class="note" x="260" y="439" text-anchor="middle">The unchanged prefix is represented three times.</text>
+
+  <text class="heading" x="780" y="96" text-anchor="middle">Tulya structural sharing</text>
+
+  <rect class="prefix" x="650" y="132" width="260" height="78" rx="10" />
+  <text class="label" x="780" y="163" text-anchor="middle">shared 800-message prefix</text>
+  <text class="note" x="780" y="187" text-anchor="middle">represented once</text>
+
+  <path class="guide" d="M780 210 V255 M780 255 H650 V305 M780 255 H910 V305" />
+
+  <rect class="addition" x="575" y="305" width="150" height="68" rx="9" />
+  <text class="label" x="650" y="334" text-anchor="middle">retry A</text>
+  <text class="note" x="650" y="356" text-anchor="middle">+3 messages</text>
+
+  <rect class="addition" x="835" y="305" width="150" height="68" rx="9" />
+  <text class="label" x="910" y="334" text-anchor="middle">retry B</text>
+  <text class="note" x="910" y="356" text-anchor="middle">+4 messages</text>
+
+  <text class="label" x="780" y="417" text-anchor="middle">800 shared + 3 divergent + 4 divergent</text>
+  <text class="note" x="780" y="439" text-anchor="middle">All three checkpoints remain exactly reconstructable.</text>
+</svg>
