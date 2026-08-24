@@ -3,11 +3,39 @@ name = "tulya-checkpoint-store"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
-description = "Durable branch-aware checkpoint store for append-only agent state"
+description = "Durable branch-aware checkpoint history for stateful systems"
 license = "MIT"
 repository = "https://github.com/Vedsaga/tulya-checkpoint-store"
-keywords = ["agents", "checkpoint", "dag", "storage"]
+keywords = ["checkpoint", "persistence", "versioning", "storage"]
 categories = ["data-structures", "database-implementations"]
+include = [
+    "src/**",
+    "tests/**",
+    "examples/**",
+    "integrations/langgraph/*.py",
+    "integrations/langgraph/*.md",
+    "integrations/langgraph/*.txt",
+    "benchmarks/**/*.py",
+    "benchmarks/**/*.md",
+    "benchmarks/**/*.json",
+    "benchmarks/**/*.txt",
+    "benchmarks/**/*.yml",
+    "benchmarks/**/*.yaml",
+    "docs/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+    "PROVENANCE.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+]
+
+[features]
+default = []
+bench-diagnostics = []
+fault-injection = []
 
 [workspace]
 members = ["."]
@@ -17,7 +45,9 @@ resolver = "2"
 name = "tulya_checkpoint_store"
 
 [dependencies]
-clap = { version = "4.4", features = ["derive"] }
+# Keep the CLI dependency below 4.5.58: newer releases pull an
+# edition-2024 `clap_lex` manifest that Cargo 1.80 cannot parse.
+clap = { version = ">=4.4, <4.5.58", features = ["derive"] }
 fs4 = "0.8.4"
 getrandom = "0.3.4"
 serde_json = "1"
@@ -27,7 +57,14 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 zstd = "0.13"
 
 [dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
+
+# `zstd-sys` reaches `jobserver` through its C compiler helper. Keep that
+# transitive edge compatible with the package's declared Rust 1.80 floor even
+# when downstream users resolve without this repository's Cargo.lock.
+[build-dependencies]
+jobserver = "=0.1.32"
 
 [[bin]]
 name = "tulya-checkpoint"

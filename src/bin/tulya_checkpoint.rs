@@ -1,4 +1,4 @@
-//! Command-line surface for the production branch-aware message checkpoint store.
+//! Command-line surface for the production branch-aware checkpoint store.
 
 use std::error::Error;
 use std::io::{self, Read};
@@ -6,12 +6,12 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
-use tulya_checkpoint_store::{CheckpointStore, CheckpointStoreConfig};
+use tulya_checkpoint_store::{format, fsck, CheckpointStore, CheckpointStoreConfig};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "tulya-checkpoint",
-    about = "Durable branch-aware checkpoint store for append-only agent messages"
+    about = "Durable branch-aware checkpoint history for stateful systems"
 )]
 struct Args {
     #[arg(long)]
@@ -44,6 +44,8 @@ enum Command {
     List,
     /// Verify all committed logical-state lengths and hashes.
     Verify,
+    /// Independently check the store without locks, repair, or mutation.
+    Fsck,
     /// Report complete store-file accounting and lifecycle counters.
     Stats,
     /// Seal all checkpoints through the requested global count.
@@ -86,6 +88,25 @@ fn canonical_messages(state: &Value) -> Result<&[Value], Box<dyn Error>> {
 }
 
 fn run(args: Args) -> Result<Value, Box<dyn Error>> {
+    if matches!(args.command, Command::Fsck) {
+        let report = fsck(&args.db)?;
+        return Ok(json!({
+            "ok": report.failures == 0,
+            "operation": "fsck",
+            "format": format::NAME,
+            "format_version": report.format_version,
+            "store_id": report.store_id.to_hex(),
+            "sealed_generation": report.sealed_generation,
+            "sealed_segment_count": report.sealed_segment_count,
+            "checkpoint_count": report.checkpoint_count,
+            "version_count": report.version_count,
+            "hot_logical_bytes": report.hot_logical_bytes,
+            "hot_physical_bytes": report.hot_physical_bytes,
+            "trailing_nonzero_bytes": report.trailing_nonzero_bytes,
+            "failures": report.failures,
+            "read_only": true,
+        }));
+    }
     let mut store = CheckpointStore::open(&args.db, CheckpointStoreConfig::default())?;
     match args.command {
         Command::Put {
@@ -155,6 +176,7 @@ fn run(args: Args) -> Result<Value, Box<dyn Error>> {
                 "failures": report.failures,
             }))
         }
+        Command::Fsck => unreachable!("fsck returns before opening a writer"),
         Command::Stats => {
             let storage = store.storage()?;
             Ok(json!({
@@ -199,6 +221,8 @@ fn run(args: Args) -> Result<Value, Box<dyn Error>> {
                 }));
             }
             Ok(json!({
+                "ok": true,
+                "operation": "export",
                 "format": "tulya-append-only-message-export",
                 "format_version": 1,
                 "checkpoint_count": checkpoints.len(),

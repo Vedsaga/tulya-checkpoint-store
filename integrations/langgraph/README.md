@@ -1,16 +1,27 @@
-# LangGraph shadow adapter
+# LangGraph verified shadow
 
-`TulyaShadowSaver` keeps an existing LangGraph saver authoritative and mirrors
-an append-only sequence channel (default: `messages`) into Tulya.
+`TulyaShadowSaver` leaves an existing LangGraph saver authoritative and mirrors
+one append-only sequence channel (default: `messages`) into Tulya. This gives a
+low-risk deployment path: reads, pending writes, DeltaChannel behavior,
+deletion, copying, and pruning remain with the primary; Tulya retains a
+separately verifiable branch history.
 
-This is a low-risk design-partner probe, not a drop-in replacement. Reads,
-pending writes and graph execution remain on the primary saver. Mirroring is
-fail-open by default and exposes explicit verification, stats and seal calls.
+The adapter now covers LangGraph's sync and async methods, serializes concurrent
+CLI writes, rebuilds its mapping from durable Tulya records on process restart,
+continues from an old branch after restart, and exposes verify, read-only fsck,
+stats, and seal operations. The real `StateGraph` smoke tests cover sibling
+branches, adapter restart, branch continuation, seal/reopen, and async graph
+execution.
 
-Build the CLI, install LangGraph plus its SQLite checkpoint package in a Python
-environment, then run:
+It is deliberately not advertised as a drop-in saver. Tulya does not store
+LangGraph pending writes or serve primary reads, and primary-side deletion or
+pruning does not erase the Tulya audit shadow. The current adapter starts a CLI
+process for each mirrored checkpoint, so its end-to-end write latency is not a
+product performance claim.
 
 ```bash
+cargo build --release --locked --bin tulya-checkpoint
+python -m pip install -r integrations/langgraph/requirements.txt
 PYTHONPATH=integrations/langgraph python -m unittest -v \
   integrations/langgraph/test_shadow_smoke.py
 ```

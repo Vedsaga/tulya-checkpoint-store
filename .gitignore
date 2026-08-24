@@ -2,3 +2,6 @@
 **/__pycache__/
 *.py[cod]
 .venv/
+.venv-branch-forest/
+/benchmark-results/
+/data/

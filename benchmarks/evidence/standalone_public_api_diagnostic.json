@@ -1,0 +1,100 @@
+{
+  "evidence_schema": 1,
+  "date": "2026-08-24",
+  "phase": "adapter-diagnostic",
+  "claim_bearing": false,
+  "pass": true,
+  "reason_not_claim_bearing": "The standalone release worktree was dirty while its newly extracted public-API adapters were verified.",
+  "raw_summary_sha256": "79c6b02579fbf663cebd94e825ee43bafad08675cea8a1f9d0ebf3b1b77e5e1d",
+  "source_head_before_uncommitted_release_work": "8e98ff44146e79074f594c287370174a3d6d623c",
+  "corpus": {
+    "name": "Nebius SWE-ReBench OpenHands evaluation partition",
+    "source_revision": "35455389ab51bf5e2306bfd436ef72d0f98bf882",
+    "sha256": "a931c659530c083933b7da5fd886bcee0068c8c8df3ce57f6aea43fae18df12e",
+    "size_bytes": 24540161,
+    "checkpoint_count": 11383,
+    "attempt_ref_count": 91
+  },
+  "environment": {
+    "platform": "Linux-7.1.8-arch1-3-x86_64-with-glibc2.44",
+    "python": "3.14.7",
+    "cpu_count": 12,
+    "filesystem": "ext4",
+    "filesystem_source": "/dev/nvme0n1p2",
+    "volatile_filesystem": false
+  },
+  "all_arms_exact_before_and_after_reopen": true,
+  "all_counts_equal": true,
+  "arms": {
+    "tulya_public_api": {
+      "marginal_reopened_allocated_bytes": 5492736,
+      "durable_append_p50_ns": 351364,
+      "reopened_read_p50_ns": 19957,
+      "peak_rss_bytes": 91365376
+    },
+    "normalized_sqlite_delta": {
+      "marginal_reopened_allocated_bytes": 38236160,
+      "durable_append_p50_ns": 723186,
+      "reopened_read_p50_ns": 990557,
+      "peak_rss_bytes": 50044928
+    },
+    "cas_sqlite_delta": {
+      "marginal_reopened_allocated_bytes": 37097472,
+      "durable_append_p50_ns": 928836,
+      "reopened_read_p50_ns": 1588706,
+      "peak_rss_bytes": 232509440
+    },
+    "raw_full_snapshot": {
+      "marginal_reopened_allocated_bytes": 1407893504,
+      "durable_append_p50_ns": 2415505,
+      "reopened_read_p50_ns": 372526,
+      "peak_rss_bytes": 232136704
+    },
+    "zstd_full_snapshot": {
+      "marginal_reopened_allocated_bytes": 311902208,
+      "durable_append_p50_ns": 1985468,
+      "reopened_read_p50_ns": 156997,
+      "peak_rss_bytes": 230330368
+    },
+    "langgraph_sqlite_full": {
+      "marginal_reopened_allocated_bytes": 2827210752,
+      "durable_append_p50_ns": 4811399,
+      "reopened_read_p50_ns": 1057152,
+      "peak_rss_bytes": 303063040
+    },
+    "langgraph_sqlite_delta": {
+      "marginal_reopened_allocated_bytes": 67993600,
+      "durable_append_p50_ns": 8402992,
+      "reopened_read_p50_ns": 4793232,
+      "peak_rss_bytes": 298602496
+    },
+    "packed_git": {
+      "marginal_reopened_allocated_bytes": 19693568,
+      "durable_append_comparable": false,
+      "reopened_read_p50_ns": 76675,
+      "peak_rss_bytes": 238321664
+    },
+    "langgraph_postgresql_full": {
+      "marginal_relation_allocated_bytes": 507494400,
+      "durable_append_p50_ns": 7128116,
+      "reopened_read_p50_ns": 1721279,
+      "client_peak_rss_bytes": 2894266368,
+      "storage_scope": "pg_total_relation_size only; not whole-system storage"
+    }
+  },
+  "selected_ratios_comparator_over_tulya": {
+    "langgraph_sqlite_delta_marginal_storage": 12.378821774794929,
+    "normalized_sqlite_marginal_storage": 6.961222967934377,
+    "cas_sqlite_marginal_storage": 6.7539149888143175,
+    "packed_git_marginal_storage": 3.585384041759881,
+    "normalized_sqlite_reopened_read_p50": 49.634564313273536,
+    "cas_sqlite_reopened_read_p50": 79.60645387583304,
+    "packed_git_reopened_read_p50": 3.8420103221927144
+  },
+  "observed_losses": {
+    "tulya_over_normalized_sqlite_peak_rss": 1.825667048616795,
+    "sqlite_reopen_was_materially_faster": true,
+    "packed_git_was_the_closest_storage_comparator": true
+  },
+  "next_gate": "Commit the release candidate, reproduce on a clean worktree, then preserve a one-shot independent reserved-holdout run without tuning."
+}

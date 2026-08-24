@@ -7,12 +7,18 @@ This focused repository was extracted on 2026-08-23 from:
 - production store body SHA-256:
   `a4963cd00a73c12d492c2a56065519f0556c58f2f145abbd6fb15db1bb520d04`.
 
-The copied production store body is byte-identical to that source commit. The
-standalone crate changes only package/module wiring and the CLI crate import.
+The initial copied production store body was byte-identical to that source
+commit. Before the first public release it was mechanically decomposed into a
+normal Rust module tree, then hardened in this repository with the single
+public manifest, golden fixture, independent fsck, first-class crash matrix,
+smaller public facade, restart-safe LangGraph shadow, CI and release evidence.
 
-The first verified package artifact was
-`tulya-checkpoint-store-0.1.0.crate`, SHA-256
-`a56fdb5a0b339e57222038fd6a815f3bb2eea6aea14a1fbd043117e671753fc1`.
+The `tulya-checkpoint-store-0.1.0.crate` artifact is built and verified by
+`cargo package --locked`. Its digest is intentionally not embedded here:
+because this file is packaged, doing so would create a self-referential hash.
 
-Benchmark protocols, comparator adapters and claim-bearing raw manifests stay
-in the source repository and are not silently duplicated here.
+The full historical raw manifests remain in the source repository.
+`benchmarks/frozen_evidence.json` copies the claim ledger, digests, measured
+summary, and explicit losses. The standalone executable protocol is under
+`benchmarks/branch_forest/`; `docs/BENCHMARKS.md` preserves the permitted
+interpretation.

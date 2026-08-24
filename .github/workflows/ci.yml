@@ -1,0 +1,165 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.80'
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --all-targets --locked -- --test-threads=1
+      - run: cargo test --locked --features fault-injection --test crash_matrix -- --test-threads=1
+      - run: cargo run --release --locked --example branch_forest_tulya -- --db /tmp/tulya-branch-forest-ci --corpus tests/fixtures/branch-forest/tiny.jsonl
+      - run: cargo run --release --locked --example branch_forest_sqlite -- --db /tmp/sqlite-branch-forest-ci --corpus tests/fixtures/branch-forest/tiny.jsonl
+      - run: python3 benchmarks/branch_forest/crash_demo.py --corpus tests/fixtures/branch-forest/tiny.jsonl --output-dir /tmp/tulya-branch-forest-crash-ci
+      - run: cargo package --locked
+
+  langgraph:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.80'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: integrations/langgraph/requirements.txt
+      - run: python -m pip install -r integrations/langgraph/requirements.txt
+      - run: cargo build --release --locked --bin tulya-checkpoint
+      - run: PYTHONPATH=integrations/langgraph python -m unittest -v integrations/langgraph/test_shadow_smoke.py
+      - run: python -m py_compile benchmarks/branch_forest/*.py
+
+  packaged-artifact:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.80'
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: benchmarks/branch_forest/requirements.txt
+      - run: python -m pip install -r benchmarks/branch_forest/requirements.txt
+      - run: cargo package --locked
+      - name: Exercise the unpacked crate
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_root="$RUNNER_TEMP/tulya-package"
+          result_root="$RUNNER_TEMP/tulya-package-results"
+          crash_root="$RUNNER_TEMP/tulya-package-crash"
+          source_root="$RUNNER_TEMP/tulya-freezer-source"
+          frozen_root="$RUNNER_TEMP/tulya-freezer-output"
+          mkdir "$artifact_root"
+          tar -xzf target/package/tulya-checkpoint-store-0.1.0.crate \
+            -C "$artifact_root" --strip-components=1
+          cd "$artifact_root"
+          mkdir -p "$source_root/nebius-openhands"
+          python - "$source_root/nebius-openhands" <<'PY'
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          import pyarrow as pa
+          import pyarrow.parquet as pq
+
+          root = Path(sys.argv[1])
+          rows = []
+          content = "x" * 512
+          for instance_no in range(21):
+              instance = f"instance-{instance_no:02d}"
+              messages = [
+                  {
+                      "role": "user" if index % 2 == 0 else "assistant",
+                      "content": f"{index:03d}:{content}",
+                  }
+                  for index in range(250)
+              ]
+              trajectory = json.dumps(messages, separators=(",", ":"))
+              for attempt_no in range(4):
+                  rows.append(
+                      {
+                          "trajectory_id": f"{instance}-attempt-{attempt_no}",
+                          "instance_id": instance,
+                          "resolved": int(attempt_no == 3),
+                          "trajectory": trajectory,
+                      }
+                  )
+          parquet = root / "trajectories.parquet"
+          pq.write_table(pa.Table.from_pylist(rows), parquet, compression="zstd")
+          digest = hashlib.sha256(parquet.read_bytes()).hexdigest()
+          manifest = {
+              "source": "nebius-openhands",
+              "role": "generated-smoke",
+              "license": "generated",
+              "repo_id": "local/generated-smoke",
+              "resolved_revision": "0" * 40,
+              "download_bytes": parquet.stat().st_size,
+              "parquet_shard_count": 1,
+              "files": [
+                  {
+                      "path": parquet.name,
+                      "bytes": parquet.stat().st_size,
+                      "sha256": digest,
+                  }
+              ],
+          }
+          (root / "source_manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+          )
+          PY
+          python benchmarks/branch_forest/freeze_corpus.py \
+            --source nebius-openhands \
+            --data-root "$source_root" \
+            --output-dir "$frozen_root"
+          python benchmarks/branch_forest/run.py \
+            --corpus tests/fixtures/branch-forest/tiny.jsonl \
+            --output-dir "$result_root" \
+            --timeout-seconds 300
+          python benchmarks/branch_forest/crash_demo.py \
+            --corpus tests/fixtures/branch-forest/tiny.jsonl \
+            --output-dir "$crash_root"
+          cargo build --release --locked --bin tulya-checkpoint
+          PYTHONPATH=integrations/langgraph python -m unittest -v \
+            integrations/langgraph/test_shadow_smoke.py
+          python benchmarks/branch_forest/summarize.py \
+            "$result_root/summary.json" \
+            --output "$RUNNER_TEMP/tulya-package-evidence.json"
+          python - \
+            "$RUNNER_TEMP/tulya-package-evidence.json" \
+            "$frozen_root/nebius-openhands/manifest.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          result = json.loads(Path(sys.argv[1]).read_text())
+          frozen = json.loads(Path(sys.argv[2]).read_text())
+          assert result["pass"] is True
+          assert result["phase"] == "packaged-source-diagnostic"
+          assert result["source"]["git"]["available"] is False
+          assert len(result["arms"]) == 9
+          assert all(
+              arm["returncode"] == 0 and arm["result"]["pass"] is True
+              for arm in result["arms"].values()
+          )
+          assert frozen["source_provenance"]["git"]["available"] is False
+          assert all(
+              partition["verification"]["exact"]
+              for partition in frozen["files"].values()
+          )
+          PY

@@ -1,0 +1,43 @@
+{
+  "claim_id": "TULYA-BF-OH-EVAL-R1",
+  "claim_bearing": true,
+  "date": "2026-08-23",
+  "source_repository_commit_at_evidence_copy": "f87a6672f112f8f52bd59f18451d84fc0b38217c",
+  "frozen_candidate_commit": "4cf590f951dd4b0173ed100d4ab09fa4dd19eae9",
+  "corpus": {
+    "name": "Nebius SWE-ReBench OpenHands evaluation partition",
+    "source_revision": "35455389ab51bf5e2306bfd436ef72d0f98bf882",
+    "sha256": "a931c659530c083933b7da5fd886bcee0068c8c8df3ce57f6aea43fae18df12e",
+    "unique_checkpoint_count": 11383
+  },
+  "exactness_failures_across_ten_arms": 0,
+  "tulya": {
+    "marginal_reopened_allocated_bytes": 5492736,
+    "peak_rss_bytes": 90595328,
+    "durable_append_p50_ns": 306708,
+    "reopened_historical_read_p50_ns": 19417
+  },
+  "ratios_comparator_over_tulya": {
+    "langgraph_sqlite_delta_marginal_storage": 12.38,
+    "normalized_sqlite_delta_marginal_storage": 6.96,
+    "cas_sqlite_delta_marginal_storage": 6.75,
+    "normalized_sqlite_reopened_read_p50": 51.24,
+    "cas_sqlite_reopened_read_p50": 77.13,
+    "packed_git_marginal_storage": 3.59,
+    "packed_git_reopened_read_p50": 2.47
+  },
+  "tulya_over_normalized_sqlite_peak_rss": 1.83,
+  "source_evidence_sha256": {
+    "evaluation_result_markdown": "137f71d2253bb884b593c52cc33161f35f9ee0836f81c904230ef9d02d415136",
+    "claim_registry_markdown": "4f117813ef83515bfbc6c4dbbcdac658067f94ae53128fc1d90449d0f2281551",
+    "process_crash_result_markdown": "36c5e4012ac3a5f46e1cfde8d35837aa63cde527a6ca6aebb0d6b23f823a7b53",
+    "process_crash_raw_summary": "cdffadf51753741d278cecca1664c59c8cfa45026b4970b8e125eb1dd73ffe5a"
+  },
+  "prohibited_inferences": [
+    "100x end-to-end customer cost reduction",
+    "universal superiority to Git or optimized history stores",
+    "power-loss safety",
+    "semantic-memory or model-quality improvement",
+    "customer ROI before a workload-owner deployment"
+  ]
+}
