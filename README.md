@@ -1,15 +1,46 @@
 # Tulya Checkpoint Store
 
-Tulya is a durable, branch-aware checkpoint history store for stateful
-systems. Agent runtimes and LangGraph are the first integration wedge, not the
-limit of the storage model: a checkpoint has a stable identity, one parent,
-exact historical bytes, structural sharing, durable append, and independent
+> [!WARNING]
+> **Alpha / design-partner release.** Tulya is pre-production, single-writer
+> storage. Run it fail-open beside an authoritative backend while evaluating
+> it. Process-crash recovery is tested; sudden-power-loss safety is not yet
+> claimed.
+
+**Keep every branch. Store the shared past once.**
+
+Stateful workloads retry, fork, explore alternatives, and preserve history.
+Full snapshots repeatedly store the same prefix; delta logs can make old
+states costly or difficult to reconstruct. Tulya is an embedded Rust store
+designed for both sides of that trade-off: structural sharing across branches,
+exact historical reads, durable append, restart recovery, and independent
 verification.
 
-The first release exposes exactly one on-disk contract: the **Tulya checkpoint
-format**. There is no format selector or family of product variants.
-The manifest's integer compatibility field is an internal safety guard, not a
-choice users have to make.
+On a frozen public branch forest of **11,383 checkpoints**, Tulya used
+**12.38x less marginal reopened storage** than direct LangGraph SQLite
+DeltaChannel. Stronger custom SQLite delta baselines narrowed the advantage to
+**6.75–6.96x**, and aggressively packed Git narrowed it to **3.59x**. Those are
+reproducible results for one pinned workload, not a claim about every workload.
+
+## Why Tulya
+
+- **Branch without copying the past:** root, child, and sibling histories share
+  structure while retaining stable checkpoint identities.
+- **Read the state that was actually saved:** reconstruct exact historical
+  bytes instead of returning a summary or approximate semantic memory.
+- **Inspect failures independently:** a read-only `fsck`, golden format
+  fixture, and deterministic crash matrix make correctness testable outside
+  the writer.
+- **Embed a focused storage primitive:** the Rust API is intentionally small;
+  agent runtimes and LangGraph are the first integration wedge, not the limit
+  of the model.
+- **Learn one format:** the alpha exposes one **Tulya checkpoint format**, not
+  a menu of v3/v4/v5 product variants. Its compatibility integer is an internal
+  safety guard.
+
+Tulya is a potential fit when many states share long prefixes: agent retries,
+workflow forks, search or simulation trees, and local versioned state. It is
+not a general database, distributed checkpoint service, or semantic-memory
+layer.
 
 ## Five-minute start
 
