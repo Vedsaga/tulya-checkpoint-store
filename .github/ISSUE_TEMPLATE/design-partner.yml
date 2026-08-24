@@ -1,0 +1,89 @@
+name: Design-partner pilot
+description: Propose a fail-open Tulya shadow pilot on an existing branching workload.
+title: "[pilot] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Tulya remains a shadow during the pilot; your current checkpoint backend stays authoritative. Do not post credentials, private source, customer data, or proprietary traces here.
+
+  - type: input
+    id: organization
+    attributes:
+      label: Team or organization
+      description: A public name, project name, or anonymized identifier is sufficient initially.
+    validations:
+      required: true
+
+  - type: input
+    id: workload
+    attributes:
+      label: Stateful workload
+      description: What produces checkpoints and branches?
+      placeholder: Agent runtime, workflow engine, simulation, notebook history, or another stateful system
+    validations:
+      required: true
+
+  - type: input
+    id: backend
+    attributes:
+      label: Current backend and exact version
+      placeholder: LangGraph SQLiteSaver 3.1.0, PostgreSQL 17, custom SQLite, Git, etc.
+    validations:
+      required: true
+
+  - type: textarea
+    id: geometry
+    attributes:
+      label: Workload geometry
+      description: Approximate checkpoints/day, branch or fork fan-out, state size, retention interval, and historical-read frequency.
+    validations:
+      required: true
+
+  - type: textarea
+    id: cost
+    attributes:
+      label: Cost or operational pain to measure
+      description: Storage bill, replay/recomputation, historical-read latency, backup cost, or operator time. Provide a baseline only if it is safe to share.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: integration
+    attributes:
+      label: Integration path
+      options:
+        - LangGraph verified shadow
+        - Public Rust API
+        - Custom adapter needed
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: protocol
+    attributes:
+      label: Pilot protocol
+      options:
+        - label: The existing backend will remain authoritative and Tulya will run fail-open as a shadow.
+          required: true
+        - label: We can freeze the measurement contract before tuning and report competing-backend wins or Tulya failures unchanged.
+          required: true
+        - label: We can run independent fsck and exact checkpoint verification after restart.
+          required: true
+
+  - type: dropdown
+    id: disclosure
+    attributes:
+      label: Result disclosure
+      description: This is not testimonial authorization; exact wording must still be approved after the pilot.
+      options:
+        - Public measurements and team name may be considered
+        - Public anonymized measurements may be considered
+        - Private evaluation only
+    validations:
+      required: true
+
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Privacy, deletion, deployment, or timing constraints
