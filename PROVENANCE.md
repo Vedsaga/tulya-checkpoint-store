@@ -12,6 +12,8 @@ commit. Before the first public release it was mechanically decomposed into a
 normal Rust module tree, then hardened in this repository with the single
 public manifest, golden fixture, independent fsck, first-class crash matrix,
 smaller public facade, restart-safe LangGraph shadow, CI and release evidence.
+The optional local evaluator, strict JSONL importer, dashboard, and metrics
+surface were then built directly in this standalone repository.
 
 The `tulya-checkpoint-store-0.1.0.crate` artifact is built and verified by
 `cargo package --locked`. Its digest is intentionally not embedded here:

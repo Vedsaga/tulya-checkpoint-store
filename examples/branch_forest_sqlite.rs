@@ -162,7 +162,7 @@ fn parse_plan(path: &Path) -> Result<(Vec<PlanNode>, Vec<AttemptRef>), Box<dyn E
 
 fn configure(conn: &Connection) -> Result<(), Box<dyn Error>> {
     let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-    if mode.to_ascii_lowercase() != "wal" {
+    if !mode.eq_ignore_ascii_case("wal") {
         return Err("SQLite did not enter WAL mode".into());
     }
     conn.pragma_update(None, "synchronous", "FULL")?;

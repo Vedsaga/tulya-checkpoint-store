@@ -4,6 +4,74 @@ Tulya is an alpha. The safest useful evaluation mirrors checkpoints beside an
 existing authoritative backend, fails open if Tulya is unavailable, and makes
 no production read path depend on the result.
 
+## Local API and dashboard
+
+The optional `tulya-local` binary is a convenience evaluator around the same
+Rust `CheckpointStore` used by the CLI and benchmark adapter. It owns one
+writer, serves a dashboard, and accepts JSON on loopback:
+
+```bash
+TULYA_EVAL=$(mktemp -d)
+cargo run --release --locked --features local-server --bin tulya-local -- \
+  --db "$TULYA_EVAL/store" \
+  --import-jsonl examples/sample_history.jsonl
+```
+
+Open `http://127.0.0.1:3210`. The server refuses a non-loopback bind unless
+`--allow-non-loopback` is supplied. That override does not add authentication
+or TLS; it should only be used on an otherwise trusted network. Startup
+`--import-jsonl` requires an empty store; use the HTTP import endpoint for an
+incremental batch after startup.
+
+### Accepted checkpoint JSONL
+
+Each non-empty line must be one JSON object with exactly these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `thread_id` | Non-empty logical history identifier. |
+| `checkpoint_id` | Non-empty checkpoint identifier, unique within the thread. |
+| `checkpoint_no` | Unsigned 32-bit sequence number expected by the adapter. |
+| `parent_checkpoint_id` | Earlier checkpoint in the same thread, or `null` for a root. |
+| `messages` | Non-empty array containing only values newly appended to the parent. |
+
+Parents must appear before children. Values inside `messages` may be any JSON;
+Tulya does not require the `role`/`content` shape used by the sample. Unknown
+top-level fields, empty deltas, missing parents, and malformed topology are
+rejected.
+
+Batch import is incrementally durable rather than transactional across the
+entire request. If an error occurs, the response names the failing line and
+the number of earlier checkpoints that remain committed. The request body is
+limited to 64 MiB; use direct checkpoint calls or multiple topologically
+ordered batches for a larger evaluation.
+
+### HTTP surface
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/` | Live local dashboard. |
+| `GET` | `/api/health` | Process status and explicit limitations. |
+| `GET` | `/api/stats` | Store, workload-shape, and process-lifetime counters. |
+| `GET` | `/api/checkpoints?limit=100` | Recent committed checkpoint metadata. |
+| `GET` | `/metrics` | Prometheus text exposition. |
+| `POST` | `/api/checkpoints` | Append one checkpoint using the JSONL object schema. |
+| `POST` | `/api/import` | Import append-delta JSONL. |
+| `POST` | `/api/read` | Reconstruct one checkpoint from `thread_id` and `checkpoint_id`. |
+| `POST` | `/api/verify` | Reconstruct and hash-check every committed checkpoint. |
+| `POST` | `/api/seal` | Seal all currently committed checkpoints. |
+
+The dashboard intentionally does not calculate “savings.” It shows the sum of
+exact logical checkpoint-state lengths and the complete Tulya directory's
+allocated bytes as separately labeled facts. An economic claim requires the
+same checkpoint set, retention, durability policy, and whole-store accounting
+from the existing backend.
+
+The service has no authentication, TLS, authorization, rate limiting,
+multi-process coordination, stable network-API guarantee, or persistent
+metrics history. Metrics reset when the process restarts. Keep the primary
+backend authoritative during evaluation.
+
 The first question is deliberately narrow:
 
 > Does exact branch history reduce retained-state or replay cost in a workload

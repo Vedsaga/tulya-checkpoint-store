@@ -1,0 +1,8 @@
+{"thread_id":"issue-42","checkpoint_id":"root","checkpoint_no":0,"parent_checkpoint_id":null,"messages":[{"role":"user","content":"The checkout request times out after ten seconds."}]}
+{"thread_id":"issue-42","checkpoint_id":"inspect","checkpoint_no":1,"parent_checkpoint_id":"root","messages":[{"role":"assistant","content":"Inspect the request trace and database timings."}]}
+{"thread_id":"issue-42","checkpoint_id":"trace","checkpoint_no":2,"parent_checkpoint_id":"inspect","messages":[{"role":"tool","content":"The database query consumes 9.7 seconds."}]}
+{"thread_id":"issue-42","checkpoint_id":"retry-timeout","checkpoint_no":3,"parent_checkpoint_id":"trace","messages":[{"role":"assistant","content":"Retry A: raise the timeout."}]}
+{"thread_id":"issue-42","checkpoint_id":"retry-query","checkpoint_no":3,"parent_checkpoint_id":"trace","messages":[{"role":"assistant","content":"Retry B: add the missing query index."}]}
+{"thread_id":"issue-42","checkpoint_id":"timeout-result","checkpoint_no":4,"parent_checkpoint_id":"retry-timeout","messages":[{"role":"tool","content":"The request finishes but still takes 9.7 seconds."}]}
+{"thread_id":"issue-42","checkpoint_id":"query-result","checkpoint_no":4,"parent_checkpoint_id":"retry-query","messages":[{"role":"tool","content":"The indexed request now finishes in 120 milliseconds."}]}
+{"thread_id":"issue-99","checkpoint_id":"root","checkpoint_no":0,"parent_checkpoint_id":null,"messages":[{"role":"user","content":"Investigate the failed deployment."}]}

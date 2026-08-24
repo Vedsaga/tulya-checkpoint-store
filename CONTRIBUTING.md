@@ -5,8 +5,8 @@ benchmark semantics. A pull request should keep the worktree clean and pass:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --all-targets --locked -- --test-threads=1
+cargo clippy --all-targets --features local-server --locked -- -D warnings
+cargo test --all-targets --features local-server --locked -- --test-threads=1
 cargo test --locked --features fault-injection --test crash_matrix -- --test-threads=1
 ```
 

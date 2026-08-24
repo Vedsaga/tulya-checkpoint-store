@@ -14,5 +14,5 @@ pub mod format;
 
 pub use checkpoint_store::{
     fsck, CheckpointInfo, CheckpointStore, CheckpointStoreConfig, CheckpointStoreError,
-    CheckpointStoreRecoveryMode, FsckReport, StoreId,
+    CheckpointStoreRecoveryMode, FsckReport, HotWalAppendReport, StoreId,
 };
