@@ -36,13 +36,16 @@ LangGraph SQLite/PostgreSQL arms, SQLite full/CAS variants, packed Git, pinned
 Python dependencies, and a Docker Compose PostgreSQL service. See its README
 for the exact clean-worktree command and holdout firewall.
 
-The standalone public-API extraction was also exercised across all nine
-executable arms on the same evaluation corpus and reproduced Tulya's exact
-5,492,736-byte retained point with zero reconstruction failures. Its compact
-record is `benchmarks/evidence/standalone_public_api_diagnostic.json`. It is
-explicitly diagnostic because the extraction worktree was dirty; it closes the
-private-adapter portability question but does not replace the frozen
-claim-bearing result.
+The standalone public API was subsequently exercised from clean commit
+`c59bd4b` across all nine executable arms on the same evaluation corpus. It
+reproduced Tulya's exact 5,492,736-byte retained point with zero reconstruction
+failures, while recording per-arm wall time and preserving the SQLite reopen,
+Git, RSS, and PostgreSQL losses. The compact record is
+`benchmarks/evidence/clean_public_api_reproduction.json`. This clean
+same-machine reproduction closes the private-adapter portability question but
+does not replace the frozen claim-bearing result or consume the independent
+holdout. The earlier dirty-worktree extraction diagnostic remains preserved as
+an audit trail.
 
 Safe wording:
 

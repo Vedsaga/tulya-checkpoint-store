@@ -762,8 +762,10 @@ def main() -> None:
             "Preserve and publish this one-shot independent holdout result without tuning."
             if is_holdout
             else "Commit the release candidate, then reproduce the pinned evaluation on a clean worktree. Keep the holdout untouched."
-            if git_before["available"]
+            if args.allow_dirty
             else "Match this packaged source-tree digest to the published artifact, then reproduce the pinned evaluation from a clean release commit."
+            if not git_before["available"]
+            else "Have an independent evaluator run the reserved holdout once from this clean release commit, without tuning after observation."
         ),
     }
     summary_path = output_dir / "summary.json"

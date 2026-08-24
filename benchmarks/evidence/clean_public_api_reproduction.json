@@ -1,0 +1,140 @@
+{
+  "evidence_schema": 1,
+  "claim_id": "TULYA-BF-OH-CLEAN-C59BD4B",
+  "date": "2026-08-24",
+  "phase": "clean-reproduction",
+  "claim_bearing": false,
+  "reproduces_claim": "TULYA-BF-OH-EVAL-R1",
+  "reason_not_claim_bearing": "This is a clean same-machine reproduction of the public evaluation partition, not the reserved independent holdout.",
+  "pass": true,
+  "holdout_accessed": false,
+  "raw_summary_sha256": "d891e8d33b5b64f856ddbbd9223944cb8d723373f02bc96e1219c2afe9c984e7",
+  "source": {
+    "git_commit": "c59bd4b3b0b71bbf7b8f2446e3858364bbd531cc",
+    "git_clean_before": true,
+    "git_clean_after": true,
+    "tree_sha256": "687f3bd28f37dbbb9a80cee7bff5c9010fb434d8743ad224ab0d70a8cbb8fc59",
+    "tree_file_count": 67,
+    "tulya_binary_sha256": "29659413bc4d07cd035cc40c87e4c1197715b75c3280127b6830d56209368228",
+    "sqlite_binary_sha256": "80110eb96f0712da033e103fae623ca63e962fef26b3573b5c17d143a95316aa"
+  },
+  "corpus": {
+    "name": "Nebius SWE-ReBench OpenHands evaluation partition",
+    "source_revision": "35455389ab51bf5e2306bfd436ef72d0f98bf882",
+    "sha256": "a931c659530c083933b7da5fd886bcee0068c8c8df3ce57f6aea43fae18df12e",
+    "size_bytes": 24540161,
+    "checkpoint_count": 11383,
+    "attempt_ref_count": 91
+  },
+  "environment": {
+    "platform": "Linux-7.1.8-arch1-3-x86_64-with-glibc2.44",
+    "python": "3.14.7",
+    "cpu_count": 12,
+    "filesystem": "ext4",
+    "filesystem_source": "/dev/nvme0n1p2",
+    "filesystem_options": "rw,noatime",
+    "volatile_filesystem": false
+  },
+  "all_arms_exact_before_and_after_reopen": true,
+  "all_counts_equal": true,
+  "arms": {
+    "tulya_public_api": {
+      "marginal_reopened_allocated_bytes": 5492736,
+      "durable_append_p50_ns": 364979,
+      "reopened_read_p50_ns": 20158,
+      "reopen_duration_ns": 34564915,
+      "peak_rss_bytes": 90816512,
+      "wall_elapsed_ns": 21252781010
+    },
+    "normalized_sqlite_delta": {
+      "marginal_reopened_allocated_bytes": 38240256,
+      "durable_append_p50_ns": 815682,
+      "reopened_read_p50_ns": 993933,
+      "reopen_duration_ns": 100492,
+      "peak_rss_bytes": 48943104,
+      "wall_elapsed_ns": 34721885223
+    },
+    "cas_sqlite_delta": {
+      "marginal_reopened_allocated_bytes": 37097472,
+      "durable_append_p50_ns": 878559,
+      "reopened_read_p50_ns": 1565039,
+      "peak_rss_bytes": 232345600,
+      "wall_elapsed_ns": 56468430035
+    },
+    "raw_full_snapshot": {
+      "marginal_reopened_allocated_bytes": 1407893504,
+      "durable_append_p50_ns": 2261669,
+      "reopened_read_p50_ns": 394583,
+      "peak_rss_bytes": 243470336,
+      "wall_elapsed_ns": 50855610975
+    },
+    "zstd_full_snapshot": {
+      "marginal_reopened_allocated_bytes": 311902208,
+      "durable_append_p50_ns": 1885671,
+      "reopened_read_p50_ns": 158532,
+      "peak_rss_bytes": 236908544,
+      "wall_elapsed_ns": 30737901615
+    },
+    "langgraph_sqlite_full": {
+      "marginal_reopened_allocated_bytes": 2827210752,
+      "durable_append_p50_ns": 4606858,
+      "reopened_read_p50_ns": 1064807,
+      "peak_rss_bytes": 303230976,
+      "wall_elapsed_ns": 117094872308
+    },
+    "langgraph_sqlite_delta": {
+      "marginal_reopened_allocated_bytes": 67997696,
+      "durable_append_p50_ns": 8313925,
+      "reopened_read_p50_ns": 4627761,
+      "peak_rss_bytes": 269721600,
+      "wall_elapsed_ns": 353239887040
+    },
+    "packed_git": {
+      "marginal_reopened_allocated_bytes": 19673088,
+      "durable_append_comparable": false,
+      "reopened_read_p50_ns": 81245,
+      "peak_rss_bytes": 243769344,
+      "wall_elapsed_ns": 86778322767
+    },
+    "langgraph_postgresql_full": {
+      "relation_marginal_allocated_bytes": 507494400,
+      "database_growth_bytes": 507666432,
+      "wal_generated_workload_bytes": 532503768,
+      "durable_append_p50_ns": 6877318,
+      "reopened_read_p50_ns": 1779246,
+      "client_peak_rss_bytes": 2894540800,
+      "wall_elapsed_ns": 165092200858,
+      "durability": {
+        "fsync": "on",
+        "full_page_writes": "on",
+        "synchronous_commit": "on"
+      },
+      "storage_ratio_comparable_to_tulya": false
+    }
+  },
+  "selected_ratios_comparator_over_tulya": {
+    "langgraph_sqlite_delta_marginal_storage": 12.379567486950037,
+    "normalized_sqlite_marginal_storage": 6.961968680089486,
+    "cas_sqlite_marginal_storage": 6.7539149888143175,
+    "packed_git_marginal_storage": 3.58165548098434,
+    "normalized_sqlite_reopened_read_p50": 49.30712372259153,
+    "cas_sqlite_reopened_read_p50": 77.63860502033931,
+    "packed_git_reopened_read_p50": 4.030409762873301
+  },
+  "observed_losses": {
+    "tulya_over_normalized_sqlite_peak_rss": 1.8555527659218345,
+    "sqlite_over_tulya_reopen_speed": 343.9568821398718,
+    "packed_git_was_the_closest_storage_comparator": true,
+    "langgraph_delta_total_wall_time_was_highest": true,
+    "postgres_client_peak_rss_bytes": 2894540800
+  },
+  "prohibited_inferences": [
+    "independent holdout success",
+    "customer-validated ROI",
+    "100x end-to-end cost reduction",
+    "universal superiority to Git or optimized history stores",
+    "power-loss safety",
+    "semantic-memory or model-quality improvement"
+  ],
+  "next_gate": "Have an independent evaluator run the reserved holdout once from a clean release commit, without tuning after observation."
+}
