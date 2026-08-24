@@ -2,7 +2,7 @@
 
 This focused repository was extracted on 2026-08-23 from:
 
-- source repository: `/home/vedsaga/rust_projects/tulya-engine`;
+- source repository: `Vedsaga/tulya-engine`;
 - source commit: `4ab176c1dd4bbca143eefe1bcc0b6dac0a79ef24`;
 - production store body SHA-256:
   `a4963cd00a73c12d492c2a56065519f0556c58f2f145abbd6fb15db1bb520d04`.

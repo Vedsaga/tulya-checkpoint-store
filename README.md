@@ -158,8 +158,7 @@ branches, resume idempotently, and reach the target on the next reopen.
 This proves behavior at named userspace process-exit boundaries on the tested
 Linux/filesystem stack. It does not establish drive-cache, torn-sector,
 cross-filesystem, multi-writer, distributed-consensus, or sudden-power-loss
-safety. Read [`docs/RECOVERY.md`](docs/RECOVERY.md) and
-[`docs/CRASH_TESTING.md`](docs/CRASH_TESTING.md) before using Tulya as an
+safety. Read [`docs/RECOVERY.md`](docs/RECOVERY.md) before using Tulya as an
 authoritative store.
 
 ## Verify the release
@@ -194,7 +193,7 @@ python3 benchmarks/release_smoke.py
 - [On-disk format and compatibility](docs/FORMAT.md)
 - [Durability and recovery](docs/RECOVERY.md)
 - [LangGraph verified shadow](integrations/langgraph/README.md)
-- [Design-partner evaluation](docs/DESIGN_PARTNER.md)
+- [Evaluate Tulya on your workload](docs/EVALUATING_TULYA.md)
 - [Security policy](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
 

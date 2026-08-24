@@ -43,9 +43,8 @@ cargo build --release --locked \
 
 ## Obtain and freeze the public corpus
 
-The raw datasets are not redistributed in the crate. Downloading them is not
-necessary on the original development machine because both pinned sources are
-already present there.
+The raw datasets are not redistributed in the crate. Download the two pinned
+public sources once, then reuse the locally verified copies across runs.
 
 ```bash
 .venv-branch-forest/bin/python benchmarks/download_real_data.py \

@@ -24,8 +24,3 @@ format number; an internal codec or manifest implementation revision does not.
 The committed golden store is at `tests/fixtures/format-v1`. Its integration
 test checks independent `fsck`, reopen, root reconstruction, and two exact
 sibling branches. Do not regenerate this fixture as part of ordinary tests.
-
-Private development builds produced manifests with internal revision labels.
-The release reader can upgrade those local pre-release manifests, but those
-labels were never public compatibility contracts and are not emitted by the
-released writer.
