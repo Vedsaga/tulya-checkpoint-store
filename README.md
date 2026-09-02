@@ -209,6 +209,7 @@ python3 benchmarks/release_smoke.py
 
 ## Documentation
 
+- [Production-readiness plan and release gates](docs/PRODUCTION_READINESS.md)
 - [Evaluate Tulya and use the local API](docs/EVALUATING_TULYA.md)
 - [Exact benchmark and reproduction](docs/BENCHMARKS.md)
 - [On-disk format](docs/FORMAT.md)
