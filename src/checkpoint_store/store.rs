@@ -1547,7 +1547,7 @@ impl CheckpointStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if file metadata cannot be read.
+    /// Returns an error if WAL metadata cannot be read.
     pub fn hot_capacity_bytes(&self) -> Result<u64, CheckpointStoreError> {
         self.hot.capacity()
     }
