@@ -683,6 +683,7 @@ pub struct CheckpointStore {
     dir: PathBuf,
     config: CheckpointStoreConfig,
     manifest: Manifest,
+    store_id: StoreId,
     state: StoreState,
     _writer_lock: WriterLock,
     hot: HotWal,
