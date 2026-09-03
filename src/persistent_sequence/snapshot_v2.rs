@@ -1,8 +1,9 @@
 //! Canonical sealed semantic snapshot for staged Format v2.
 //!
 //! `T2S2` pairs the already-accepted `T2I2` persistent-sequence arena image
-//! with version/checkpoint publication metadata and durable request ledgers.
-//! It is an immutable reopen artifact, not a foreground append format.
+//! with version/checkpoint publication metadata, durable request ledgers, and
+//! logical-deletion tombstones. It is an immutable reopen artifact, not a
+//! foreground append format.
 
 use super::avl::{V2AvlError, V2AvlSequence};
 use super::commit_v2::{checkpoint_operation_digest, V2CommitError};
@@ -15,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 const V2_SNAPSHOT_MAGIC: [u8; 4] = *b"T2S2";
-const V2_SNAPSHOT_SCHEMA: u32 = 1;
+const V2_SNAPSHOT_SCHEMA: u32 = 2;
 const V2_SNAPSHOT_HEADER_SIZE: usize = 96;
 const V2_SNAPSHOT_PREFIX_SIZE: usize = 64;
 const V2_SNAPSHOT_DIGEST_OFFSET: usize = 64;
@@ -25,7 +26,10 @@ const V2_ACTIVE_REQUEST_MAGIC: [u8; 4] = *b"T2A2";
 const V2_ACTIVE_REQUEST_PREFIX_SIZE: usize = 56;
 const V2_RETIRED_REQUEST_MAGIC: [u8; 4] = *b"T2D2";
 const V2_RETIRED_REQUEST_PREFIX_SIZE: usize = 48;
+const V2_DELETED_CHECKPOINT_MAGIC: [u8; 4] = *b"T2X2";
+const V2_DELETED_CHECKPOINT_PREFIX_SIZE: usize = 16;
 const V2_MAX_REQUEST_ID_BYTES: usize = 4096;
+const V2_MAX_IDENTIFIER_BYTES: usize = 4096;
 const V2_MAX_FIXED_RECORD_SIZE: u32 = 4096;
 const V2_MIN_CHECKPOINT_RECORD_SIZE: usize = 88;
 
@@ -131,12 +135,44 @@ impl V2RetiredRequestRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct V2DeletedCheckpointRecord {
+    thread_id: String,
+    checkpoint_id: String,
+}
+
+impl V2DeletedCheckpointRecord {
+    pub(super) fn new(
+        thread_id: String,
+        checkpoint_id: String,
+    ) -> Result<Self, V2SnapshotError> {
+        validate_identifier(&thread_id, "v2 deleted checkpoint thread id is invalid")?;
+        validate_identifier(
+            &checkpoint_id,
+            "v2 deleted checkpoint checkpoint id is invalid",
+        )?;
+        Ok(Self {
+            thread_id,
+            checkpoint_id,
+        })
+    }
+
+    pub(super) fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
+    pub(super) fn checkpoint_id(&self) -> &str {
+        &self.checkpoint_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct V2SealedSnapshot {
     pub(super) image: Vec<u8>,
     pub(super) versions: Vec<V2VersionRecord>,
     pub(super) checkpoints: Vec<V2CheckpointRecord>,
     pub(super) active_requests: Vec<V2ActiveRequestRecord>,
     pub(super) retired_requests: Vec<V2RetiredRequestRecord>,
+    pub(super) deleted_checkpoints: Vec<V2DeletedCheckpointRecord>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,16 +195,16 @@ pub(super) fn encode_v2_sealed_snapshot(
     for version in &snapshot.versions {
         version_records.push(encode_v2_version(*version)?.to_vec());
     }
-    let version_record_size = u32::try_from(
-        version_records
-            .first()
-            .ok_or(V2SnapshotError::Invalid(
-                "v2 sealed snapshot requires at least one version",
-            ))?
-            .len(),
-    )
-    .map_err(|_| V2SnapshotError::Overflow("v2 snapshot version record width exceeds u32"))?;
-    validate_fixed_record_size(version_record_size)?;
+    let version_record_size = match version_records.first() {
+        Some(record) => {
+            let width = u32::try_from(record.len()).map_err(|_| {
+                V2SnapshotError::Overflow("v2 snapshot version record width exceeds u32")
+            })?;
+            validate_fixed_record_size(width)?;
+            width
+        }
+        None => 0,
+    };
 
     let mut checkpoint_records = Vec::with_capacity(snapshot.checkpoints.len());
     for checkpoint in &snapshot.checkpoints {
@@ -189,13 +225,30 @@ pub(super) fn encode_v2_sealed_snapshot(
         retired_records.push(encode_retired_request(record)?);
     }
 
+    let mut deleted_checkpoints = snapshot.deleted_checkpoints.clone();
+    deleted_checkpoints.sort_by(|left, right| {
+        left.thread_id
+            .cmp(&right.thread_id)
+            .then_with(|| left.checkpoint_id.cmp(&right.checkpoint_id))
+    });
+    let mut deleted_records = Vec::with_capacity(deleted_checkpoints.len());
+    for record in &deleted_checkpoints {
+        deleted_records.push(encode_deleted_checkpoint(record)?);
+    }
+
+    let version_bytes = sum_lengths(&version_records)?;
+    let checkpoint_bytes = sum_lengths(&checkpoint_records)?;
+    let active_bytes = sum_lengths(&active_records)?;
+    let retired_bytes = sum_lengths(&retired_records)?;
+    let deleted_bytes = sum_lengths(&deleted_records)?;
     let body_len = snapshot
         .image
         .len()
-        .checked_add(sum_lengths(&version_records)?)
-        .and_then(|value| value.checked_add(sum_lengths(&checkpoint_records).ok()?))
-        .and_then(|value| value.checked_add(sum_lengths(&active_records).ok()?))
-        .and_then(|value| value.checked_add(sum_lengths(&retired_records).ok()?))
+        .checked_add(version_bytes)
+        .and_then(|value| value.checked_add(checkpoint_bytes))
+        .and_then(|value| value.checked_add(active_bytes))
+        .and_then(|value| value.checked_add(retired_bytes))
+        .and_then(|value| value.checked_add(deleted_bytes))
         .ok_or(V2SnapshotError::Overflow(
             "v2 sealed snapshot body length exceeds usize",
         ))?;
@@ -230,6 +283,7 @@ pub(super) fn encode_v2_sealed_snapshot(
     append_records(&mut output, &checkpoint_records);
     append_records(&mut output, &active_records);
     append_records(&mut output, &retired_records);
+    append_records(&mut output, &deleted_records);
     if output.len() != total_len {
         return Err(V2SnapshotError::Invalid(
             "v2 sealed snapshot encoder produced an unexpected length",
@@ -273,11 +327,6 @@ pub(super) fn decode_v2_sealed_snapshot(bytes: &[u8]) -> Result<V2SealedSnapshot
 
     let image_len = usize::try_from(header.image_len)
         .map_err(|_| V2SnapshotError::Overflow("v2 snapshot image length exceeds usize"))?;
-    if image_len == 0 {
-        return Err(V2SnapshotError::Invalid(
-            "v2 sealed snapshot image must be non-empty",
-        ));
-    }
     let image_end =
         V2_SNAPSHOT_HEADER_SIZE
             .checked_add(image_len)
@@ -289,32 +338,41 @@ pub(super) fn decode_v2_sealed_snapshot(bytes: &[u8]) -> Result<V2SealedSnapshot
         .ok_or(V2SnapshotError::Invalid("v2 snapshot image is truncated"))?
         .to_vec();
 
-    let version_record_size = usize::try_from(header.version_record_size)
-        .map_err(|_| V2SnapshotError::Overflow("v2 snapshot version width exceeds usize"))?;
-    validate_fixed_record_size(header.version_record_size)?;
     let mut cursor = image_end;
-    let version_count = bounded_count(
-        header.version_count,
-        bytes.len().saturating_sub(cursor),
-        version_record_size,
-        "v2 snapshot version count exceeds body capacity",
-    )?;
+    let version_count = usize::try_from(header.version_count)
+        .map_err(|_| V2SnapshotError::Overflow("v2 snapshot version count exceeds usize"))?;
     let mut versions = Vec::with_capacity(version_count);
-    for index in 0..version_count {
-        let end = cursor
-            .checked_add(version_record_size)
-            .ok_or(V2SnapshotError::Overflow(
-                "v2 snapshot version end exceeds usize",
-            ))?;
-        let expected_version_id = u32::try_from(index)
-            .map_err(|_| V2SnapshotError::Overflow("v2 snapshot version id exceeds u32"))?;
-        versions.push(decode_v2_version(
-            bytes
-                .get(cursor..end)
-                .ok_or(V2SnapshotError::Invalid("v2 snapshot version is truncated"))?,
-            expected_version_id,
-        )?);
-        cursor = end;
+    if version_count == 0 {
+        if header.version_record_size != 0 {
+            return Err(V2SnapshotError::Invalid(
+                "v2 snapshot empty version table has nonzero record width",
+            ));
+        }
+    } else {
+        validate_fixed_record_size(header.version_record_size)?;
+        let version_record_size = usize::try_from(header.version_record_size)
+            .map_err(|_| V2SnapshotError::Overflow("v2 snapshot version width exceeds usize"))?;
+        if version_count > bytes.len().saturating_sub(cursor) / version_record_size {
+            return Err(V2SnapshotError::Invalid(
+                "v2 snapshot version count exceeds body capacity",
+            ));
+        }
+        for index in 0..version_count {
+            let end = cursor
+                .checked_add(version_record_size)
+                .ok_or(V2SnapshotError::Overflow(
+                    "v2 snapshot version end exceeds usize",
+                ))?;
+            let expected_version_id = u32::try_from(index)
+                .map_err(|_| V2SnapshotError::Overflow("v2 snapshot version id exceeds u32"))?;
+            versions.push(decode_v2_version(
+                bytes
+                    .get(cursor..end)
+                    .ok_or(V2SnapshotError::Invalid("v2 snapshot version is truncated"))?,
+                expected_version_id,
+            )?);
+            cursor = end;
+        }
     }
 
     let checkpoint_count = bounded_count(
@@ -390,52 +448,88 @@ pub(super) fn decode_v2_sealed_snapshot(bytes: &[u8]) -> Result<V2SealedSnapshot
         cursor = end;
     }
 
-    if cursor != bytes.len() {
-        return Err(V2SnapshotError::Invalid(
-            "v2 sealed snapshot has trailing bytes",
-        ));
+    let mut deleted_checkpoints = Vec::new();
+    let mut previous_deleted: Option<(String, String)> = None;
+    while cursor < bytes.len() {
+        let record_len = framed_record_len(
+            bytes,
+            cursor,
+            "v2 deleted checkpoint record length is truncated",
+        )?;
+        let end = cursor
+            .checked_add(record_len)
+            .ok_or(V2SnapshotError::Overflow(
+                "v2 deleted checkpoint record end exceeds usize",
+            ))?;
+        let record = decode_deleted_checkpoint(bytes.get(cursor..end).ok_or(
+            V2SnapshotError::Invalid("v2 deleted checkpoint record is truncated"),
+        )?)?;
+        require_strict_deleted_order(previous_deleted.as_ref(), &record)?;
+        previous_deleted = Some((record.thread_id.clone(), record.checkpoint_id.clone()));
+        deleted_checkpoints.push(record);
+        cursor = end;
     }
+
     let snapshot = V2SealedSnapshot {
         image,
         versions,
         checkpoints,
         active_requests,
         retired_requests,
+        deleted_checkpoints,
     };
     validate_snapshot(&snapshot)?;
     Ok(snapshot)
 }
 
 fn validate_snapshot(snapshot: &V2SealedSnapshot) -> Result<(), V2SnapshotError> {
-    if snapshot.versions.is_empty() || snapshot.checkpoints.is_empty() {
-        return Err(V2SnapshotError::Invalid(
-            "v2 sealed snapshot requires committed versions and checkpoints",
-        ));
-    }
-    let (_, image_roots) = V2AvlSequence::import_image(&snapshot.image)?;
-    if image_roots.len() != snapshot.versions.len() {
-        return Err(V2SnapshotError::Invalid(
-            "v2 snapshot image roots do not match version count",
-        ));
-    }
-    for (index, (root, version)) in image_roots
-        .iter()
-        .copied()
-        .zip(snapshot.versions.iter().copied())
-        .enumerate()
-    {
-        let expected_id = u32::try_from(index)
-            .map_err(|_| V2SnapshotError::Overflow("v2 snapshot version id exceeds u32"))?;
-        if version.version_id() != expected_id {
+    if snapshot.checkpoints.is_empty() {
+        if !snapshot.image.is_empty() || !snapshot.versions.is_empty() {
             return Err(V2SnapshotError::Invalid(
-                "v2 snapshot version identifiers are not sequential",
+                "v2 tombstone-only snapshot contains live sequence state",
             ));
         }
-        encode_v2_version(version)?;
-        if root != version.root() {
+        if !snapshot.active_requests.is_empty() {
             return Err(V2SnapshotError::Invalid(
-                "v2 snapshot image root disagrees with version root",
+                "v2 tombstone-only snapshot contains active requests",
             ));
+        }
+        if snapshot.retired_requests.is_empty() && snapshot.deleted_checkpoints.is_empty() {
+            return Err(V2SnapshotError::Invalid(
+                "v2 empty semantic state has no snapshot artifact",
+            ));
+        }
+    } else {
+        if snapshot.image.is_empty() || snapshot.versions.is_empty() {
+            return Err(V2SnapshotError::Invalid(
+                "v2 live snapshot requires sequence image and versions",
+            ));
+        }
+        let (_, image_roots) = V2AvlSequence::import_image(&snapshot.image)?;
+        if image_roots.len() != snapshot.versions.len() {
+            return Err(V2SnapshotError::Invalid(
+                "v2 snapshot image roots do not match version count",
+            ));
+        }
+        for (index, (root, version)) in image_roots
+            .iter()
+            .copied()
+            .zip(snapshot.versions.iter().copied())
+            .enumerate()
+        {
+            let expected_id = u32::try_from(index)
+                .map_err(|_| V2SnapshotError::Overflow("v2 snapshot version id exceeds u32"))?;
+            if version.version_id() != expected_id {
+                return Err(V2SnapshotError::Invalid(
+                    "v2 snapshot version identifiers are not sequential",
+                ));
+            }
+            encode_v2_version(version)?;
+            if root != version.root() {
+                return Err(V2SnapshotError::Invalid(
+                    "v2 snapshot image root disagrees with version root",
+                ));
+            }
         }
     }
 
@@ -479,6 +573,29 @@ fn validate_snapshot(snapshot: &V2SealedSnapshot) -> Result<(), V2SnapshotError>
         {
             return Err(V2SnapshotError::Invalid(
                 "v2 snapshot contains a duplicate checkpoint identity",
+            ));
+        }
+    }
+
+    let mut deleted_ids = HashSet::<(String, String)>::new();
+    for record in &snapshot.deleted_checkpoints {
+        validate_identifier(
+            record.thread_id(),
+            "v2 deleted checkpoint thread id is invalid",
+        )?;
+        validate_identifier(
+            record.checkpoint_id(),
+            "v2 deleted checkpoint checkpoint id is invalid",
+        )?;
+        let key = (record.thread_id.clone(), record.checkpoint_id.clone());
+        if checkpoint_ordinals.contains_key(&key) {
+            return Err(V2SnapshotError::Invalid(
+                "v2 checkpoint identity is both live and deleted",
+            ));
+        }
+        if !deleted_ids.insert(key) {
+            return Err(V2SnapshotError::Invalid(
+                "v2 snapshot contains a duplicate deleted checkpoint identity",
             ));
         }
     }
@@ -702,6 +819,121 @@ fn decode_retired_request(bytes: &[u8]) -> Result<V2RetiredRequestRecord, V2Snap
     )
 }
 
+fn encode_deleted_checkpoint(
+    record: &V2DeletedCheckpointRecord,
+) -> Result<Vec<u8>, V2SnapshotError> {
+    validate_identifier(
+        record.thread_id(),
+        "v2 deleted checkpoint thread id is invalid",
+    )?;
+    validate_identifier(
+        record.checkpoint_id(),
+        "v2 deleted checkpoint checkpoint id is invalid",
+    )?;
+    let record_len = V2_DELETED_CHECKPOINT_PREFIX_SIZE
+        .checked_add(record.thread_id.len())
+        .and_then(|value| value.checked_add(record.checkpoint_id.len()))
+        .ok_or(V2SnapshotError::Overflow(
+            "v2 deleted checkpoint record length exceeds usize",
+        ))?;
+    let record_len_u32 = u32::try_from(record_len)
+        .map_err(|_| V2SnapshotError::Overflow("v2 deleted checkpoint length exceeds u32"))?;
+    let thread_len = u32::try_from(record.thread_id.len())
+        .map_err(|_| V2SnapshotError::Overflow("v2 deleted checkpoint thread length exceeds u32"))?;
+    let checkpoint_len = u32::try_from(record.checkpoint_id.len()).map_err(|_| {
+        V2SnapshotError::Overflow("v2 deleted checkpoint checkpoint length exceeds u32")
+    })?;
+    let mut output = Vec::with_capacity(record_len);
+    output.extend_from_slice(&V2_DELETED_CHECKPOINT_MAGIC);
+    output.extend_from_slice(&record_len_u32.to_le_bytes());
+    output.extend_from_slice(&thread_len.to_le_bytes());
+    output.extend_from_slice(&checkpoint_len.to_le_bytes());
+    output.extend_from_slice(record.thread_id.as_bytes());
+    output.extend_from_slice(record.checkpoint_id.as_bytes());
+    Ok(output)
+}
+
+fn decode_deleted_checkpoint(bytes: &[u8]) -> Result<V2DeletedCheckpointRecord, V2SnapshotError> {
+    if bytes.len() < V2_DELETED_CHECKPOINT_PREFIX_SIZE {
+        return Err(V2SnapshotError::Invalid(
+            "v2 deleted checkpoint record is shorter than its prefix",
+        ));
+    }
+    if bytes.get(..4) != Some(V2_DELETED_CHECKPOINT_MAGIC.as_slice()) {
+        return Err(V2SnapshotError::Invalid(
+            "v2 deleted checkpoint magic mismatch",
+        ));
+    }
+    let record_len = usize::try_from(read_u32(
+        bytes,
+        4,
+        "v2 deleted checkpoint length is truncated",
+    )?)
+    .map_err(|_| V2SnapshotError::Overflow("v2 deleted checkpoint length exceeds usize"))?;
+    if record_len != bytes.len() {
+        return Err(V2SnapshotError::Invalid(
+            "v2 deleted checkpoint record length mismatch",
+        ));
+    }
+    let thread_len = usize::try_from(read_u32(
+        bytes,
+        8,
+        "v2 deleted checkpoint thread length is truncated",
+    )?)
+    .map_err(|_| V2SnapshotError::Overflow("v2 deleted checkpoint thread length exceeds usize"))?;
+    let checkpoint_len = usize::try_from(read_u32(
+        bytes,
+        12,
+        "v2 deleted checkpoint checkpoint length is truncated",
+    )?)
+    .map_err(|_| {
+        V2SnapshotError::Overflow("v2 deleted checkpoint checkpoint length exceeds usize")
+    })?;
+    if thread_len == 0 || thread_len > V2_MAX_IDENTIFIER_BYTES {
+        return Err(V2SnapshotError::Invalid(
+            "v2 deleted checkpoint thread id is invalid",
+        ));
+    }
+    if checkpoint_len == 0 || checkpoint_len > V2_MAX_IDENTIFIER_BYTES {
+        return Err(V2SnapshotError::Invalid(
+            "v2 deleted checkpoint checkpoint id is invalid",
+        ));
+    }
+    let thread_start = V2_DELETED_CHECKPOINT_PREFIX_SIZE;
+    let thread_end = thread_start
+        .checked_add(thread_len)
+        .ok_or(V2SnapshotError::Overflow(
+            "v2 deleted checkpoint thread end exceeds usize",
+        ))?;
+    let checkpoint_end = thread_end
+        .checked_add(checkpoint_len)
+        .ok_or(V2SnapshotError::Overflow(
+            "v2 deleted checkpoint checkpoint end exceeds usize",
+        ))?;
+    if checkpoint_end != bytes.len() {
+        return Err(V2SnapshotError::Invalid(
+            "v2 deleted checkpoint identifier geometry mismatch",
+        ));
+    }
+    let thread_id = decode_identifier(
+        bytes
+            .get(thread_start..thread_end)
+            .ok_or(V2SnapshotError::Invalid(
+                "v2 deleted checkpoint thread bytes are truncated",
+            ))?,
+        "v2 deleted checkpoint thread id is not UTF-8",
+    )?;
+    let checkpoint_id = decode_identifier(
+        bytes
+            .get(thread_end..checkpoint_end)
+            .ok_or(V2SnapshotError::Invalid(
+                "v2 deleted checkpoint checkpoint bytes are truncated",
+            ))?,
+        "v2 deleted checkpoint checkpoint id is not UTF-8",
+    )?;
+    V2DeletedCheckpointRecord::new(thread_id, checkpoint_id)
+}
+
 fn encode_header_prefix(header: V2SnapshotHeader, output: &mut [u8]) {
     output[0..4].copy_from_slice(&V2_SNAPSHOT_MAGIC);
     output[4..8].copy_from_slice(&V2_SNAPSHOT_SCHEMA.to_le_bytes());
@@ -774,6 +1006,19 @@ fn validate_request_id(request_id: &[u8]) -> Result<(), V2SnapshotError> {
     Ok(())
 }
 
+fn validate_identifier(value: &str, message: &'static str) -> Result<(), V2SnapshotError> {
+    if value.is_empty() || value.len() > V2_MAX_IDENTIFIER_BYTES {
+        return Err(V2SnapshotError::Invalid(message));
+    }
+    Ok(())
+}
+
+fn decode_identifier(bytes: &[u8], message: &'static str) -> Result<String, V2SnapshotError> {
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| V2SnapshotError::Invalid(message))
+}
+
 fn require_strict_request_order(
     previous: Option<&[u8]>,
     current: &[u8],
@@ -781,6 +1026,21 @@ fn require_strict_request_order(
     if previous.is_some_and(|value| value >= current) {
         return Err(V2SnapshotError::Invalid(
             "v2 snapshot request records are not in strict lexical order",
+        ));
+    }
+    Ok(())
+}
+
+fn require_strict_deleted_order(
+    previous: Option<&(String, String)>,
+    current: &V2DeletedCheckpointRecord,
+) -> Result<(), V2SnapshotError> {
+    if previous.is_some_and(|(thread_id, checkpoint_id)| {
+        (thread_id.as_str(), checkpoint_id.as_str())
+            >= (current.thread_id(), current.checkpoint_id())
+    }) {
+        return Err(V2SnapshotError::Invalid(
+            "v2 deleted checkpoint records are not in strict lexical order",
         ));
     }
     Ok(())
@@ -894,18 +1154,19 @@ mod tests {
             )
             .unwrap()],
             retired_requests: Vec::new(),
+            deleted_checkpoints: Vec::new(),
         }
     }
 
     #[test]
-    fn sealed_snapshot_round_trip_matches_independent_golden_digest() {
+    fn sealed_snapshot_round_trip_matches_independent_schema2_golden_digest() {
         let snapshot = one_checkpoint_snapshot();
         let encoded = encode_v2_sealed_snapshot(&snapshot).unwrap();
         assert_eq!(encoded.len(), 530);
         assert_eq!(
             encoded.get(V2_SNAPSHOT_DIGEST_OFFSET..V2_SNAPSHOT_HEADER_SIZE),
             Some(
-                hex_bytes("f31c62e5f4c884424addf7dcd6716c633a0e738be495f6de476ec70401db7516")
+                hex_bytes("ae8abba06121c8c689ed2b3cf822fc750b184f373e0b947a9c0ab9ad448d0cfc")
                     .as_slice()
             )
         );
@@ -913,17 +1174,49 @@ mod tests {
     }
 
     #[test]
-    fn request_ledgers_encode_in_canonical_lexical_order() {
+    fn tombstone_only_snapshot_round_trips_with_independent_golden_digest() {
+        let snapshot = V2SealedSnapshot {
+            image: Vec::new(),
+            versions: Vec::new(),
+            checkpoints: Vec::new(),
+            active_requests: Vec::new(),
+            retired_requests: Vec::new(),
+            deleted_checkpoints: vec![V2DeletedCheckpointRecord::new(
+                "thread".to_owned(),
+                "cp-old".to_owned(),
+            )
+            .unwrap()],
+        };
+        let encoded = encode_v2_sealed_snapshot(&snapshot).unwrap();
+        assert_eq!(encoded.len(), 124);
+        assert_eq!(
+            encoded.get(V2_SNAPSHOT_DIGEST_OFFSET..V2_SNAPSHOT_HEADER_SIZE),
+            Some(
+                hex_bytes("6a63a9f5cace063e835d3f61b4886d2a4a3fd6a95ac6f34162baf4c149825782")
+                    .as_slice()
+            )
+        );
+        assert_eq!(decode_v2_sealed_snapshot(&encoded), Ok(snapshot));
+    }
+
+    #[test]
+    fn request_and_deleted_ledgers_encode_in_canonical_lexical_order() {
         let mut snapshot = one_checkpoint_snapshot();
         let digest = snapshot.active_requests[0].operation_digest();
         snapshot.active_requests = vec![
             V2ActiveRequestRecord::new(b"z-request".to_vec(), digest, 0).unwrap(),
             V2ActiveRequestRecord::new(b"a-request".to_vec(), digest, 0).unwrap(),
         ];
+        snapshot.deleted_checkpoints = vec![
+            V2DeletedCheckpointRecord::new("z-thread".to_owned(), "cp-2".to_owned()).unwrap(),
+            V2DeletedCheckpointRecord::new("a-thread".to_owned(), "cp-9".to_owned()).unwrap(),
+        ];
         let encoded = encode_v2_sealed_snapshot(&snapshot).unwrap();
         let decoded = decode_v2_sealed_snapshot(&encoded).unwrap();
         assert_eq!(decoded.active_requests[0].request_id(), b"a-request");
         assert_eq!(decoded.active_requests[1].request_id(), b"z-request");
+        assert_eq!(decoded.deleted_checkpoints[0].thread_id(), "a-thread");
+        assert_eq!(decoded.deleted_checkpoints[1].thread_id(), "z-thread");
         assert_eq!(encode_v2_sealed_snapshot(&decoded).unwrap(), encoded);
     }
 
@@ -945,7 +1238,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_rejects_version_root_and_checkpoint_parent_inconsistency() {
+    fn snapshot_rejects_version_root_parent_and_deleted_identity_inconsistency() {
         let mut sequence = V2AvlSequence::default();
         let root_a = sequence.append(None, b"abc").unwrap().root();
         let root_b = sequence.append(Some(root_a), b"XYZ").unwrap().root();
@@ -968,6 +1261,7 @@ mod tests {
             checkpoints: vec![checkpoint],
             active_requests: Vec::new(),
             retired_requests: Vec::new(),
+            deleted_checkpoints: Vec::new(),
         };
         let error = encode_v2_sealed_snapshot(&snapshot).unwrap_err();
         assert!(error
@@ -991,11 +1285,35 @@ mod tests {
             checkpoints: vec![checkpoint],
             active_requests: Vec::new(),
             retired_requests: Vec::new(),
+            deleted_checkpoints: Vec::new(),
         };
         let error = encode_v2_sealed_snapshot(&snapshot).unwrap_err();
         assert!(error
             .to_string()
             .contains("checkpoint parent is not topologically prior"));
+
+        let mut snapshot = one_checkpoint_snapshot();
+        snapshot.deleted_checkpoints.push(
+            V2DeletedCheckpointRecord::new("thread".to_owned(), "cp-1".to_owned()).unwrap(),
+        );
+        let error = encode_v2_sealed_snapshot(&snapshot).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("checkpoint identity is both live and deleted"));
+    }
+
+    #[test]
+    fn schema1_snapshot_is_rejected_after_tombstone_semantics_bump() {
+        let snapshot = one_checkpoint_snapshot();
+        let mut encoded = encode_v2_sealed_snapshot(&snapshot).unwrap();
+        encoded[4..8].copy_from_slice(&1u32.to_le_bytes());
+        let digest = snapshot_digest(
+            &encoded[..V2_SNAPSHOT_PREFIX_SIZE],
+            &encoded[V2_SNAPSHOT_HEADER_SIZE..],
+        );
+        encoded[V2_SNAPSHOT_DIGEST_OFFSET..V2_SNAPSHOT_HEADER_SIZE].copy_from_slice(&digest);
+        let error = decode_v2_sealed_snapshot(&encoded).unwrap_err();
+        assert!(error.to_string().contains("schema is unsupported"));
     }
 
     fn hex_bytes(value: &str) -> Vec<u8> {
