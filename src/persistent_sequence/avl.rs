@@ -8,8 +8,7 @@
 
 use super::format_v2::{V2FormatError, V2NodeRecord, V2RootRecord};
 use super::image_v2::{
-    decode_v2_image, encode_v2_image, v2_node_fields, V2ImageError, V2NodeFields,
-    V2SequenceImage,
+    decode_v2_image, encode_v2_image, v2_node_fields, V2ImageError, V2NodeFields, V2SequenceImage,
 };
 use std::fmt;
 
@@ -225,9 +224,7 @@ impl V2AvlSequence {
     }
 
     /// Reconstructs an arena from one canonical v2 image and validates every node.
-    pub(super) fn import_image(
-        bytes: &[u8],
-    ) -> Result<(Self, Vec<V2RootRecord>), V2AvlError> {
+    pub(super) fn import_image(bytes: &[u8]) -> Result<(Self, Vec<V2RootRecord>), V2AvlError> {
         let image = decode_v2_image(bytes)?;
         let mut sequence = Self {
             payload: image.payload,
@@ -248,9 +245,12 @@ impl V2AvlSequence {
                             "v2 image leaf payloads are not contiguous in allocation order",
                         ));
                     }
-                    let payload_end = payload_offset
-                        .checked_add(payload_len)
-                        .ok_or(V2AvlError::Overflow("v2 image leaf payload range exceeds u64"))?;
+                    let payload_end =
+                        payload_offset
+                            .checked_add(payload_len)
+                            .ok_or(V2AvlError::Overflow(
+                                "v2 image leaf payload range exceeds u64",
+                            ))?;
                     let expected = V2NodeRecord::leaf(
                         payload_offset,
                         sequence.payload_slice(payload_offset, payload_end)?,
@@ -697,7 +697,9 @@ mod tests {
         assert_eq!(reopened.read_range(root_b, 0, 9).unwrap(), b"root-left");
         assert_eq!(reopened.read_range(root_c, 0, 10).unwrap(), b"root-right");
         assert_eq!(
-            reopened.read_range(latest, 0, latest.logical_len()).unwrap(),
+            reopened
+                .read_range(latest, 0, latest.logical_len())
+                .unwrap(),
             expected_latest
         );
 
