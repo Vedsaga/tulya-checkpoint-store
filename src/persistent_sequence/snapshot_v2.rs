@@ -141,10 +141,7 @@ pub(super) struct V2DeletedCheckpointRecord {
 }
 
 impl V2DeletedCheckpointRecord {
-    pub(super) fn new(
-        thread_id: String,
-        checkpoint_id: String,
-    ) -> Result<Self, V2SnapshotError> {
+    pub(super) fn new(thread_id: String, checkpoint_id: String) -> Result<Self, V2SnapshotError> {
         validate_identifier(&thread_id, "v2 deleted checkpoint thread id is invalid")?;
         validate_identifier(
             &checkpoint_id,
@@ -838,8 +835,9 @@ fn encode_deleted_checkpoint(
         ))?;
     let record_len_u32 = u32::try_from(record_len)
         .map_err(|_| V2SnapshotError::Overflow("v2 deleted checkpoint length exceeds u32"))?;
-    let thread_len = u32::try_from(record.thread_id.len())
-        .map_err(|_| V2SnapshotError::Overflow("v2 deleted checkpoint thread length exceeds u32"))?;
+    let thread_len = u32::try_from(record.thread_id.len()).map_err(|_| {
+        V2SnapshotError::Overflow("v2 deleted checkpoint thread length exceeds u32")
+    })?;
     let checkpoint_len = u32::try_from(record.checkpoint_id.len()).map_err(|_| {
         V2SnapshotError::Overflow("v2 deleted checkpoint checkpoint length exceeds u32")
     })?;
@@ -905,11 +903,12 @@ fn decode_deleted_checkpoint(bytes: &[u8]) -> Result<V2DeletedCheckpointRecord, 
         .ok_or(V2SnapshotError::Overflow(
             "v2 deleted checkpoint thread end exceeds usize",
         ))?;
-    let checkpoint_end = thread_end
-        .checked_add(checkpoint_len)
-        .ok_or(V2SnapshotError::Overflow(
-            "v2 deleted checkpoint checkpoint end exceeds usize",
-        ))?;
+    let checkpoint_end =
+        thread_end
+            .checked_add(checkpoint_len)
+            .ok_or(V2SnapshotError::Overflow(
+                "v2 deleted checkpoint checkpoint end exceeds usize",
+            ))?;
     if checkpoint_end != bytes.len() {
         return Err(V2SnapshotError::Invalid(
             "v2 deleted checkpoint identifier geometry mismatch",
@@ -1293,9 +1292,9 @@ mod tests {
             .contains("checkpoint parent is not topologically prior"));
 
         let mut snapshot = one_checkpoint_snapshot();
-        snapshot.deleted_checkpoints.push(
-            V2DeletedCheckpointRecord::new("thread".to_owned(), "cp-1".to_owned()).unwrap(),
-        );
+        snapshot
+            .deleted_checkpoints
+            .push(V2DeletedCheckpointRecord::new("thread".to_owned(), "cp-1".to_owned()).unwrap());
         let error = encode_v2_sealed_snapshot(&snapshot).unwrap_err();
         assert!(error
             .to_string()
