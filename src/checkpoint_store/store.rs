@@ -3,6 +3,11 @@ use crate::persistent_sequence::{
     LogicalLength, PersistentRoot, PersistentSequence, SequenceRange, SequenceRepresentation,
 };
 
+const MESSAGE_IDENTITY_NULL_PREFIX: &[u8] = b"{\"identity\":null,";
+const MESSAGE_CANONICAL_PREFIX: &[u8] = b"{\"identity\":null,\"messages\":[";
+const MESSAGE_CANONICAL_SUFFIX: &[u8] = b"]}";
+const LEGACY_V1_HASH_STREAM_CHUNK_BYTES: u64 = 64 * 1024;
+
 impl CheckpointStore {
     /// Opens or creates a checkpoint store and reconstructs its complete
     /// committed logical state from sealed streams plus the valid hot suffix.
@@ -359,11 +364,13 @@ impl CheckpointStore {
     /// once; a child checkpoint adds one leaf plus one binary node regardless
     /// of the parent's logical message-history length.
     ///
-    /// The store reconstructs the selected parent before encoding the new
-    /// checkpoint and derives the canonical state length/hash itself. This
-    /// favors a strict, self-validating first integration over an unchecked
-    /// caller-supplied digest. The caller may batch multiple newly appended
-    /// message values into one checkpoint, but the batch must not be empty.
+    /// Format v1 persists a whole-canonical-state XXH3-64 value. This path
+    /// therefore still scans the selected parent's canonical bytes to preserve
+    /// released v1 hash semantics, but it no longer materializes the complete
+    /// parent in one temporary vector. Child length comes from persisted parent
+    /// metadata and legacy hashing is fed through bounded range chunks. A
+    /// writable Format-v2 commitment is still required to remove the O(parent)
+    /// read/hash work itself.
     ///
     /// # Errors
     ///
@@ -418,8 +425,15 @@ impl CheckpointStore {
 
         if parent.is_none() {
             if let Some(first) = self.state.checkpoints.first() {
-                let first_state = self.read_checkpoint(&first.thread_id, &first.checkpoint_id)?;
-                if !first_state.starts_with(b"{\"identity\":null,") {
+                let prefix_len = u64::try_from(MESSAGE_IDENTITY_NULL_PREFIX.len())
+                    .map_err(|_| format_error("message identity prefix length exceeds u64"))?;
+                let prefix = self.read_checkpoint_range(
+                    &first.thread_id,
+                    &first.checkpoint_id,
+                    0,
+                    prefix_len,
+                )?;
+                if prefix != MESSAGE_IDENTITY_NULL_PREFIX {
                     return Err(format_error(
                         "message checkpoints cannot reuse a non-null identity root",
                     ));
@@ -427,34 +441,12 @@ impl CheckpointStore {
             }
         }
 
-        let mut canonical = if let Some((info, _, _)) = parent.as_ref() {
-            let mut prior = self.read_checkpoint(thread_id, &info.checkpoint_id)?;
-            if !prior.starts_with(b"{\"identity\":null,\"messages\":[") || !prior.ends_with(b"]}") {
-                return Err(format_error(
-                    "parent canonical state is not the append-only message schema",
-                ));
-            }
-            prior.truncate(
-                prior
-                    .len()
-                    .checked_sub(2)
-                    .ok_or_else(|| format_error("parent canonical state is truncated"))?,
-            );
-            prior.push(b',');
-            prior.extend_from_slice(&message_body);
-            prior.extend_from_slice(b"]}");
-            prior
-        } else {
-            let mut root = Vec::new();
-            root.extend_from_slice(b"{\"identity\":null,\"messages\":[");
-            root.extend_from_slice(&message_body);
-            root.extend_from_slice(b"]}");
-            root
-        };
-        let canonical_state_len = u64::try_from(canonical.len())
-            .map_err(|_| format_error("canonical message state length exceeds u64"))?;
-        let canonical_state_hash = xxh3_64(&canonical);
-        canonical.clear();
+        let (canonical_state_len, canonical_state_hash) =
+            if let Some((info, _, _)) = parent.as_ref() {
+                self.legacy_v1_message_child_metadata(info, &message_body)?
+            } else {
+                Self::legacy_v1_message_root_metadata(&message_body)?
+            };
 
         let geometry = self.state.geometry()?;
         let transaction = encode_message_append_transaction(
@@ -472,6 +464,92 @@ impl CheckpointStore {
             canonical_state_hash,
         )?;
         self.append_encoded_transaction(&transaction)
+    }
+
+    fn legacy_v1_message_root_metadata(
+        message_body: &[u8],
+    ) -> Result<(u64, u64), CheckpointStoreError> {
+        let prefix_len = u64::try_from(MESSAGE_CANONICAL_PREFIX.len())
+            .map_err(|_| format_error("message canonical prefix length exceeds u64"))?;
+        let message_len = u64::try_from(message_body.len())
+            .map_err(|_| format_error("message canonical body length exceeds u64"))?;
+        let suffix_len = u64::try_from(MESSAGE_CANONICAL_SUFFIX.len())
+            .map_err(|_| format_error("message canonical suffix length exceeds u64"))?;
+        let canonical_state_len = prefix_len
+            .checked_add(message_len)
+            .and_then(|length| length.checked_add(suffix_len))
+            .ok_or_else(|| format_error("canonical message state length exceeds u64"))?;
+        let mut hasher = Xxh3::new();
+        hasher.update(MESSAGE_CANONICAL_PREFIX);
+        hasher.update(message_body);
+        hasher.update(MESSAGE_CANONICAL_SUFFIX);
+        Ok((canonical_state_len, hasher.digest()))
+    }
+
+    fn legacy_v1_message_child_metadata(
+        &self,
+        parent: &CheckpointInfo,
+        message_body: &[u8],
+    ) -> Result<(u64, u64), CheckpointStoreError> {
+        let prefix_len = u64::try_from(MESSAGE_CANONICAL_PREFIX.len())
+            .map_err(|_| format_error("message canonical prefix length exceeds u64"))?;
+        let suffix_len = u64::try_from(MESSAGE_CANONICAL_SUFFIX.len())
+            .map_err(|_| format_error("message canonical suffix length exceeds u64"))?;
+        let framing_len = prefix_len
+            .checked_add(suffix_len)
+            .ok_or_else(|| format_error("message canonical framing length overflow"))?;
+        if parent.logical_state_len < framing_len {
+            return Err(format_error(
+                "parent canonical state is shorter than the append-only message framing",
+            ));
+        }
+
+        let prefix = self.read_checkpoint_range(
+            &parent.thread_id,
+            &parent.checkpoint_id,
+            0,
+            prefix_len,
+        )?;
+        let parent_without_suffix_len = parent
+            .logical_state_len
+            .checked_sub(suffix_len)
+            .ok_or_else(|| format_error("parent canonical message suffix underflow"))?;
+        let suffix = self.read_checkpoint_range(
+            &parent.thread_id,
+            &parent.checkpoint_id,
+            parent_without_suffix_len,
+            suffix_len,
+        )?;
+        if prefix != MESSAGE_CANONICAL_PREFIX || suffix != MESSAGE_CANONICAL_SUFFIX {
+            return Err(format_error(
+                "parent canonical state is not the append-only message schema",
+            ));
+        }
+
+        let message_len = u64::try_from(message_body.len())
+            .map_err(|_| format_error("message canonical body length exceeds u64"))?;
+        let canonical_state_len = parent
+            .logical_state_len
+            .checked_add(1)
+            .and_then(|length| length.checked_add(message_len))
+            .ok_or_else(|| format_error("canonical message state length exceeds u64"))?;
+
+        let mut hasher = Xxh3::new();
+        self.stream_checkpoint_range(
+            &parent.thread_id,
+            &parent.checkpoint_id,
+            0,
+            parent_without_suffix_len,
+            LEGACY_V1_HASH_STREAM_CHUNK_BYTES,
+            &mut |chunk| {
+                hasher.update(chunk);
+                Ok(())
+            },
+        )?;
+        hasher.update(b",");
+        hasher.update(message_body);
+        hasher.update(MESSAGE_CANONICAL_SUFFIX);
+        Ok((canonical_state_len, hasher.digest()))
     }
 
     #[allow(dead_code)] // Reserved for a future zero-copy repository adapter feature.
