@@ -1,4 +1,8 @@
 use super::*;
+use crate::persistent_sequence::{
+    LogicalLength, PersistentRoot, PersistentSequence, SequenceRange, SequenceRepresentation,
+    SequenceSink,
+};
 
 impl CheckpointStore {
     /// Opens or creates a checkpoint store and reconstructs its complete
@@ -1053,11 +1057,14 @@ impl CheckpointStore {
         if length == 0 {
             return Ok(Vec::new());
         }
-        let root = self.version_root_for_read(checkpoint.identity_version)?;
+        let root_node = self.version_root_for_read(checkpoint.identity_version)?;
+        let root = PersistentRoot::legacy_v1(root_node, LogicalLength::new(identity_len));
+        let range = SequenceRange::new(LogicalLength::new(offset), LogicalLength::new(length))
+            .ok_or_else(|| format_error("identity range end overflow"))?;
         let output_len =
             usize::try_from(length).map_err(|_| format_error("identity range exceeds usize"))?;
         let mut output = Vec::with_capacity(output_len);
-        self.append_root_range_with_known_size(root, identity_len, offset, length, &mut output)?;
+        LegacyV1Sequence { store: self }.read_range(root, range, &mut output)?;
         if output.len() != output_len {
             return Err(format_error("identity range produced unexpected length"));
         }
@@ -1269,50 +1276,28 @@ impl CheckpointStore {
         end: u64,
         output: &mut Vec<u8>,
     ) -> Result<(), CheckpointStoreError> {
-        let identity_root = self.version_root_for_read(checkpoint.identity_version)?;
-        let identity_len = self.root_term_size(identity_root)?;
+        let identity_root = self.persistent_root_for_read(checkpoint.identity_version)?;
         let messages_root = checkpoint
             .messages_version
-            .map(|version| self.version_root_for_read(version))
+            .map(|version| self.persistent_root_for_read(version))
             .transpose()?;
-        let messages_len = messages_root
-            .map(|root| self.root_term_size(root))
-            .transpose()?
-            .unwrap_or(0);
         let result_root = checkpoint
             .result_version
-            .map(|version| self.version_root_for_read(version))
-            .transpose()?;
-        let result_len = result_root
-            .map(|root| self.root_term_size(root))
+            .map(|version| self.persistent_root_for_read(version))
             .transpose()?;
 
         let mut cursor = 0u64;
         cursor = self.append_static_range(b"{\"identity\":", cursor, start, end, output)?;
-        cursor = self.append_root_segment_range(
-            identity_root,
-            identity_len,
-            cursor,
-            start,
-            end,
-            output,
-        )?;
+        cursor =
+            self.append_root_segment_range(identity_root, cursor, start, end, output)?;
         cursor = self.append_static_range(b",\"messages\":[", cursor, start, end, output)?;
         if let Some(root) = messages_root {
-            cursor =
-                self.append_root_segment_range(root, messages_len, cursor, start, end, output)?;
+            cursor = self.append_root_segment_range(root, cursor, start, end, output)?;
         }
         cursor = self.append_static_range(b"]", cursor, start, end, output)?;
         if let Some(root) = result_root {
             cursor = self.append_static_range(b",\"result\":", cursor, start, end, output)?;
-            cursor = self.append_root_segment_range(
-                root,
-                result_len.unwrap_or(0),
-                cursor,
-                start,
-                end,
-                output,
-            )?;
+            cursor = self.append_root_segment_range(root, cursor, start, end, output)?;
         }
         cursor = self.append_static_range(b"}", cursor, start, end, output)?;
         if cursor != checkpoint.logical_state_len {
@@ -1354,25 +1339,26 @@ impl CheckpointStore {
 
     fn append_root_segment_range(
         &self,
-        root: u64,
-        root_len: u64,
+        root: PersistentRoot,
         segment_start: u64,
         request_start: u64,
         request_end: u64,
         output: &mut Vec<u8>,
     ) -> Result<u64, CheckpointStoreError> {
+        let sequence = LegacyV1Sequence { store: self };
+        let root_len = sequence.logical_len(root)?.get();
         let segment_end = segment_start
             .checked_add(root_len)
             .ok_or_else(|| format_error("canonical root segment end overflow"))?;
         let overlap_start = request_start.max(segment_start);
         let overlap_end = request_end.min(segment_end);
         if overlap_start < overlap_end {
-            self.append_root_range(
-                root,
-                overlap_start - segment_start,
-                overlap_end - overlap_start,
-                output,
-            )?;
+            let range = SequenceRange::new(
+                LogicalLength::new(overlap_start - segment_start),
+                LogicalLength::new(overlap_end - overlap_start),
+            )
+            .ok_or_else(|| format_error("checkpoint root range end overflow"))?;
+            sequence.read_range(root, range, output)?;
         }
         Ok(segment_end)
     }
@@ -1384,6 +1370,15 @@ impl CheckpointStore {
             .copied()
             .flatten()
             .ok_or_else(|| format_error("version has no root"))
+    }
+
+    fn persistent_root_for_read(
+        &self,
+        version: u32,
+    ) -> Result<PersistentRoot, CheckpointStoreError> {
+        let node_id = self.version_root_for_read(version)?;
+        let logical_len = LogicalLength::new(self.root_term_size(node_id)?);
+        Ok(PersistentRoot::legacy_v1(node_id, logical_len))
     }
 
     fn decode_node_for_read(&self, node_id: u64) -> Result<DecodedNode, CheckpointStoreError> {
@@ -1419,17 +1414,6 @@ impl CheckpointStore {
         }
         cache[index] = Some(total);
         Ok(total)
-    }
-
-    fn append_root_range(
-        &self,
-        root: u64,
-        offset: u64,
-        length: u64,
-        output: &mut Vec<u8>,
-    ) -> Result<(), CheckpointStoreError> {
-        let root_len = self.root_term_size(root)?;
-        self.append_root_range_with_known_size(root, root_len, offset, length, output)
     }
 
     fn append_root_range_with_known_size(
@@ -1580,5 +1564,98 @@ impl CheckpointStore {
     #[must_use]
     pub fn checkpoints(&self) -> &[CheckpointInfo] {
         &self.state.checkpoints
+    }
+}
+
+const LEGACY_V1_STREAM_CHUNK_BYTES: u64 = 64 * 1024;
+
+struct LegacyV1Sequence<'a> {
+    store: &'a CheckpointStore,
+}
+
+impl LegacyV1Sequence<'_> {
+    fn validate_root(&self, root: PersistentRoot) -> Result<(), CheckpointStoreError> {
+        if root.representation() != SequenceRepresentation::LegacyV1 {
+            return Err(format_error(
+                "legacy v1 sequence adapter received an incompatible root",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl PersistentSequence for LegacyV1Sequence<'_> {
+    type Error = CheckpointStoreError;
+
+    fn append(
+        &mut self,
+        _parent: Option<PersistentRoot>,
+        _bytes: &[u8],
+    ) -> Result<PersistentRoot, Self::Error> {
+        Err(format_error(
+            "Format v1 sequence adapter is read-only; append requires the balanced writable representation",
+        ))
+    }
+
+    fn logical_len(&self, root: PersistentRoot) -> Result<LogicalLength, Self::Error> {
+        self.validate_root(root)?;
+        Ok(root.logical_len())
+    }
+
+    fn read_range(
+        &self,
+        root: PersistentRoot,
+        range: SequenceRange,
+        output: &mut Vec<u8>,
+    ) -> Result<(), Self::Error> {
+        self.validate_root(root)?;
+        if range.end().get() > root.logical_len().get() {
+            return Err(format_error("checkpoint root range outside root"));
+        }
+        self.store.append_root_range_with_known_size(
+            root.node_id(),
+            root.logical_len().get(),
+            range.offset().get(),
+            range.length().get(),
+            output,
+        )
+    }
+
+    fn stream_range(
+        &self,
+        root: PersistentRoot,
+        range: SequenceRange,
+        sink: &mut SequenceSink<'_, Self::Error>,
+    ) -> Result<(), Self::Error> {
+        self.validate_root(root)?;
+        if range.end().get() > root.logical_len().get() {
+            return Err(format_error("checkpoint root range outside root"));
+        }
+        let end = range.end().get();
+        let mut cursor = range.offset().get();
+        while cursor < end {
+            let length = LEGACY_V1_STREAM_CHUNK_BYTES.min(end - cursor);
+            let chunk_range = SequenceRange::new(LogicalLength::new(cursor), LogicalLength::new(length))
+                .ok_or_else(|| format_error("checkpoint root stream range end overflow"))?;
+            let mut chunk = Vec::with_capacity(
+                usize::try_from(length)
+                    .map_err(|_| format_error("checkpoint root stream chunk exceeds usize"))?,
+            );
+            self.read_range(root, chunk_range, &mut chunk)?;
+            sink(&chunk)?;
+            cursor = cursor
+                .checked_add(length)
+                .ok_or_else(|| format_error("checkpoint root stream cursor overflow"))?;
+        }
+        Ok(())
+    }
+
+    fn verify(&self, root: PersistentRoot) -> Result<(), Self::Error> {
+        self.validate_root(root)?;
+        let actual = self.store.root_term_size(root.node_id())?;
+        if actual != root.logical_len().get() {
+            return Err(format_error("checkpoint root logical length mismatch"));
+        }
+        Ok(())
     }
 }
