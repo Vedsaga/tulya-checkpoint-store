@@ -16,10 +16,12 @@
 //! operation is added to the executable contract when its production caller
 //! and implementation land, so strict `dead_code` checks remain meaningful.
 
-// Staged Format-v2 codec. The next storage unit makes the writable balanced
-// sequence its production caller and removes this scoped allowance.
+// Staged Format-v2 codec and pure AVL core. The persistence-integration unit
+// makes them production callers and removes these scoped allowances.
 #[allow(dead_code)]
 mod format_v2;
+#[allow(dead_code)]
+mod avl;
 
 /// Logical byte length of a persistent sequence.
 ///
