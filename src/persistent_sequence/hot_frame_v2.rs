@@ -229,8 +229,7 @@ mod tests {
     fn complete_noncanonical_footer_fails_closed() {
         let commit = commit();
         let mut frame = encode_v2_hot_frame(&commit).unwrap();
-        let footer_last = frame.len() - 1;
-        frame[footer_last] ^= 1;
+        frame[commit.len()] = b'X';
         assert_eq!(
             probe_v2_hot_frame(&frame),
             Err(V2HotFrameError::Invalid("v2 hot completion footer mismatch"))
