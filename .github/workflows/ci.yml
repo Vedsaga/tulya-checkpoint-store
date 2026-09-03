@@ -2,7 +2,20 @@ name: ci
 
 on:
   push:
+    branches:
+      - main
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   rust:
@@ -155,7 +168,7 @@ jobs:
           assert result["source"]["git"]["available"] is False
           assert len(result["arms"]) == 9
           assert all(
-              arm["returncode"] == 0 and arm["result"]["pass"] is True
+              arm["returncode"] == 0 and arm["pass"] is True
               for arm in result["arms"].values()
           )
           assert frozen["source_provenance"]["git"]["available"] is False
