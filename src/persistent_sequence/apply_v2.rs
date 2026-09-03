@@ -134,7 +134,9 @@ impl V2CommittedState {
         let record = self
             .request_records
             .remove(request_id)
-            .ok_or(V2ApplyError::Invalid("v2 active request identity is absent"))?;
+            .ok_or(V2ApplyError::Invalid(
+                "v2 active request identity is absent",
+            ))?;
         if self
             .retired_requests
             .insert(request_id.to_vec(), record.operation_digest)
@@ -279,7 +281,10 @@ fn validate_checkpoint(
     transaction: &V2WalTransaction,
 ) -> Result<(), V2ApplyError> {
     let checkpoint = &transaction.checkpoint;
-    let key = (checkpoint.thread_id.clone(), checkpoint.checkpoint_id.clone());
+    let key = (
+        checkpoint.thread_id.clone(),
+        checkpoint.checkpoint_id.clone(),
+    );
     if state.checkpoint_ordinals.contains_key(&key) {
         return Err(V2ApplyError::Invalid(
             "v2 checkpoint identity is already committed",
@@ -365,9 +370,10 @@ fn resolve_version(
         ))?;
     transaction
         .versions
-        .get(usize::try_from(local).map_err(|_| {
-            V2ApplyError::Overflow("v2 local version identifier exceeds usize")
-        })?)
+        .get(
+            usize::try_from(local)
+                .map_err(|_| V2ApplyError::Overflow("v2 local version identifier exceeds usize"))?,
+        )
         .copied()
         .ok_or(V2ApplyError::Invalid("v2 referenced new version is absent"))
 }
@@ -456,8 +462,8 @@ mod tests {
     fn retry_same_request_is_noop_and_conflicting_reuse_fails() {
         let mut state = V2CommittedState::default();
         let transaction = initial_transaction("cp-1");
-        let encoded = encode_v2_commit(V2WalGeometry::default(), &transaction, Some(b"req-1"))
-            .unwrap();
+        let encoded =
+            encode_v2_commit(V2WalGeometry::default(), &transaction, Some(b"req-1")).unwrap();
         assert_eq!(
             apply_v2_commit(&mut state, &encoded),
             Ok(V2ApplyOutcome::Applied {
@@ -487,8 +493,8 @@ mod tests {
         let mut state = V2CommittedState::default();
         let transaction = initial_transaction("cp-1");
         let digest = checkpoint_operation_digest(&transaction.checkpoint).unwrap();
-        let encoded = encode_v2_commit(V2WalGeometry::default(), &transaction, Some(b"req-1"))
-            .unwrap();
+        let encoded =
+            encode_v2_commit(V2WalGeometry::default(), &transaction, Some(b"req-1")).unwrap();
         apply_v2_commit(&mut state, &encoded).unwrap();
         state.retire_request(b"req-1").unwrap();
         assert_eq!(
