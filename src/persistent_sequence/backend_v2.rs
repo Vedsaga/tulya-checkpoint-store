@@ -4,19 +4,17 @@
 //! sealed base and the append-local `T2C2 + T2E2` hot suffix. It deliberately
 //! contains no filesystem, manifest, or public `CheckpointStore` policy.
 
-use super::apply_v2::{
-    V2ApplyError, V2CommittedState, V2RequestRecord, V2RequestStatus,
-};
+use super::apply_v2::{V2ApplyError, V2CommittedState, V2RequestRecord};
 use super::image_v2::{decode_v2_image, encode_v2_image, V2ImageError, V2SequenceImage};
 use super::recovery_v2::{
     recover_v2_hot_wal, V2RecoveredHotWal, V2RecoveryError, V2RecoveryStop,
 };
 use super::snapshot_v2::{
     decode_v2_sealed_snapshot, encode_v2_sealed_snapshot, V2ActiveRequestRecord,
-    V2RetiredRequestRecord, V2SealedSnapshot, V2SnapshotError,
+    V2DeletedCheckpointRecord, V2RetiredRequestRecord, V2SealedSnapshot, V2SnapshotError,
 };
 use super::transaction_v2::V2WalGeometry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,9 +77,11 @@ pub(super) struct V2BackendRecovery {
 /// Reconstructs one Format-v2 semantic backend from an optional sealed base
 /// plus the authoritative hot suffix.
 ///
-/// A missing sealed snapshot means the store has no sealed checkpoint base.
-/// The hot scanner then begins from empty geometry. A present snapshot is fully
-/// decoded and semantically validated before any hot commit is considered.
+/// A missing sealed snapshot means the store has no sealed semantic base. A
+/// present tombstone-only snapshot may still have zero sequence geometry; it is
+/// not equivalent to a brand-new store because deleted identities remain
+/// authoritative. Every present snapshot is fully validated before any hot
+/// commit is considered.
 pub(super) fn recover_v2_backend(
     sealed_snapshot: Option<&[u8]>,
     hot_bytes: &[u8],
@@ -107,24 +107,35 @@ pub(super) fn recover_v2_backend(
 }
 
 /// Encodes the complete committed semantic state as one immutable `T2S2`
-/// sealed base. Empty state has no snapshot artifact and returns `None`.
+/// sealed base. A truly empty never-used state has no snapshot artifact. A
+/// tombstone-only state does have an artifact so deletion cannot be forgotten.
 pub(super) fn export_v2_sealed_state(
     state: &V2CommittedState,
 ) -> Result<Option<Vec<u8>>, V2BackendError> {
+    validate_checkpoint_index(state)?;
     let geometry = state.geometry()?;
     if geometry.checkpoint_count == 0 {
         if geometry.payload_len != 0
             || geometry.node_count != 0
             || geometry.version_count != 0
-            || !state.checkpoint_ordinals.is_empty()
             || !state.request_records.is_empty()
-            || !state.retired_requests.is_empty()
         {
             return Err(V2BackendError::Invalid(
-                "empty v2 backend has non-empty semantic state",
+                "tombstone-only v2 backend contains live semantic state",
             ));
         }
-        return Ok(None);
+        if state.retired_requests.is_empty() && state.deleted_checkpoints.is_empty() {
+            return Ok(None);
+        }
+        let snapshot = V2SealedSnapshot {
+            image: Vec::new(),
+            versions: Vec::new(),
+            checkpoints: Vec::new(),
+            active_requests: Vec::new(),
+            retired_requests: retired_request_records(state)?,
+            deleted_checkpoints: deleted_checkpoint_records(state)?,
+        };
+        return Ok(Some(encode_v2_sealed_snapshot(&snapshot)?));
     }
     if geometry.version_count == 0 || geometry.node_count == 0 || geometry.payload_len == 0 {
         return Err(V2BackendError::Invalid(
@@ -152,30 +163,28 @@ pub(super) fn export_v2_sealed_state(
             record.checkpoint_ordinal,
         )?);
     }
-    let mut retired_requests = Vec::with_capacity(state.retired_requests.len());
-    for (request_id, operation_digest) in &state.retired_requests {
-        retired_requests.push(V2RetiredRequestRecord::new(
-            request_id.clone(),
-            *operation_digest,
-        )?);
-    }
-
     let snapshot = V2SealedSnapshot {
         image,
         versions: state.versions.clone(),
         checkpoints: state.checkpoints.clone(),
         active_requests,
-        retired_requests,
+        retired_requests: retired_request_records(state)?,
+        deleted_checkpoints: deleted_checkpoint_records(state)?,
     };
     Ok(Some(encode_v2_sealed_snapshot(&snapshot)?))
 }
 
 fn import_v2_sealed_state(bytes: &[u8]) -> Result<V2CommittedState, V2BackendError> {
     let snapshot = decode_v2_sealed_snapshot(bytes)?;
-    // `decode_v2_sealed_snapshot` already imports the nested image through the
+    // `decode_v2_sealed_snapshot` already imports any nested image through the
     // AVL semantic verifier. Decode it once more only to materialize the exact
     // payload/node arrays owned by `V2CommittedState`.
-    let image = decode_v2_image(&snapshot.image)?;
+    let (payload, nodes) = if snapshot.image.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let image = decode_v2_image(&snapshot.image)?;
+        (image.payload, image.nodes)
+    };
 
     let mut checkpoint_ordinals = HashMap::with_capacity(snapshot.checkpoints.len());
     for (index, checkpoint) in snapshot.checkpoints.iter().enumerate() {
@@ -224,14 +233,27 @@ fn import_v2_sealed_state(bytes: &[u8]) -> Result<V2CommittedState, V2BackendErr
         }
     }
 
+    let mut deleted_checkpoints = HashSet::with_capacity(snapshot.deleted_checkpoints.len());
+    for record in snapshot.deleted_checkpoints {
+        if !deleted_checkpoints.insert((
+            record.thread_id().to_owned(),
+            record.checkpoint_id().to_owned(),
+        )) {
+            return Err(V2BackendError::Invalid(
+                "validated v2 snapshot contains duplicate deleted checkpoint identity",
+            ));
+        }
+    }
+
     let state = V2CommittedState {
-        payload: image.payload,
-        nodes: image.nodes,
+        payload,
+        nodes,
         versions: snapshot.versions,
         checkpoints: snapshot.checkpoints,
         checkpoint_ordinals,
         request_records,
         retired_requests,
+        deleted_checkpoints,
     };
     // Keep geometry conversion as the final fixed-width boundary check even
     // though all section counts were already bounded by their codecs.
@@ -239,8 +261,59 @@ fn import_v2_sealed_state(bytes: &[u8]) -> Result<V2CommittedState, V2BackendErr
     Ok(state)
 }
 
+fn validate_checkpoint_index(state: &V2CommittedState) -> Result<(), V2BackendError> {
+    if state.checkpoint_ordinals.len() != state.checkpoints.len() {
+        return Err(V2BackendError::Invalid(
+            "v2 checkpoint index cardinality disagrees with checkpoint table",
+        ));
+    }
+    for (index, checkpoint) in state.checkpoints.iter().enumerate() {
+        let ordinal = u64::try_from(index)
+            .map_err(|_| V2BackendError::Overflow("v2 checkpoint ordinal exceeds u64"))?;
+        let key = (checkpoint.thread_id.clone(), checkpoint.checkpoint_id.clone());
+        if state.checkpoint_ordinals.get(&key) != Some(&ordinal) {
+            return Err(V2BackendError::Invalid(
+                "v2 checkpoint index disagrees with checkpoint table",
+            ));
+        }
+        if state.deleted_checkpoints.contains(&key) {
+            return Err(V2BackendError::Invalid(
+                "v2 checkpoint identity is both live and deleted",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn retired_request_records(
+    state: &V2CommittedState,
+) -> Result<Vec<V2RetiredRequestRecord>, V2BackendError> {
+    let mut records = Vec::with_capacity(state.retired_requests.len());
+    for (request_id, operation_digest) in &state.retired_requests {
+        records.push(V2RetiredRequestRecord::new(
+            request_id.clone(),
+            *operation_digest,
+        )?);
+    }
+    Ok(records)
+}
+
+fn deleted_checkpoint_records(
+    state: &V2CommittedState,
+) -> Result<Vec<V2DeletedCheckpointRecord>, V2BackendError> {
+    let mut records = Vec::with_capacity(state.deleted_checkpoints.len());
+    for (thread_id, checkpoint_id) in &state.deleted_checkpoints {
+        records.push(V2DeletedCheckpointRecord::new(
+            thread_id.clone(),
+            checkpoint_id.clone(),
+        )?);
+    }
+    Ok(records)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::apply_v2::V2RequestStatus;
     use super::super::commit_v2::{checkpoint_operation_digest, encode_v2_commit};
     use super::super::format_v2::{V2NodeRecord, V2RootRecord};
     use super::super::hot_frame_v2::encode_v2_hot_frame;
@@ -377,6 +450,25 @@ mod tests {
             V2RequestStatus::Retired
         );
         assert_eq!(reopened.logical_hot_tail, 0);
+    }
+
+    #[test]
+    fn tombstone_only_base_survives_reopen_and_blocks_resurrection() {
+        let mut state = V2CommittedState::default();
+        state
+            .deleted_checkpoints
+            .insert(("thread".to_owned(), "cp-1".to_owned()));
+        let snapshot = export_v2_sealed_state(&state).unwrap().unwrap();
+        let reopened = recover_v2_backend(Some(&snapshot), &[]).unwrap();
+        assert!(reopened
+            .state
+            .deleted_checkpoints
+            .contains(&("thread".to_owned(), "cp-1".to_owned())));
+
+        let first = first_transaction();
+        let first_frame = frame(V2WalGeometry::default(), &first, b"req-new");
+        let error = recover_v2_backend(Some(&snapshot), &first_frame).unwrap_err();
+        assert!(error.to_string().contains("logically deleted"));
     }
 
     #[test]
