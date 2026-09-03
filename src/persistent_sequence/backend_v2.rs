@@ -6,9 +6,7 @@
 
 use super::apply_v2::{V2ApplyError, V2CommittedState, V2RequestRecord};
 use super::image_v2::{decode_v2_image, encode_v2_image, V2ImageError, V2SequenceImage};
-use super::recovery_v2::{
-    recover_v2_hot_wal, V2RecoveredHotWal, V2RecoveryError, V2RecoveryStop,
-};
+use super::recovery_v2::{recover_v2_hot_wal, V2RecoveredHotWal, V2RecoveryError, V2RecoveryStop};
 use super::snapshot_v2::{
     decode_v2_sealed_snapshot, encode_v2_sealed_snapshot, V2ActiveRequestRecord,
     V2DeletedCheckpointRecord, V2RetiredRequestRecord, V2SealedSnapshot, V2SnapshotError,
@@ -192,7 +190,10 @@ fn import_v2_sealed_state(bytes: &[u8]) -> Result<V2CommittedState, V2BackendErr
             .map_err(|_| V2BackendError::Overflow("v2 checkpoint ordinal exceeds u64"))?;
         if checkpoint_ordinals
             .insert(
-                (checkpoint.thread_id.clone(), checkpoint.checkpoint_id.clone()),
+                (
+                    checkpoint.thread_id.clone(),
+                    checkpoint.checkpoint_id.clone(),
+                ),
                 ordinal,
             )
             .is_some()
@@ -270,7 +271,10 @@ fn validate_checkpoint_index(state: &V2CommittedState) -> Result<(), V2BackendEr
     for (index, checkpoint) in state.checkpoints.iter().enumerate() {
         let ordinal = u64::try_from(index)
             .map_err(|_| V2BackendError::Overflow("v2 checkpoint ordinal exceeds u64"))?;
-        let key = (checkpoint.thread_id.clone(), checkpoint.checkpoint_id.clone());
+        let key = (
+            checkpoint.thread_id.clone(),
+            checkpoint.checkpoint_id.clone(),
+        );
         if state.checkpoint_ordinals.get(&key) != Some(&ordinal) {
             return Err(V2BackendError::Invalid(
                 "v2 checkpoint index disagrees with checkpoint table",
@@ -313,13 +317,14 @@ fn deleted_checkpoint_records(
 
 #[cfg(test)]
 mod tests {
-    use super::super::apply_v2::V2RequestStatus;
+    use super::super::apply_v2::{V2ApplyError, V2RequestStatus};
     use super::super::commit_v2::{checkpoint_operation_digest, encode_v2_commit};
     use super::super::format_v2::{V2NodeRecord, V2RootRecord};
     use super::super::hot_frame_v2::encode_v2_hot_frame;
     use super::super::publication_v2::{
         checkpoint_state_metadata, V2CheckpointRecord, V2VersionRecord,
     };
+    use super::super::recovery_v2::V2RecoveryError;
     use super::super::transaction_v2::V2WalTransaction;
     use super::*;
 
@@ -368,11 +373,7 @@ mod tests {
         }
     }
 
-    fn frame(
-        base: V2WalGeometry,
-        transaction: &V2WalTransaction,
-        request_id: &[u8],
-    ) -> Vec<u8> {
+    fn frame(base: V2WalGeometry, transaction: &V2WalTransaction, request_id: &[u8]) -> Vec<u8> {
         let commit = encode_v2_commit(base, transaction, Some(request_id)).unwrap();
         encode_v2_hot_frame(&commit).unwrap()
     }
@@ -425,11 +426,15 @@ mod tests {
         let first_frame = frame(V2WalGeometry::default(), &first, b"req-1");
         let recovered = recover_v2_backend(None, &first_frame).unwrap();
         let snapshot = export_v2_sealed_state(&recovered.state).unwrap().unwrap();
+        let wrong_base_frame = frame(V2WalGeometry::default(), &first, b"req-other");
 
-        let error = recover_v2_backend(Some(&snapshot), &first_frame).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("starting geometry disagrees with committed state"));
+        let error = recover_v2_backend(Some(&snapshot), &wrong_base_frame).unwrap_err();
+        assert!(matches!(
+            error,
+            V2BackendError::Recovery(V2RecoveryError::Apply(V2ApplyError::Invalid(
+                "v2 commit starting geometry disagrees with committed state"
+            )))
+        ));
     }
 
     #[test]
