@@ -16,12 +16,14 @@
 //! operation is added to the executable contract when its production caller
 //! and implementation land, so strict `dead_code` checks remain meaningful.
 
-// Staged Format-v2 codec and pure AVL core. The persistence-integration unit
-// makes them production callers and removes these scoped allowances.
+// The v2 codec, AVL core, and canonical arena image are staged behind the
+// sequence boundary. Checkpoint-store integration makes the AVL core a
+// production caller and removes the remaining scoped dead-code allowances.
 #[allow(dead_code)]
 mod avl;
 #[allow(dead_code)]
 mod format_v2;
+mod image_v2;
 
 /// Logical byte length of a persistent sequence.
 ///
