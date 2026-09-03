@@ -19,9 +19,9 @@
 // Staged Format-v2 codec and pure AVL core. The persistence-integration unit
 // makes them production callers and removes these scoped allowances.
 #[allow(dead_code)]
-mod format_v2;
-#[allow(dead_code)]
 mod avl;
+#[allow(dead_code)]
+mod format_v2;
 
 /// Logical byte length of a persistent sequence.
 ///
