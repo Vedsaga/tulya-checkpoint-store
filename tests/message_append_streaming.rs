@@ -1,7 +1,5 @@
 use serde_json::json;
-use tulya_checkpoint_store::{
-    CheckpointStore, CheckpointStoreConfig, CheckpointStoreRecoveryMode,
-};
+use tulya_checkpoint_store::{CheckpointStore, CheckpointStoreConfig, CheckpointStoreRecoveryMode};
 
 #[test]
 fn message_append_streaming_hash_matches_full_v1_state_across_chunks(
