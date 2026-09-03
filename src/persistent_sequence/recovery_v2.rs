@@ -1,19 +1,20 @@
 //! Sequential recovery for the staged Format-v2 `T2C2` hot WAL.
 //!
 //! This scanner is filesystem-neutral. A later checkpoint-store integration
-//! will feed it the authoritative logical WAL bytes after manifest/version
-//! dispatch. It never treats bare `T2W2` structural records as commits.
+//! will feed it the authoritative hot-file bytes after manifest/version
+//! dispatch. It never treats bare `T2W2` structural records as commits and it
+//! requires the last-written v2 hot completion footer for every applied record.
 
 use super::apply_v2::{apply_v2_commit, V2ApplyError, V2ApplyOutcome, V2CommittedState};
+use super::hot_frame_v2::{probe_v2_hot_frame, V2HotFrameError, V2HotFrameProbe};
 use std::fmt;
 
-const V2_COMMIT_MAGIC: [u8; 4] = *b"T2C2";
 const V2_STRUCTURAL_MAGIC: [u8; 4] = *b"T2W2";
-const V2_COMMIT_HEADER_SIZE: usize = 88;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum V2RecoveryError {
     Apply(V2ApplyError),
+    Frame(V2HotFrameError),
     Invalid(&'static str),
     Overflow(&'static str),
 }
@@ -22,6 +23,7 @@ impl fmt::Display for V2RecoveryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Apply(error) => write!(formatter, "{error}"),
+            Self::Frame(error) => write!(formatter, "{error}"),
             Self::Invalid(message) | Self::Overflow(message) => formatter.write_str(message),
         }
     }
@@ -32,6 +34,12 @@ impl std::error::Error for V2RecoveryError {}
 impl From<V2ApplyError> for V2RecoveryError {
     fn from(error: V2ApplyError) -> Self {
         Self::Apply(error)
+    }
+}
+
+impl From<V2HotFrameError> for V2RecoveryError {
+    fn from(error: V2HotFrameError) -> Self {
+        Self::Frame(error)
     }
 }
 
@@ -73,46 +81,24 @@ pub(super) fn recover_v2_hot_wal(
             break;
         }
 
-        if remaining.len() < V2_COMMIT_MAGIC.len() {
-            if V2_COMMIT_MAGIC.starts_with(remaining) {
-                stop = V2RecoveryStop::TornFinalCommit;
-                break;
-            }
-            return Err(V2RecoveryError::Invalid(
-                "v2 WAL suffix is neither a commit nor zero reserve",
-            ));
-        }
-
-        let magic = remaining
-            .get(..4)
-            .ok_or(V2RecoveryError::Invalid("v2 WAL commit magic is truncated"))?;
-        if magic == V2_STRUCTURAL_MAGIC.as_slice() {
+        if remaining.get(..4) == Some(V2_STRUCTURAL_MAGIC.as_slice()) {
             return Err(V2RecoveryError::Invalid(
                 "bare T2W2 structural transaction cannot be recovered as a commit",
             ));
         }
-        if magic != V2_COMMIT_MAGIC.as_slice() {
-            return Err(V2RecoveryError::Invalid("v2 WAL commit magic mismatch"));
-        }
-        if remaining.len() < 8 {
-            stop = V2RecoveryStop::TornFinalCommit;
-            break;
-        }
 
-        let record_len = usize::try_from(read_u32(remaining, 4)?)
-            .map_err(|_| V2RecoveryError::Overflow("v2 commit length exceeds usize"))?;
-        if record_len < V2_COMMIT_HEADER_SIZE {
-            return Err(V2RecoveryError::Invalid(
-                "v2 commit length is shorter than its header",
-            ));
-        }
-        if record_len > remaining.len() {
-            stop = V2RecoveryStop::TornFinalCommit;
-            break;
-        }
-
+        let (commit_len, frame_len) = match probe_v2_hot_frame(remaining)? {
+            V2HotFrameProbe::Complete {
+                commit_len,
+                frame_len,
+            } => (commit_len, frame_len),
+            V2HotFrameProbe::Torn => {
+                stop = V2RecoveryStop::TornFinalCommit;
+                break;
+            }
+        };
         let record = remaining
-            .get(..record_len)
+            .get(..commit_len)
             .ok_or(V2RecoveryError::Invalid("v2 commit range exceeds WAL bytes"))?;
         match apply_v2_commit(&mut state, record)? {
             V2ApplyOutcome::Applied { .. } => {}
@@ -128,7 +114,7 @@ pub(super) fn recover_v2_hot_wal(
             }
         }
         cursor = cursor
-            .checked_add(record_len)
+            .checked_add(frame_len)
             .ok_or(V2RecoveryError::Overflow("v2 recovery cursor exceeds usize"))?;
         commit_count = commit_count
             .checked_add(1)
@@ -146,29 +132,18 @@ pub(super) fn recover_v2_hot_wal(
 }
 
 fn starts_with_zero_reserve(bytes: &[u8]) -> bool {
-    let width = bytes.len().min(V2_COMMIT_MAGIC.len());
+    let width = bytes.len().min(4);
     width > 0
         && bytes
             .get(..width)
             .is_some_and(|prefix| prefix.iter().all(|byte| *byte == 0))
 }
 
-fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, V2RecoveryError> {
-    let end = offset
-        .checked_add(4)
-        .ok_or(V2RecoveryError::Overflow("v2 recovery u32 range exceeds usize"))?;
-    let encoded: [u8; 4] = bytes
-        .get(offset..end)
-        .ok_or(V2RecoveryError::Invalid("v2 recovery u32 field is truncated"))?
-        .try_into()
-        .map_err(|_| V2RecoveryError::Invalid("v2 recovery u32 width mismatch"))?;
-    Ok(u32::from_le_bytes(encoded))
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::commit_v2::encode_v2_commit;
     use super::super::format_v2::{V2NodeRecord, V2RootRecord};
+    use super::super::hot_frame_v2::encode_v2_hot_frame;
     use super::super::publication_v2::{
         checkpoint_state_metadata, V2CheckpointRecord, V2VersionRecord,
     };
@@ -220,10 +195,14 @@ mod tests {
         }
     }
 
-    fn two_commits() -> (Vec<u8>, usize) {
+    fn encode_frame(base: V2WalGeometry, transaction: &V2WalTransaction, request: &[u8]) -> Vec<u8> {
+        let commit = encode_v2_commit(base, transaction, Some(request)).unwrap();
+        encode_v2_hot_frame(&commit).unwrap()
+    }
+
+    fn two_frames() -> (Vec<u8>, usize) {
         let first = first_transaction();
-        let first_bytes = encode_v2_commit(V2WalGeometry::default(), &first, Some(b"req-1"))
-            .unwrap();
+        let first_frame = encode_frame(V2WalGeometry::default(), &first, b"req-1");
         let base = V2WalGeometry {
             payload_len: 3,
             node_count: 1,
@@ -231,16 +210,16 @@ mod tests {
             checkpoint_count: 1,
         };
         let second = second_transaction(base);
-        let second_bytes = encode_v2_commit(base, &second, Some(b"req-2")).unwrap();
-        let logical_tail = first_bytes.len() + second_bytes.len();
-        let mut wal = first_bytes;
-        wal.extend_from_slice(&second_bytes);
+        let second_frame = encode_frame(base, &second, b"req-2");
+        let logical_tail = first_frame.len() + second_frame.len();
+        let mut wal = first_frame;
+        wal.extend_from_slice(&second_frame);
         (wal, logical_tail)
     }
 
     #[test]
     fn sequential_commits_recover_before_zero_reserve() {
-        let (mut wal, logical_tail) = two_commits();
+        let (mut wal, logical_tail) = two_frames();
         wal.resize(wal.len() + 1024, 0);
         let recovered = recover_v2_hot_wal(&wal, V2CommittedState::default()).unwrap();
         assert_eq!(recovered.logical_tail, u64::try_from(logical_tail).unwrap());
@@ -258,10 +237,9 @@ mod tests {
     }
 
     #[test]
-    fn torn_final_commit_is_uncommitted_suffix() {
+    fn zero_padded_partial_final_commit_is_uncommitted_suffix() {
         let first = first_transaction();
-        let first_bytes = encode_v2_commit(V2WalGeometry::default(), &first, Some(b"req-1"))
-            .unwrap();
+        let first_frame = encode_frame(V2WalGeometry::default(), &first, b"req-1");
         let base = V2WalGeometry {
             payload_len: 3,
             node_count: 1,
@@ -269,12 +247,15 @@ mod tests {
             checkpoint_count: 1,
         };
         let second = second_transaction(base);
-        let second_bytes = encode_v2_commit(base, &second, Some(b"req-2")).unwrap();
-        let mut wal = first_bytes.clone();
-        wal.extend_from_slice(&second_bytes[..second_bytes.len() / 2]);
+        let second_frame = encode_frame(base, &second, b"req-2");
+        let mut wal = first_frame.clone();
+        let second_start = wal.len();
+        wal.resize(second_start + second_frame.len() + 512, 0);
+        let written = second_frame.len() / 2;
+        wal[second_start..second_start + written].copy_from_slice(&second_frame[..written]);
 
         let recovered = recover_v2_hot_wal(&wal, V2CommittedState::default()).unwrap();
-        assert_eq!(recovered.logical_tail, u64::try_from(first_bytes.len()).unwrap());
+        assert_eq!(recovered.logical_tail, u64::try_from(first_frame.len()).unwrap());
         assert_eq!(recovered.commit_count, 1);
         assert_eq!(recovered.stop, V2RecoveryStop::TornFinalCommit);
         assert_eq!(recovered.state.geometry().unwrap().checkpoint_count, 1);
@@ -283,8 +264,7 @@ mod tests {
     #[test]
     fn complete_corruption_and_duplicate_physical_retry_fail_closed() {
         let first = first_transaction();
-        let first_bytes = encode_v2_commit(V2WalGeometry::default(), &first, Some(b"req-1"))
-            .unwrap();
+        let first_frame = encode_frame(V2WalGeometry::default(), &first, b"req-1");
         let base = V2WalGeometry {
             payload_len: 3,
             node_count: 1,
@@ -292,14 +272,16 @@ mod tests {
             checkpoint_count: 1,
         };
         let second = second_transaction(base);
-        let mut corrupt_second = encode_v2_commit(base, &second, Some(b"req-2")).unwrap();
-        *corrupt_second.last_mut().unwrap() ^= 1;
-        let mut corrupt_wal = first_bytes.clone();
+        let mut corrupt_second = encode_frame(base, &second, b"req-2");
+        let footer_size = 40usize;
+        let commit_last = corrupt_second.len() - footer_size - 1;
+        corrupt_second[commit_last] ^= 1;
+        let mut corrupt_wal = first_frame.clone();
         corrupt_wal.extend_from_slice(&corrupt_second);
         assert!(recover_v2_hot_wal(&corrupt_wal, V2CommittedState::default()).is_err());
 
-        let mut duplicate = first_bytes.clone();
-        duplicate.extend_from_slice(&first_bytes);
+        let mut duplicate = first_frame.clone();
+        duplicate.extend_from_slice(&first_frame);
         let error = recover_v2_hot_wal(&duplicate, V2CommittedState::default()).unwrap_err();
         assert!(error
             .to_string()
@@ -308,7 +290,7 @@ mod tests {
 
     #[test]
     fn reserve_garbage_and_bare_structural_record_are_rejected() {
-        let (mut wal, _) = two_commits();
+        let (mut wal, _) = two_frames();
         wal.extend_from_slice(&[0, 0, 0, 0, 9]);
         let error = recover_v2_hot_wal(&wal, V2CommittedState::default()).unwrap_err();
         assert!(error
