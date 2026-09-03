@@ -685,7 +685,7 @@ mod tests {
             hex(&encoded),
             "543250325a0000000b00000009000000ffffffffffffffff010000000100000000000000010000001e0000000000000074a8ea61c65c688272bbf9662aabb1ee88301f89810198b88c7eadcac5384a6800000000000000007463"
         );
-        assert_eq!(decode_v2_checkpoint(&encoded, 10), Ok(record));
+        assert_eq!(decode_v2_checkpoint(&encoded, 10), Ok(record.clone()));
 
         assert_eq!(
             decode_v2_checkpoint(&encoded, 9),
