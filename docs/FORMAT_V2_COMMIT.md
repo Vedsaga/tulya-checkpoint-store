@@ -45,6 +45,11 @@ complete, validated `T2C2` can publish it.
 New Format-v2 bytes only. Released Format v1 is unchanged. `T2W2` schema 1 is
 also unchanged and becomes an inner structural record of `T2C2`.
 
+The preinitialized hot file adds a separate physical `T2E2` completion footer
+after each `T2C2`. That footer does not change `T2C2` semantics or bytes; it
+proves that the sequential hot-WAL write reached the end of the exact logical
+commit. See `FORMAT_V2_RECOVERY.md`.
+
 ## Canonical `T2C2` envelope
 
 All integers are little-endian. Schema 1 uses an 88-byte header:
@@ -193,25 +198,31 @@ state is extended. A validation error therefore has no partial logical apply.
 
 ## Recovery / authority rule
 
-For a future v2 hot WAL, the authority unit is `T2C2`, not bare `T2W2`.
+For a future v2 hot WAL, `T2C2` is the logical authority unit, not bare `T2W2`.
+The physical hot file additionally requires the last-written `T2E2` completion
+footer before recovery may consider that `T2C2` complete.
+
 Recovery should:
 
-1. frame and validate `T2C2` length/schema/integrity;
-2. validate its request metadata and logical-operation digest;
-3. decode and validate the inner `T2W2` against the encoded starting geometry;
-4. classify the request identity against the reconstructed ledger;
-5. resolve old references against already committed state;
-6. apply all logical state atomically; then
-7. advance the scanner to the next commit.
+1. prove the `T2C2 + T2E2` physical frame reached its canonical end;
+2. validate `T2C2` length/schema/integrity;
+3. validate its request metadata and logical-operation digest;
+4. decode and validate the inner `T2W2` against the encoded starting geometry;
+5. classify the request identity against the reconstructed ledger;
+6. resolve old references against already committed state;
+7. apply all logical state atomically; then
+8. advance the scanner by the complete physical frame length.
 
-An incomplete final `T2C2` is an uncommitted suffix. A complete inner `T2W2`
+A final zero-padded `T2C2`/`T2E2` write that never reaches its canonical footer
+is an uncommitted suffix. Once the exact footer is present, any commit or apply
+validation failure is corruption and fails closed. A complete inner `T2W2`
 without its enclosing complete `T2C2` must never become client-visible.
 
 ## Current boundary
 
 This unit is still pure/staged. It does **not** yet:
 
-- write `T2C2` to `CheckpointStore::hot.wal`;
+- write `T2C2 + T2E2` through `CheckpointStore::hot.wal`;
 - change manifest/public format version;
 - implement v1 -> v2 migration;
 - replace sealed Format-v1 streams;
