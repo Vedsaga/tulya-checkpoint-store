@@ -16,6 +16,11 @@
 //! operation is added to the executable contract when its production caller
 //! and implementation land, so strict `dead_code` checks remain meaningful.
 
+// Staged Format-v2 codec. The next storage unit makes the writable balanced
+// sequence its production caller and removes this scoped allowance.
+#[allow(dead_code)]
+mod format_v2;
+
 /// Logical byte length of a persistent sequence.
 ///
 /// Persistent lengths stay in a fixed-width integer. Conversion to `usize`
