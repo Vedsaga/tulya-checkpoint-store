@@ -129,15 +129,17 @@ pub(crate) type SequenceSink<'a, E> = dyn FnMut(&[u8]) -> Result<(), E> + 'a;
 /// must return the same bytes as full extraction of the requested root.
 ///
 /// This trait states semantics, not yet the production complexity claim.
-/// Format v1 is allowed to have legacy traversal costs. The balanced writable
-/// implementation introduced for the locality gate must additionally enforce
-/// logarithmic/bounded depth and persisted subtree lengths.
+/// Format v1 is allowed to have legacy traversal costs and is adapted through
+/// a read-only compatibility implementation because its transaction grammar
+/// couples sequence mutation to checkpoint publication. The balanced writable
+/// implementation introduced for the locality gate must support `append` and
+/// additionally enforce logarithmic/bounded depth and persisted subtree lengths.
 pub(crate) trait PersistentSequence {
     type Error;
 
     /// Appends `bytes` to `parent`, or creates a new root when `parent` is
-    /// absent. An empty delta may be rejected by an implementation when the
-    /// caller's semantic operation requires a non-empty append.
+    /// absent. A read-only compatibility adapter may reject this operation;
+    /// production writable implementations must support it.
     fn append(
         &mut self,
         parent: Option<PersistentRoot>,
