@@ -89,9 +89,8 @@ impl V2NodeRecord {
                 "v2 sequence leaf payload must be non-empty",
             ));
         }
-        let logical_len = u64::try_from(payload.len()).map_err(|_| {
-            V2FormatError::Overflow("v2 sequence leaf payload length exceeds u64")
-        })?;
+        let logical_len = u64::try_from(payload.len())
+            .map_err(|_| V2FormatError::Overflow("v2 sequence leaf payload length exceeds u64"))?;
         payload_offset
             .checked_add(logical_len)
             .ok_or(V2FormatError::Overflow(
@@ -108,10 +107,7 @@ impl V2NodeRecord {
         })
     }
 
-    pub(super) fn branch(
-        left: V2RootRecord,
-        right: V2RootRecord,
-    ) -> Result<Self, V2FormatError> {
+    pub(super) fn branch(left: V2RootRecord, right: V2RootRecord) -> Result<Self, V2FormatError> {
         validate_child_root(left)?;
         validate_child_root(right)?;
         if left.height.abs_diff(right.height) > 1 {
@@ -119,19 +115,19 @@ impl V2NodeRecord {
                 "v2 sequence branch children are not AVL-balanced",
             ));
         }
-        let height = left
-            .height
-            .max(right.height)
-            .checked_add(1)
-            .ok_or(V2FormatError::Overflow(
-                "v2 sequence branch height exceeds u16",
-            ))?;
-        let logical_len = left
-            .logical_len
-            .checked_add(right.logical_len)
-            .ok_or(V2FormatError::Overflow(
-                "v2 sequence branch logical length exceeds u64",
-            ))?;
+        let height =
+            left.height
+                .max(right.height)
+                .checked_add(1)
+                .ok_or(V2FormatError::Overflow(
+                    "v2 sequence branch height exceeds u16",
+                ))?;
+        let logical_len =
+            left.logical_len
+                .checked_add(right.logical_len)
+                .ok_or(V2FormatError::Overflow(
+                    "v2 sequence branch logical length exceeds u64",
+                ))?;
         Ok(Self {
             height,
             logical_len,
@@ -244,31 +240,15 @@ pub(super) fn decode_v2_node(bytes: &[u8]) -> Result<V2NodeRecord, V2FormatError
     if flags != 0 {
         return Err(V2FormatError::Invalid("v2 node flags must be zero"));
     }
-    let height = u16::from_le_bytes(read_array::<2>(
-        bytes,
-        6,
-        "v2 node height is truncated",
-    )?);
+    let height = u16::from_le_bytes(read_array::<2>(bytes, 6, "v2 node height is truncated")?);
     let logical_len = u64::from_le_bytes(read_array::<8>(
         bytes,
         8,
         "v2 node logical length is truncated",
     )?);
-    let field_a = u64::from_le_bytes(read_array::<8>(
-        bytes,
-        16,
-        "v2 node field A is truncated",
-    )?);
-    let field_b = u64::from_le_bytes(read_array::<8>(
-        bytes,
-        24,
-        "v2 node field B is truncated",
-    )?);
-    let field_c = u64::from_le_bytes(read_array::<8>(
-        bytes,
-        32,
-        "v2 node field C is truncated",
-    )?);
+    let field_a = u64::from_le_bytes(read_array::<8>(bytes, 16, "v2 node field A is truncated")?);
+    let field_b = u64::from_le_bytes(read_array::<8>(bytes, 24, "v2 node field B is truncated")?);
+    let field_c = u64::from_le_bytes(read_array::<8>(bytes, 32, "v2 node field C is truncated")?);
     let commitment = V2Commitment::from_bytes(read_array::<32>(
         bytes,
         40,
@@ -297,9 +277,7 @@ pub(super) fn decode_v2_node(bytes: &[u8]) -> Result<V2NodeRecord, V2FormatError
             }
             field_a
                 .checked_add(field_b)
-                .ok_or(V2FormatError::Overflow(
-                    "v2 leaf payload range exceeds u64",
-                ))?;
+                .ok_or(V2FormatError::Overflow("v2 leaf payload range exceeds u64"))?;
             Ok(V2NodeRecord {
                 height,
                 logical_len,
@@ -367,11 +345,7 @@ pub(super) fn decode_v2_root(bytes: &[u8]) -> Result<V2RootRecord, V2FormatError
     if flags != 0 {
         return Err(V2FormatError::Invalid("v2 root flags must be zero"));
     }
-    let height = u16::from_le_bytes(read_array::<2>(
-        bytes,
-        6,
-        "v2 root height is truncated",
-    )?);
+    let height = u16::from_le_bytes(read_array::<2>(bytes, 6, "v2 root height is truncated")?);
     let node_id = u64::from_le_bytes(read_array::<8>(
         bytes,
         8,
@@ -461,11 +435,7 @@ fn require_record_len(
     Ok(())
 }
 
-fn read_byte(
-    bytes: &[u8],
-    offset: usize,
-    message: &'static str,
-) -> Result<u8, V2FormatError> {
+fn read_byte(bytes: &[u8], offset: usize, message: &'static str) -> Result<u8, V2FormatError> {
     bytes
         .get(offset)
         .copied()
@@ -596,9 +566,7 @@ mod tests {
         corrupt[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
         assert_eq!(
             decode_v2_node(&corrupt),
-            Err(V2FormatError::Overflow(
-                "v2 leaf payload range exceeds u64"
-            ))
+            Err(V2FormatError::Overflow("v2 leaf payload range exceeds u64"))
         );
     }
 
