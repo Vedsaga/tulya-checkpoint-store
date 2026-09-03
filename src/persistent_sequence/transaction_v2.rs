@@ -742,10 +742,10 @@ mod tests {
                 checkpoint_count: 1,
             }
         );
-        assert_eq!(encoded.len(), 370);
+        assert_eq!(encoded.len(), 365);
         assert_eq!(
             hex(&decoded.digest),
-            "4cd271349dbf6727fc27847cc352771c20f722de9462538eea7968117cb5b31e"
+            "185d3f5767c8e1fc76a457b52d3620eb4dd4357176b52270adf4a58095a36227"
         );
     }
 
@@ -877,14 +877,15 @@ mod tests {
             ))
         );
 
+        let second_local = V2NodeRecord::leaf(1, b"c").unwrap();
         let left = V2RootRecord::from_node(9, first).unwrap();
-        let right = V2RootRecord::from_node(10, second).unwrap();
+        let right = V2RootRecord::from_node(10, second_local).unwrap();
         let branch = V2NodeRecord::branch(left, right).unwrap();
         let branch_root = V2RootRecord::from_node(2, branch).unwrap();
         let branch_state = checkpoint_state_metadata(branch_root, None, None).unwrap();
         let forward = V2WalTransaction {
             payload: b"ac".to_vec(),
-            nodes: vec![first, second, branch],
+            nodes: vec![first, second_local, branch],
             versions: vec![V2VersionRecord::new(0, None, branch_root).unwrap()],
             checkpoint: V2CheckpointRecord {
                 checkpoint_no: 1,
