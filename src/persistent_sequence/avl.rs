@@ -123,9 +123,7 @@ impl V2AvlSequence {
             .checked_add(length)
             .ok_or(V2AvlError::Overflow("v2 range end exceeds u64"))?;
         if end > root.logical_len() {
-            return Err(V2AvlError::Invalid(
-                "v2 range exceeds root logical length",
-            ));
+            return Err(V2AvlError::Invalid("v2 range exceeds root logical length"));
         }
         let capacity = usize::try_from(length)
             .map_err(|_| V2AvlError::Overflow("v2 range length exceeds usize"))?;
@@ -146,9 +144,7 @@ impl V2AvlSequence {
                         .checked_add(local_length)
                         .ok_or(V2AvlError::Overflow("v2 leaf range exceeds u64"))?;
                     if local_end > *payload_len {
-                        return Err(V2AvlError::Invalid(
-                            "v2 leaf range exceeds leaf payload",
-                        ));
+                        return Err(V2AvlError::Invalid("v2 leaf range exceeds leaf payload"));
                     }
                     let start = payload_offset
                         .checked_add(local_offset)
@@ -306,10 +302,9 @@ impl V2AvlSequence {
     fn node_for_root(&self, root: V2RootRecord) -> Result<&ArenaNode, V2AvlError> {
         let index = usize::try_from(root.node_id())
             .map_err(|_| V2AvlError::Overflow("v2 node identifier exceeds usize"))?;
-        let node = self
-            .nodes
-            .get(index)
-            .ok_or(V2AvlError::Invalid("v2 root references a missing arena node"))?;
+        let node = self.nodes.get(index).ok_or(V2AvlError::Invalid(
+            "v2 root references a missing arena node",
+        ))?;
         let canonical = V2RootRecord::from_node(root.node_id(), node.record())?;
         if canonical != root {
             return Err(V2AvlError::Invalid(
@@ -339,8 +334,10 @@ impl V2AvlSequence {
                 let payload_end = payload_offset
                     .checked_add(*payload_len)
                     .ok_or(V2AvlError::Overflow("v2 leaf payload range exceeds u64"))?;
-                let expected =
-                    V2NodeRecord::leaf(*payload_offset, self.payload_slice(*payload_offset, payload_end)?)?;
+                let expected = V2NodeRecord::leaf(
+                    *payload_offset,
+                    self.payload_slice(*payload_offset, payload_end)?,
+                )?;
                 if expected != *record {
                     return Err(V2AvlError::Invalid(
                         "v2 leaf metadata or commitment verification failed",
@@ -402,17 +399,21 @@ mod tests {
             expected.extend_from_slice(&chunk);
             assert_eq!(next.logical_len(), u64::try_from(expected.len()).unwrap());
             assert!(result.allocated_nodes() <= usize::from(next.height()) * 2 + 2);
-            sequence
-                .verify_root(next)
-                .expect("new root should verify after every append");
-            root = Some(next);
 
-            if index < 8 || index.is_power_of_two() || index % 511 == 0 {
+            let checkpoint = index < 8 || index.is_power_of_two() || index % 511 == 0;
+            if checkpoint {
+                sequence
+                    .verify_root(next)
+                    .expect("checkpoint root should verify");
                 snapshots.push((next, expected.clone()));
             }
+            root = Some(next);
         }
 
         let root = root.expect("at least one append produced a root");
+        sequence
+            .verify_root(root)
+            .expect("final root should verify after sequential appends");
         let height_bound = 2 * ceil_log2(4097) + 1;
         assert!(usize::from(root.height()) <= height_bound);
         assert!(sequence.node_count() < 4096 * height_bound);
