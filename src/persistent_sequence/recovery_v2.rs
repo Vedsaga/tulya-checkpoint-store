@@ -67,9 +67,9 @@ pub(super) fn recover_v2_hot_wal(
     let mut stop = V2RecoveryStop::EndOfBytes;
 
     while cursor < bytes.len() {
-        let remaining = bytes
-            .get(cursor..)
-            .ok_or(V2RecoveryError::Invalid("v2 recovery cursor exceeds WAL bytes"))?;
+        let remaining = bytes.get(cursor..).ok_or(V2RecoveryError::Invalid(
+            "v2 recovery cursor exceeds WAL bytes",
+        ))?;
 
         if starts_with_zero_reserve(remaining) {
             if remaining.iter().any(|byte| *byte != 0) {
@@ -97,9 +97,9 @@ pub(super) fn recover_v2_hot_wal(
                 break;
             }
         };
-        let record = remaining
-            .get(..commit_len)
-            .ok_or(V2RecoveryError::Invalid("v2 commit range exceeds WAL bytes"))?;
+        let record = remaining.get(..commit_len).ok_or(V2RecoveryError::Invalid(
+            "v2 commit range exceeds WAL bytes",
+        ))?;
         match apply_v2_commit(&mut state, record)? {
             V2ApplyOutcome::Applied { .. } => {}
             V2ApplyOutcome::Replayed { .. } => {
@@ -115,10 +115,14 @@ pub(super) fn recover_v2_hot_wal(
         }
         cursor = cursor
             .checked_add(frame_len)
-            .ok_or(V2RecoveryError::Overflow("v2 recovery cursor exceeds usize"))?;
+            .ok_or(V2RecoveryError::Overflow(
+                "v2 recovery cursor exceeds usize",
+            ))?;
         commit_count = commit_count
             .checked_add(1)
-            .ok_or(V2RecoveryError::Overflow("v2 recovery commit count exceeds u64"))?;
+            .ok_or(V2RecoveryError::Overflow(
+                "v2 recovery commit count exceeds u64",
+            ))?;
     }
 
     let logical_tail = u64::try_from(cursor)
@@ -195,7 +199,11 @@ mod tests {
         }
     }
 
-    fn encode_frame(base: V2WalGeometry, transaction: &V2WalTransaction, request: &[u8]) -> Vec<u8> {
+    fn encode_frame(
+        base: V2WalGeometry,
+        transaction: &V2WalTransaction,
+        request: &[u8],
+    ) -> Vec<u8> {
         let commit = encode_v2_commit(base, transaction, Some(request)).unwrap();
         encode_v2_hot_frame(&commit).unwrap()
     }
@@ -255,7 +263,10 @@ mod tests {
         wal[second_start..second_start + written].copy_from_slice(&second_frame[..written]);
 
         let recovered = recover_v2_hot_wal(&wal, V2CommittedState::default()).unwrap();
-        assert_eq!(recovered.logical_tail, u64::try_from(first_frame.len()).unwrap());
+        assert_eq!(
+            recovered.logical_tail,
+            u64::try_from(first_frame.len()).unwrap()
+        );
         assert_eq!(recovered.commit_count, 1);
         assert_eq!(recovered.stop, V2RecoveryStop::TornFinalCommit);
         assert_eq!(recovered.state.geometry().unwrap().checkpoint_count, 1);
