@@ -38,6 +38,8 @@ pub enum CheckpointStoreFailureKind {
     Io,
     /// Durable commit may have succeeded even though the caller did not receive success.
     DurabilityIndeterminate,
+    /// The writer observed a partial/mutating failure and must reopen/recover before reuse.
+    RecoveryRequired,
     /// The requested operation violates a documented lifecycle precondition.
     Precondition,
     /// Legacy error site has not yet been migrated to a precise class.
@@ -128,6 +130,59 @@ impl Error for DurabilityIndeterminate {
     }
 }
 
+/// Typed context returned once a mutable writer can no longer safely continue
+/// without reconstructing authority from disk.
+#[derive(Debug)]
+pub struct RecoveryRequired {
+    path: PathBuf,
+    source: Option<io::Error>,
+}
+
+impl RecoveryRequired {
+    fn new(path: PathBuf, source: Option<io::Error>) -> Self {
+        Self { path, source }
+    }
+
+    /// Returns the WAL/filesystem object that must be recovered before reuse.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the original I/O error when the recovery requirement was caused
+    /// directly by a failed mutating syscall.
+    #[must_use]
+    pub fn source_error(&self) -> Option<&io::Error> {
+        self.source.as_ref()
+    }
+}
+
+impl fmt::Display for RecoveryRequired {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.source {
+            Some(source) => write!(
+                formatter,
+                "writer requires reopen/recovery for {} after I/O failure: {}",
+                self.path.display(),
+                source
+            ),
+            None => write!(
+                formatter,
+                "writer requires reopen/recovery for {} before further mutation",
+                self.path.display()
+            ),
+        }
+    }
+}
+
+impl Error for RecoveryRequired {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source as &(dyn Error + 'static))
+    }
+}
+
 impl CheckpointStoreError {
     /// Returns the stable behavioral class for this failure.
     ///
@@ -140,6 +195,9 @@ impl CheckpointStoreError {
         match self {
             Self::Io(error) if embedded_durability_indeterminate(error).is_some() => {
                 CheckpointStoreFailureKind::DurabilityIndeterminate
+            }
+            Self::Io(error) if embedded_recovery_required(error).is_some() => {
+                CheckpointStoreFailureKind::RecoveryRequired
             }
             Self::Io(_) => CheckpointStoreFailureKind::Io,
             Self::Json(error) => match error.classify() {
@@ -170,6 +228,16 @@ impl CheckpointStoreError {
             _ => None,
         }
     }
+
+    /// Returns recovery-required context when this writer must not perform
+    /// further mutation until the store is reopened and recovered.
+    #[must_use]
+    pub fn recovery_required(&self) -> Option<&RecoveryRequired> {
+        match self {
+            Self::Io(error) => embedded_recovery_required(error),
+            _ => None,
+        }
+    }
 }
 
 fn embedded_durability_indeterminate(error: &io::Error) -> Option<&DurabilityIndeterminate> {
@@ -178,10 +246,14 @@ fn embedded_durability_indeterminate(error: &io::Error) -> Option<&DurabilityInd
         .and_then(|source| source.downcast_ref::<DurabilityIndeterminate>())
 }
 
+fn embedded_recovery_required(error: &io::Error) -> Option<&RecoveryRequired> {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<RecoveryRequired>())
+}
+
 /// Wraps an I/O failure whose commit outcome cannot safely be treated as a
-/// definite abort. The hot-WAL I/O boundary consumes this helper in the next
-/// resilience unit.
-#[allow(dead_code)]
+/// definite abort.
 pub(crate) fn durability_indeterminate_error(
     operation: DurabilityOperation,
     path: &Path,
@@ -189,6 +261,17 @@ pub(crate) fn durability_indeterminate_error(
 ) -> CheckpointStoreError {
     let kind = source.kind();
     let context = DurabilityIndeterminate::new(operation, path.to_path_buf(), source);
+    CheckpointStoreError::Io(io::Error::new(kind, context))
+}
+
+/// Wraps a failure after mutable WAL bytes may have changed, or reports an
+/// already-poisoned writer. Callers must reopen/recover before another write.
+pub(crate) fn recovery_required_error(
+    path: &Path,
+    source: Option<io::Error>,
+) -> CheckpointStoreError {
+    let kind = source.as_ref().map_or(io::ErrorKind::Other, io::Error::kind);
+    let context = RecoveryRequired::new(path.to_path_buf(), source);
     CheckpointStoreError::Io(io::Error::new(kind, context))
 }
 
@@ -250,12 +333,39 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_io_error_is_not_misclassified_as_indeterminate() {
+    fn recovery_required_retains_path_and_optional_source() {
+        let error = recovery_required_error(
+            Path::new("/tmp/hot.wal"),
+            Some(io::Error::from_raw_os_error(5)),
+        );
+        assert_eq!(
+            error.failure_kind(),
+            CheckpointStoreFailureKind::RecoveryRequired
+        );
+        let context = error.recovery_required().unwrap();
+        assert_eq!(context.path(), Path::new("/tmp/hot.wal"));
+        assert_eq!(context.source_error().and_then(io::Error::raw_os_error), Some(5));
+
+        let poisoned = recovery_required_error(Path::new("/tmp/hot.wal"), None);
+        assert_eq!(
+            poisoned.failure_kind(),
+            CheckpointStoreFailureKind::RecoveryRequired
+        );
+        assert!(poisoned
+            .recovery_required()
+            .unwrap()
+            .source_error()
+            .is_none());
+    }
+
+    #[test]
+    fn ordinary_io_error_is_not_misclassified_as_indeterminate_or_recovery_required() {
         let error = CheckpointStoreError::Io(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "permission denied",
         ));
         assert_eq!(error.failure_kind(), CheckpointStoreFailureKind::Io);
         assert!(error.durability_indeterminate().is_none());
+        assert!(error.recovery_required().is_none());
     }
 }
