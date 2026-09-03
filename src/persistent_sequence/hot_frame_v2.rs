@@ -40,19 +40,19 @@ impl From<V2CommitError> for V2HotFrameError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum V2HotFrameProbe {
-    Complete {
-        commit_len: usize,
-        frame_len: usize,
-    },
+    Complete { commit_len: usize, frame_len: usize },
     Torn,
 }
 
 pub(super) fn encode_v2_hot_frame(commit: &[u8]) -> Result<Vec<u8>, V2HotFrameError> {
     let decoded = decode_v2_commit(commit)?;
-    let frame_len = commit
-        .len()
-        .checked_add(V2_HOT_FOOTER_SIZE)
-        .ok_or(V2HotFrameError::Overflow("v2 hot frame length exceeds usize"))?;
+    let frame_len =
+        commit
+            .len()
+            .checked_add(V2_HOT_FOOTER_SIZE)
+            .ok_or(V2HotFrameError::Overflow(
+                "v2 hot frame length exceeds usize",
+            ))?;
     let frame_len_u32 = u32::try_from(frame_len)
         .map_err(|_| V2HotFrameError::Overflow("v2 hot frame length exceeds u32"))?;
     let mut output = Vec::with_capacity(frame_len);
@@ -77,7 +77,9 @@ pub(super) fn probe_v2_hot_frame(bytes: &[u8]) -> Result<V2HotFrameProbe, V2HotF
         };
     }
     if bytes.get(..4) != Some(V2_COMMIT_MAGIC.as_slice()) {
-        return Err(V2HotFrameError::Invalid("v2 hot frame commit magic mismatch"));
+        return Err(V2HotFrameError::Invalid(
+            "v2 hot frame commit magic mismatch",
+        ));
     }
     if bytes.len() < 8 {
         return Ok(V2HotFrameProbe::Torn);
@@ -100,7 +102,9 @@ pub(super) fn probe_v2_hot_frame(bytes: &[u8]) -> Result<V2HotFrameProbe, V2HotF
 
     let frame_len = commit_len
         .checked_add(V2_HOT_FOOTER_SIZE)
-        .ok_or(V2HotFrameError::Overflow("v2 hot frame length exceeds usize"))?;
+        .ok_or(V2HotFrameError::Overflow(
+            "v2 hot frame length exceeds usize",
+        ))?;
     if frame_len > bytes.len() {
         return Ok(V2HotFrameProbe::Torn);
     }
@@ -122,7 +126,9 @@ pub(super) fn probe_v2_hot_frame(bytes: &[u8]) -> Result<V2HotFrameProbe, V2HotF
         if is_zero_padded_prefix(actual_footer, &expected_footer) {
             return Ok(V2HotFrameProbe::Torn);
         }
-        return Err(V2HotFrameError::Invalid("v2 hot completion footer mismatch"));
+        return Err(V2HotFrameError::Invalid(
+            "v2 hot completion footer mismatch",
+        ));
     }
     Ok(V2HotFrameProbe::Complete {
         commit_len,
@@ -196,7 +202,10 @@ mod tests {
                 frame_len: frame.len(),
             })
         );
-        assert_eq!(frame.get(commit.len()..commit.len() + 4), Some(b"T2E2".as_slice()));
+        assert_eq!(
+            frame.get(commit.len()..commit.len() + 4),
+            Some(b"T2E2".as_slice())
+        );
         assert_eq!(
             frame.get(commit.len() + 8..commit.len() + V2_HOT_FOOTER_SIZE),
             commit.get(V2_COMMIT_DIGEST_OFFSET..V2_COMMIT_DIGEST_END)
@@ -232,7 +241,9 @@ mod tests {
         frame[commit.len()] = b'X';
         assert_eq!(
             probe_v2_hot_frame(&frame),
-            Err(V2HotFrameError::Invalid("v2 hot completion footer mismatch"))
+            Err(V2HotFrameError::Invalid(
+                "v2 hot completion footer mismatch"
+            ))
         );
     }
 }
