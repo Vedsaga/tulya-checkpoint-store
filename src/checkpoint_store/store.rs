@@ -30,6 +30,9 @@ impl CheckpointStore {
         let writer_lock = WriterLock::acquire(&dir)?;
         let manifest = load_manifest(&dir)?;
         let manifest = ensure_format_v1_manifest(&dir, manifest)?;
+        let store_id = manifest.store_id.ok_or_else(|| {
+            format_error("public-format manifest is missing persistent StoreId after normalization")
+        })?;
         let (mut state, lazy_base) = if config.recovery_mode == CheckpointStoreRecoveryMode::Lazy {
             let lazy = LazyCheckpointStore::open_for_writable_store(&dir)?;
             let state = state_from_lazy_reader(&dir, &manifest, &lazy)?;
@@ -90,6 +93,7 @@ impl CheckpointStore {
             dir,
             config,
             manifest,
+            store_id,
             state,
             _writer_lock: writer_lock,
             hot,
@@ -114,9 +118,7 @@ impl CheckpointStore {
     /// Returns this store's persistent identity.
     #[must_use]
     pub fn store_id(&self) -> StoreId {
-        self.manifest
-            .store_id
-            .expect("public-format stores always have a persistent StoreId")
+        self.store_id
     }
 
     /// Assigns a new identity after a directory has been copied as an
@@ -131,6 +133,7 @@ impl CheckpointStore {
             &manifest_bytes(&next_manifest)?,
         )?;
         self.manifest = next_manifest;
+        self.store_id = store_id;
         Ok(store_id)
     }
 
