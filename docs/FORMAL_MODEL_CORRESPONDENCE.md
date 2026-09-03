@@ -95,6 +95,24 @@ commitment strategy (or explicitly separate structural commitment from an
 optional full-byte verification hash), persist the required metadata, and test
 failure-closed decoding.
 
+### Format-v1 message-append compatibility step
+
+The Format-v1 message append path now derives child logical length from persisted
+`CheckpointInfo.logical_state_len` and feeds the legacy whole-state XXH3 through
+bounded checkpoint-range chunks. It no longer reconstructs the complete parent
+canonical JSON in one temporary vector merely to derive the child metadata.
+
+This is a bounded-incremental-RAM compatibility improvement, **not** completion
+of the append-locality gate. Format v1 still persists one XXH3-64 over the full
+canonical checkpoint. Because that value is not a composable commitment for
+concatenation, preserving released v1 hash semantics still requires O(parent)
+read/hash work for a child append.
+
+Accordingly, the production locality redesign requires a new writable format
+with persisted subtree lengths plus a composable structural/content commitment.
+That is a Format-v2 concern; the existing v1 `state_hash` field must not be
+reinterpreted as such a commitment.
+
 ### Complexity rule
 
 The semantic trait by itself does not establish production locality. The
@@ -110,16 +128,17 @@ that is not linear in unchanged parent size.
 1. Compile the internal sequence contract without changing Format-v1 bytes.
 2. Adapt existing v1 root lookup, logical-length discovery, and range reads to
    typed `PersistentRoot` / `LogicalLength` boundaries.
-3. Add the writable append operation to the sequence boundary together with its
-   real checkpoint caller; do not pretend Format v1 has an independent append
-   primitive when transaction publication is coupled to it.
-4. Add structural tests that expose the current left-deep depth as a legacy
+3. Bound Format-v1 message-append temporary materialization while preserving its
+   exact whole-state XXH3 semantics; this step does not satisfy append locality.
+4. Design the writable Format-v2 root/node metadata and composable commitment,
+   then add the real sequence append operation with its checkpoint caller.
+5. Add structural tests that expose the current left-deep depth as a legacy
    property rather than an accepted production invariant.
-5. Design the balanced representation and commitment metadata; introduce
-   Format v2 if the persisted representation changes.
-6. Add bounded streaming and structural verification to the sequence boundary
+6. Implement the balanced representation with persisted subtree lengths and
+   Format-v2 commitment metadata.
+7. Add bounded streaming and structural verification to the sequence boundary
    as their production implementations land.
-7. Add balancing, historical-preservation, range-locality, reopen, corruption,
+8. Add balancing, historical-preservation, range-locality, reopen, corruption,
    and scaling evidence before checking the corresponding production-readiness
    gates.
 
