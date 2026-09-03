@@ -68,27 +68,23 @@ pub(crate) fn probe_public_manifest(
     probe_public_manifest_value(&value)
 }
 
-fn probe_public_manifest_value(
-    value: &Value,
-) -> Result<PublicStoreFormat, FormatAuthorityError> {
-    let format = value
-        .get("format")
-        .and_then(Value::as_str)
-        .ok_or(FormatAuthorityError::Invalid(
-            "checkpoint-store manifest format is missing",
-        ))?;
+fn probe_public_manifest_value(value: &Value) -> Result<PublicStoreFormat, FormatAuthorityError> {
+    let format =
+        value
+            .get("format")
+            .and_then(Value::as_str)
+            .ok_or(FormatAuthorityError::Invalid(
+                "checkpoint-store manifest format is missing",
+            ))?;
     if format != crate::format::NAME {
         return Err(FormatAuthorityError::Invalid(
             "checkpoint-store manifest format mismatch",
         ));
     }
 
-    let version = value
-        .get("format_version")
-        .and_then(Value::as_u64)
-        .ok_or(FormatAuthorityError::Invalid(
-            "checkpoint-store manifest format version is missing",
-        ))?;
+    let version = value.get("format_version").and_then(Value::as_u64).ok_or(
+        FormatAuthorityError::Invalid("checkpoint-store manifest format version is missing"),
+    )?;
     match version {
         PUBLIC_FORMAT_V1 => Ok(PublicStoreFormat::V1),
         PUBLIC_FORMAT_V2 => Ok(PublicStoreFormat::V2),
@@ -96,9 +92,7 @@ fn probe_public_manifest_value(
     }
 }
 
-pub(crate) fn probe_hot_wal_prefix(
-    bytes: &[u8],
-) -> Result<HotWalAuthority, FormatAuthorityError> {
+pub(crate) fn probe_hot_wal_prefix(bytes: &[u8]) -> Result<HotWalAuthority, FormatAuthorityError> {
     if bytes.is_empty() || bytes.iter().take(4).all(|byte| *byte == 0) {
         return Ok(HotWalAuthority::Empty);
     }
@@ -114,9 +108,7 @@ pub(crate) fn probe_hot_wal_prefix(
             "checkpoint-store WAL prefix is truncated",
         ))?
         .try_into()
-        .map_err(|_| {
-            FormatAuthorityError::Invalid("checkpoint-store WAL magic width mismatch")
-        })?;
+        .map_err(|_| FormatAuthorityError::Invalid("checkpoint-store WAL magic width mismatch"))?;
     match magic {
         WAL_V1_MAGIC => Ok(HotWalAuthority::V1Transaction),
         WAL_V2_COMMIT_MAGIC => Ok(HotWalAuthority::V2Commit),
