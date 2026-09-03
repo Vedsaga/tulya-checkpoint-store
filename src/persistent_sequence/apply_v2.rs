@@ -74,20 +74,20 @@ pub(super) enum V2ApplyOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct V2RequestRecord {
-    operation_digest: [u8; 32],
-    checkpoint_ordinal: u64,
+pub(super) struct V2RequestRecord {
+    pub(super) operation_digest: [u8; 32],
+    pub(super) checkpoint_ordinal: u64,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct V2CommittedState {
-    payload: Vec<u8>,
-    nodes: Vec<V2NodeRecord>,
-    versions: Vec<V2VersionRecord>,
-    checkpoints: Vec<V2CheckpointRecord>,
-    checkpoint_ordinals: HashMap<(String, String), u64>,
-    request_records: HashMap<Vec<u8>, V2RequestRecord>,
-    retired_requests: HashMap<Vec<u8>, [u8; 32]>,
+    pub(super) payload: Vec<u8>,
+    pub(super) nodes: Vec<V2NodeRecord>,
+    pub(super) versions: Vec<V2VersionRecord>,
+    pub(super) checkpoints: Vec<V2CheckpointRecord>,
+    pub(super) checkpoint_ordinals: HashMap<(String, String), u64>,
+    pub(super) request_records: HashMap<Vec<u8>, V2RequestRecord>,
+    pub(super) retired_requests: HashMap<Vec<u8>, [u8; 32]>,
 }
 
 impl V2CommittedState {
