@@ -106,7 +106,9 @@ pub(super) fn encode_v2_commit(
     let total_len = V2_COMMIT_HEADER_SIZE
         .checked_add(wal.len())
         .and_then(|value| value.checked_add(request_len))
-        .ok_or(V2CommitError::Overflow("v2 commit byte length exceeds usize"))?;
+        .ok_or(V2CommitError::Overflow(
+            "v2 commit byte length exceeds usize",
+        ))?;
     let total_len_u32 = u32::try_from(total_len)
         .map_err(|_| V2CommitError::Overflow("v2 commit byte length exceeds u32"))?;
 
@@ -195,7 +197,9 @@ pub(super) fn decode_v2_commit(bytes: &[u8]) -> Result<V2DecodedCommit, V2Commit
             "v2 commit request range exceeds usize",
         ))?;
     if request_end != bytes.len() {
-        return Err(V2CommitError::Invalid("v2 commit section geometry mismatch"));
+        return Err(V2CommitError::Invalid(
+            "v2 commit section geometry mismatch",
+        ));
     }
     let wal_bytes = bytes
         .get(V2_COMMIT_HEADER_SIZE..wal_end)
@@ -241,7 +245,8 @@ pub(super) fn decode_v2_commit(bytes: &[u8]) -> Result<V2DecodedCommit, V2Commit
 }
 
 fn validate_request_id(request_id: Option<&[u8]>) -> Result<(), V2CommitError> {
-    if request_id.is_some_and(|request| request.is_empty() || request.len() > V2_MAX_REQUEST_ID_BYTES)
+    if request_id
+        .is_some_and(|request| request.is_empty() || request.len() > V2_MAX_REQUEST_ID_BYTES)
     {
         return Err(V2CommitError::Invalid(
             "v2 commit request id is empty or exceeds the byte limit",
