@@ -504,12 +504,8 @@ impl CheckpointStore {
             ));
         }
 
-        let prefix = self.read_checkpoint_range(
-            &parent.thread_id,
-            &parent.checkpoint_id,
-            0,
-            prefix_len,
-        )?;
+        let prefix =
+            self.read_checkpoint_range(&parent.thread_id, &parent.checkpoint_id, 0, prefix_len)?;
         let parent_without_suffix_len = parent
             .logical_state_len
             .checked_sub(suffix_len)
