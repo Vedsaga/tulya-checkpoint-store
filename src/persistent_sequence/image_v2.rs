@@ -5,8 +5,8 @@
 //! manifest, or sealed-segment lifecycle.
 
 use super::format_v2::{
-    decode_v2_node, decode_v2_root, encode_v2_node, encode_v2_root, V2FormatError,
-    V2NodeRecord, V2RootRecord,
+    decode_v2_node, decode_v2_root, encode_v2_node, encode_v2_root, V2FormatError, V2NodeRecord,
+    V2RootRecord,
 };
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -78,18 +78,28 @@ pub(super) fn encode_v2_image(image: &V2SequenceImage) -> Result<Vec<u8>, V2Imag
         return Err(V2ImageError::Invalid("v2 image payload must be non-empty"));
     }
     if image.nodes.is_empty() {
-        return Err(V2ImageError::Invalid("v2 image node table must be non-empty"));
+        return Err(V2ImageError::Invalid(
+            "v2 image node table must be non-empty",
+        ));
     }
     if image.roots.is_empty() {
-        return Err(V2ImageError::Invalid("v2 image root table must be non-empty"));
+        return Err(V2ImageError::Invalid(
+            "v2 image root table must be non-empty",
+        ));
     }
 
     let node_record_size = u32::try_from(encode_v2_node(image.nodes[0]).len())
         .map_err(|_| V2ImageError::Overflow("v2 image node record size exceeds u32"))?;
     let root_record_size = u32::try_from(encode_v2_root(image.roots[0]).len())
         .map_err(|_| V2ImageError::Overflow("v2 image root record size exceeds u32"))?;
-    validate_record_size(node_record_size, "v2 image node record size is outside bounds")?;
-    validate_record_size(root_record_size, "v2 image root record size is outside bounds")?;
+    validate_record_size(
+        node_record_size,
+        "v2 image node record size is outside bounds",
+    )?;
+    validate_record_size(
+        root_record_size,
+        "v2 image root record size is outside bounds",
+    )?;
 
     let header = V2ImageHeader {
         payload_len: u64::try_from(image.payload.len())
@@ -137,7 +147,10 @@ pub(super) fn encode_v2_image(image: &V2SequenceImage) -> Result<Vec<u8>, V2Imag
             "v2 image encoder produced an unexpected byte length",
         ));
     }
-    let digest = image_digest(&output[..V2_IMAGE_PREFIX_SIZE], &output[V2_IMAGE_HEADER_SIZE..]);
+    let digest = image_digest(
+        &output[..V2_IMAGE_PREFIX_SIZE],
+        &output[V2_IMAGE_HEADER_SIZE..],
+    );
     output[V2_IMAGE_DIGEST_OFFSET..V2_IMAGE_HEADER_SIZE].copy_from_slice(&digest);
     Ok(output)
 }
@@ -154,8 +167,10 @@ pub(super) fn decode_v2_image(bytes: &[u8]) -> Result<V2SequenceImage, V2ImageEr
         .ok_or(V2ImageError::Invalid("v2 image digest is truncated"))?
         .try_into()
         .map_err(|_| V2ImageError::Invalid("v2 image digest width mismatch"))?;
-    let expected_digest =
-        image_digest(&bytes[..V2_IMAGE_PREFIX_SIZE], &bytes[V2_IMAGE_HEADER_SIZE..]);
+    let expected_digest = image_digest(
+        &bytes[..V2_IMAGE_PREFIX_SIZE],
+        &bytes[V2_IMAGE_HEADER_SIZE..],
+    );
     if stored_digest != expected_digest {
         return Err(V2ImageError::Invalid("v2 image digest mismatch"));
     }
@@ -174,7 +189,9 @@ pub(super) fn decode_v2_image(bytes: &[u8]) -> Result<V2SequenceImage, V2ImageEr
     let mut cursor = V2_IMAGE_HEADER_SIZE;
     let payload_end = cursor
         .checked_add(payload_len)
-        .ok_or(V2ImageError::Overflow("v2 image payload range exceeds usize"))?;
+        .ok_or(V2ImageError::Overflow(
+            "v2 image payload range exceeds usize",
+        ))?;
     let payload = bytes
         .get(cursor..payload_end)
         .ok_or(V2ImageError::Invalid("v2 image payload is truncated"))?
@@ -209,7 +226,9 @@ pub(super) fn decode_v2_image(bytes: &[u8]) -> Result<V2SequenceImage, V2ImageEr
         cursor = end;
     }
     if cursor != bytes.len() {
-        return Err(V2ImageError::Invalid("v2 image decoder did not consume all bytes"));
+        return Err(V2ImageError::Invalid(
+            "v2 image decoder did not consume all bytes",
+        ));
     }
 
     Ok(V2SequenceImage {
@@ -264,10 +283,14 @@ fn decode_header(bytes: &[u8]) -> Result<V2ImageHeader, V2ImageError> {
         return Err(V2ImageError::Invalid("v2 image payload must be non-empty"));
     }
     if header.node_count == 0 {
-        return Err(V2ImageError::Invalid("v2 image node table must be non-empty"));
+        return Err(V2ImageError::Invalid(
+            "v2 image node table must be non-empty",
+        ));
     }
     if header.root_count == 0 {
-        return Err(V2ImageError::Invalid("v2 image root table must be non-empty"));
+        return Err(V2ImageError::Invalid(
+            "v2 image root table must be non-empty",
+        ));
     }
     validate_record_size(
         header.node_record_size,
@@ -293,15 +316,21 @@ fn checked_total_len(header: V2ImageHeader) -> Result<usize, V2ImageError> {
         .map_err(|_| V2ImageError::Overflow("v2 image root record size exceeds usize"))?;
     let node_bytes = node_count
         .checked_mul(node_record_size)
-        .ok_or(V2ImageError::Overflow("v2 image node table length exceeds usize"))?;
+        .ok_or(V2ImageError::Overflow(
+            "v2 image node table length exceeds usize",
+        ))?;
     let root_bytes = root_count
         .checked_mul(root_record_size)
-        .ok_or(V2ImageError::Overflow("v2 image root table length exceeds usize"))?;
+        .ok_or(V2ImageError::Overflow(
+            "v2 image root table length exceeds usize",
+        ))?;
     V2_IMAGE_HEADER_SIZE
         .checked_add(payload_len)
         .and_then(|value| value.checked_add(node_bytes))
         .and_then(|value| value.checked_add(root_bytes))
-        .ok_or(V2ImageError::Overflow("v2 image total length exceeds usize"))
+        .ok_or(V2ImageError::Overflow(
+            "v2 image total length exceeds usize",
+        ))
 }
 
 fn validate_record_size(size: u32, message: &'static str) -> Result<(), V2ImageError> {
@@ -368,9 +397,12 @@ pub(super) fn corrupt_first_branch_child_for_test(
         .map_err(|_| V2ImageError::Overflow("v2 image node count exceeds usize"))?;
     let node_record_size = usize::try_from(header.node_record_size)
         .map_err(|_| V2ImageError::Overflow("v2 image node record size exceeds usize"))?;
-    let mut cursor = V2_IMAGE_HEADER_SIZE
-        .checked_add(payload_len)
-        .ok_or(V2ImageError::Overflow("v2 image node table offset exceeds usize"))?;
+    let mut cursor =
+        V2_IMAGE_HEADER_SIZE
+            .checked_add(payload_len)
+            .ok_or(V2ImageError::Overflow(
+                "v2 image node table offset exceeds usize",
+            ))?;
     for _ in 0..node_count {
         let end = cursor
             .checked_add(node_record_size)
@@ -381,12 +413,12 @@ pub(super) fn corrupt_first_branch_child_for_test(
                 .ok_or(V2ImageError::Invalid("v2 image node table is truncated"))?,
         )?;
         if record.height() > 1 {
-            let child_end = cursor
-                .checked_add(24)
-                .ok_or(V2ImageError::Overflow("v2 image branch field exceeds usize"))?;
-            let child_start = cursor
-                .checked_add(16)
-                .ok_or(V2ImageError::Overflow("v2 image branch field exceeds usize"))?;
+            let child_end = cursor.checked_add(24).ok_or(V2ImageError::Overflow(
+                "v2 image branch field exceeds usize",
+            ))?;
+            let child_start = cursor.checked_add(16).ok_or(V2ImageError::Overflow(
+                "v2 image branch field exceeds usize",
+            ))?;
             bytes
                 .get_mut(child_start..child_end)
                 .ok_or(V2ImageError::Invalid("v2 image branch field is truncated"))?
@@ -396,13 +428,18 @@ pub(super) fn corrupt_first_branch_child_for_test(
         }
         cursor = end;
     }
-    Err(V2ImageError::Invalid("v2 image contains no branch to corrupt"))
+    Err(V2ImageError::Invalid(
+        "v2 image contains no branch to corrupt",
+    ))
 }
 
 #[cfg(test)]
 fn refresh_digest_for_test(bytes: &mut [u8]) -> Result<(), V2ImageError> {
     decode_header(bytes)?;
-    let digest = image_digest(&bytes[..V2_IMAGE_PREFIX_SIZE], &bytes[V2_IMAGE_HEADER_SIZE..]);
+    let digest = image_digest(
+        &bytes[..V2_IMAGE_PREFIX_SIZE],
+        &bytes[V2_IMAGE_HEADER_SIZE..],
+    );
     bytes[V2_IMAGE_DIGEST_OFFSET..V2_IMAGE_HEADER_SIZE].copy_from_slice(&digest);
     Ok(())
 }
@@ -415,7 +452,8 @@ mod tests {
         let left_node = V2NodeRecord::leaf(0, b"abc").expect("left leaf should be valid");
         let right_node = V2NodeRecord::leaf(3, b"XYZ").expect("right leaf should be valid");
         let left_root = V2RootRecord::from_node(0, left_node).expect("left root should be valid");
-        let right_root = V2RootRecord::from_node(1, right_node).expect("right root should be valid");
+        let right_root =
+            V2RootRecord::from_node(1, right_node).expect("right root should be valid");
         let branch = V2NodeRecord::branch(left_root, right_root).expect("branch should be valid");
         let root = V2RootRecord::from_node(2, branch).expect("root should be valid");
         V2SequenceImage {
