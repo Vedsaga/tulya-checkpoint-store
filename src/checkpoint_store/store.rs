@@ -1288,8 +1288,7 @@ impl CheckpointStore {
 
         let mut cursor = 0u64;
         cursor = self.append_static_range(b"{\"identity\":", cursor, start, end, output)?;
-        cursor =
-            self.append_root_segment_range(identity_root, cursor, start, end, output)?;
+        cursor = self.append_root_segment_range(identity_root, cursor, start, end, output)?;
         cursor = self.append_static_range(b",\"messages\":[", cursor, start, end, output)?;
         if let Some(root) = messages_root {
             cursor = self.append_root_segment_range(root, cursor, start, end, output)?;
@@ -1548,7 +1547,7 @@ impl CheckpointStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if WAL metadata cannot be read.
+    /// Returns an error if file metadata cannot be read.
     pub fn hot_capacity_bytes(&self) -> Result<u64, CheckpointStoreError> {
         self.hot.capacity()
     }
@@ -1635,8 +1634,9 @@ impl PersistentSequence for LegacyV1Sequence<'_> {
         let mut cursor = range.offset().get();
         while cursor < end {
             let length = LEGACY_V1_STREAM_CHUNK_BYTES.min(end - cursor);
-            let chunk_range = SequenceRange::new(LogicalLength::new(cursor), LogicalLength::new(length))
-                .ok_or_else(|| format_error("checkpoint root stream range end overflow"))?;
+            let chunk_range =
+                SequenceRange::new(LogicalLength::new(cursor), LogicalLength::new(length))
+                    .ok_or_else(|| format_error("checkpoint root stream range end overflow"))?;
             let mut chunk = Vec::with_capacity(
                 usize::try_from(length)
                     .map_err(|_| format_error("checkpoint root stream chunk exceeds usize"))?,
