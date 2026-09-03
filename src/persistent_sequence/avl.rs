@@ -726,11 +726,11 @@ mod tests {
         corrupt_first_branch_child_for_test(&mut encoded, 100_000)
             .expect("test corruption should find a branch");
 
-        assert_eq!(
+        assert!(matches!(
             V2AvlSequence::import_image(&encoded),
             Err(V2AvlError::Invalid(
                 "v2 image branch child must reference an earlier arena node"
             ))
-        );
+        ));
     }
 }
