@@ -18,13 +18,16 @@
 
 // The v2 codec, AVL core, canonical arena image, publication records, WAL
 // transaction grammar, durable commit envelope, hot completion framing, pure
-// apply validator, hot recovery scanner, and sealed semantic snapshot are
-// staged behind the sequence boundary. Checkpoint-store integration makes the
-// balanced path a production caller and removes the scoped dead-code allowances.
+// apply validator, hot recovery scanner, sealed semantic snapshot, and backend
+// state recovery boundary are staged behind the sequence seam. Checkpoint-store
+// integration makes the balanced path a production caller and removes the
+// scoped dead-code allowances.
 #[allow(dead_code)]
 mod apply_v2;
 #[allow(dead_code)]
 mod avl;
+#[allow(dead_code)]
+mod backend_v2;
 #[allow(dead_code)]
 mod commit_v2;
 #[allow(dead_code)]
