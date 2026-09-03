@@ -7,11 +7,16 @@
 //! path.
 
 use super::format_v2::{V2FormatError, V2NodeRecord, V2RootRecord};
+use super::image_v2::{
+    decode_v2_image, encode_v2_image, v2_node_fields, V2ImageError, V2NodeFields,
+    V2SequenceImage,
+};
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum V2AvlError {
     Format(V2FormatError),
+    Image(V2ImageError),
     Invalid(&'static str),
     Overflow(&'static str),
 }
@@ -20,6 +25,7 @@ impl fmt::Display for V2AvlError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Format(error) => write!(formatter, "{error}"),
+            Self::Image(error) => write!(formatter, "{error}"),
             Self::Invalid(message) | Self::Overflow(message) => formatter.write_str(message),
         }
     }
@@ -30,6 +36,12 @@ impl std::error::Error for V2AvlError {}
 impl From<V2FormatError> for V2AvlError {
     fn from(error: V2FormatError) -> Self {
         Self::Format(error)
+    }
+}
+
+impl From<V2ImageError> for V2AvlError {
+    fn from(error: V2ImageError) -> Self {
+        Self::Image(error)
     }
 }
 
@@ -191,6 +203,115 @@ impl V2AvlSequence {
         self.nodes.len()
     }
 
+    /// Encodes the complete append-only arena plus an explicit retained-root table.
+    ///
+    /// This is an O(total arena) snapshot operation for sealing/reopen work. It
+    /// is deliberately not part of the foreground append locality path.
+    pub(super) fn export_image(&self, roots: &[V2RootRecord]) -> Result<Vec<u8>, V2AvlError> {
+        if roots.is_empty() {
+            return Err(V2AvlError::Invalid(
+                "v2 image export requires at least one retained root",
+            ));
+        }
+        for root in roots {
+            self.node_for_root(*root)?;
+        }
+        let image = V2SequenceImage {
+            payload: self.payload.clone(),
+            nodes: self.nodes.iter().map(ArenaNode::record).collect(),
+            roots: roots.to_vec(),
+        };
+        Ok(encode_v2_image(&image)?)
+    }
+
+    /// Reconstructs an arena from one canonical v2 image and validates every node.
+    pub(super) fn import_image(
+        bytes: &[u8],
+    ) -> Result<(Self, Vec<V2RootRecord>), V2AvlError> {
+        let image = decode_v2_image(bytes)?;
+        let mut sequence = Self {
+            payload: image.payload,
+            nodes: Vec::with_capacity(image.nodes.len()),
+        };
+        let mut expected_payload_offset = 0u64;
+
+        for (index, record) in image.nodes.into_iter().enumerate() {
+            let node_id = u64::try_from(index)
+                .map_err(|_| V2AvlError::Overflow("v2 image node index exceeds u64"))?;
+            match v2_node_fields(record)? {
+                V2NodeFields::Leaf {
+                    payload_offset,
+                    payload_len,
+                } => {
+                    if payload_offset != expected_payload_offset {
+                        return Err(V2AvlError::Invalid(
+                            "v2 image leaf payloads are not contiguous in allocation order",
+                        ));
+                    }
+                    let payload_end = payload_offset
+                        .checked_add(payload_len)
+                        .ok_or(V2AvlError::Overflow("v2 image leaf payload range exceeds u64"))?;
+                    let expected = V2NodeRecord::leaf(
+                        payload_offset,
+                        sequence.payload_slice(payload_offset, payload_end)?,
+                    )?;
+                    if expected != record {
+                        return Err(V2AvlError::Invalid(
+                            "v2 image leaf metadata or commitment verification failed",
+                        ));
+                    }
+                    sequence.nodes.push(ArenaNode::Leaf {
+                        payload_offset,
+                        payload_len,
+                        record,
+                    });
+                    expected_payload_offset = payload_end;
+                }
+                V2NodeFields::Branch {
+                    left_node_id,
+                    right_node_id,
+                    left_len,
+                } => {
+                    if left_node_id >= node_id || right_node_id >= node_id {
+                        return Err(V2AvlError::Invalid(
+                            "v2 image branch child must reference an earlier arena node",
+                        ));
+                    }
+                    let left = sequence.root_for_node_id(left_node_id)?;
+                    let right = sequence.root_for_node_id(right_node_id)?;
+                    if left.logical_len() != left_len {
+                        return Err(V2AvlError::Invalid(
+                            "v2 image branch left length disagrees with its child",
+                        ));
+                    }
+                    let expected = V2NodeRecord::branch(left, right)?;
+                    if expected != record {
+                        return Err(V2AvlError::Invalid(
+                            "v2 image branch metadata or commitment verification failed",
+                        ));
+                    }
+                    sequence.nodes.push(ArenaNode::Branch {
+                        left,
+                        right,
+                        record,
+                    });
+                }
+            }
+        }
+
+        let payload_len = u64::try_from(sequence.payload.len())
+            .map_err(|_| V2AvlError::Overflow("v2 image payload length exceeds u64"))?;
+        if expected_payload_offset != payload_len {
+            return Err(V2AvlError::Invalid(
+                "v2 image contains payload bytes not owned by canonical leaves",
+            ));
+        }
+        for root in &image.roots {
+            sequence.node_for_root(*root)?;
+        }
+        Ok((sequence, image.roots))
+    }
+
     fn append_inner(
         &mut self,
         parent: Option<V2RootRecord>,
@@ -299,6 +420,15 @@ impl V2AvlSequence {
         }
     }
 
+    fn root_for_node_id(&self, node_id: u64) -> Result<V2RootRecord, V2AvlError> {
+        let index = usize::try_from(node_id)
+            .map_err(|_| V2AvlError::Overflow("v2 node identifier exceeds usize"))?;
+        let node = self.nodes.get(index).ok_or(V2AvlError::Invalid(
+            "v2 root references a missing arena node",
+        ))?;
+        Ok(V2RootRecord::from_node(node_id, node.record())?)
+    }
+
     fn node_for_root(&self, root: V2RootRecord) -> Result<&ArenaNode, V2AvlError> {
         let index = usize::try_from(root.node_id())
             .map_err(|_| V2AvlError::Overflow("v2 node identifier exceeds usize"))?;
@@ -366,6 +496,7 @@ impl V2AvlSequence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistent_sequence::image_v2::corrupt_first_branch_child_for_test;
 
     fn append_leaf(sequence: &mut V2AvlSequence, byte: u8) -> V2RootRecord {
         sequence
@@ -536,5 +667,70 @@ mod tests {
         assert_eq!(sequence.nodes.len(), nodes_before);
         assert_eq!(sequence.payload.len(), payload_before);
         assert_eq!(sequence.read_range(root, 0, 6).unwrap(), b"stable");
+    }
+
+    #[test]
+    fn image_round_trip_preserves_historical_roots_and_future_appends() {
+        let mut sequence = V2AvlSequence::default();
+        let root_a = sequence.append(None, b"root").unwrap().root();
+        let root_b = sequence.append(Some(root_a), b"-left").unwrap().root();
+        let root_c = sequence.append(Some(root_a), b"-right").unwrap().root();
+        let mut latest = root_b;
+        for index in 0..128u16 {
+            latest = sequence
+                .append(Some(latest), &index.to_le_bytes())
+                .unwrap()
+                .root();
+        }
+        let retained = vec![root_a, root_b, root_c, latest];
+        let expected_latest = sequence
+            .read_range(latest, 0, latest.logical_len())
+            .expect("latest root should be readable before export");
+
+        let encoded = sequence
+            .export_image(&retained)
+            .expect("v2 image export should succeed");
+        let (mut reopened, reopened_roots) =
+            V2AvlSequence::import_image(&encoded).expect("v2 image import should succeed");
+        assert_eq!(reopened_roots, retained);
+        assert_eq!(reopened.read_range(root_a, 0, 4).unwrap(), b"root");
+        assert_eq!(reopened.read_range(root_b, 0, 9).unwrap(), b"root-left");
+        assert_eq!(reopened.read_range(root_c, 0, 10).unwrap(), b"root-right");
+        assert_eq!(
+            reopened.read_range(latest, 0, latest.logical_len()).unwrap(),
+            expected_latest
+        );
+
+        let extended = reopened
+            .append(Some(latest), b"-after-reopen")
+            .expect("append after reopen should succeed")
+            .root();
+        let mut expected_extended = expected_latest;
+        expected_extended.extend_from_slice(b"-after-reopen");
+        assert_eq!(
+            reopened
+                .read_range(extended, 0, extended.logical_len())
+                .unwrap(),
+            expected_extended
+        );
+        reopened.verify_root(extended).unwrap();
+    }
+
+    #[test]
+    fn image_import_rejects_semantic_corruption_with_valid_outer_digest() {
+        let mut sequence = V2AvlSequence::default();
+        let root = sequence.append(None, b"a").unwrap().root();
+        let root = sequence.append(Some(root), b"b").unwrap().root();
+        let root = sequence.append(Some(root), b"c").unwrap().root();
+        let mut encoded = sequence.export_image(&[root]).unwrap();
+        corrupt_first_branch_child_for_test(&mut encoded, 100_000)
+            .expect("test corruption should find a branch");
+
+        assert_eq!(
+            V2AvlSequence::import_image(&encoded),
+            Err(V2AvlError::Invalid(
+                "v2 image branch child must reference an earlier arena node"
+            ))
+        );
     }
 }
