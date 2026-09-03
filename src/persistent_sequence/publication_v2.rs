@@ -4,9 +4,7 @@
 //! future T2W2 WAL envelope. They are not yet authoritative checkpoint-store
 //! bytes; public Format v1 remains unchanged until migration/recovery lands.
 
-use super::format_v2::{
-    decode_v2_root, encode_v2_root, V2FormatError, V2RootRecord,
-};
+use super::format_v2::{decode_v2_root, encode_v2_root, V2FormatError, V2RootRecord};
 use sha2::{Digest, Sha256};
 use std::fmt;
 
@@ -227,6 +225,13 @@ pub(super) fn encode_v2_checkpoint(
     )?;
     if let Some(parent) = record.parent_checkpoint_id.as_deref() {
         validate_identifier(parent, "v2 checkpoint parent id is invalid")?;
+    }
+    validate_encodable_version_reference(record.identity_version)?;
+    if let Some(version) = record.messages_version {
+        validate_encodable_version_reference(version)?;
+    }
+    if let Some(version) = record.result_version {
+        validate_encodable_version_reference(version)?;
     }
     if record.state.logical_len < V2_MIN_CANONICAL_STATE_BYTES {
         return Err(V2PublicationError::Invalid(
@@ -480,6 +485,16 @@ fn validate_parent_version(
     version_id: u32,
     parent_version: Option<u32>,
 ) -> Result<(), V2PublicationError> {
+    if version_id == V2_NONE_VERSION {
+        return Err(V2PublicationError::Invalid(
+            "v2 version id uses the reserved none sentinel",
+        ));
+    }
+    if parent_version == Some(V2_NONE_VERSION) {
+        return Err(V2PublicationError::Invalid(
+            "v2 version parent uses the reserved none sentinel",
+        ));
+    }
     if parent_version.is_some_and(|parent| parent >= version_id) {
         return Err(V2PublicationError::Invalid(
             "v2 version parent is not topologically prior",
@@ -495,10 +510,20 @@ fn validate_identifier(value: &str, message: &'static str) -> Result<(), V2Publi
     Ok(())
 }
 
+fn validate_encodable_version_reference(version: u32) -> Result<(), V2PublicationError> {
+    if version == V2_NONE_VERSION {
+        return Err(V2PublicationError::Invalid(
+            "v2 checkpoint version reference uses the reserved none sentinel",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_version_reference(
     version: u32,
     version_count: u64,
 ) -> Result<(), V2PublicationError> {
+    validate_encodable_version_reference(version)?;
     if u64::from(version) >= version_count {
         return Err(V2PublicationError::Invalid(
             "v2 checkpoint version reference is outside the committed watermark",
@@ -574,8 +599,8 @@ fn read_u64(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::format_v2::V2NodeRecord;
+    use super::*;
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -631,6 +656,13 @@ mod tests {
                 "v2 version parent is not topologically prior"
             ))
         );
+
+        assert_eq!(
+            V2VersionRecord::new(V2_NONE_VERSION, None, root),
+            Err(V2PublicationError::Invalid(
+                "v2 version id uses the reserved none sentinel"
+            ))
+        );
     }
 
     #[test]
@@ -677,6 +709,17 @@ mod tests {
             decode_v2_checkpoint(&bad_reserved, 10),
             Err(V2PublicationError::Invalid(
                 "v2 checkpoint reserved field must be zero"
+            ))
+        );
+
+        let reserved_version = V2CheckpointRecord {
+            identity_version: V2_NONE_VERSION,
+            ..record
+        };
+        assert_eq!(
+            encode_v2_checkpoint(&reserved_version),
+            Err(V2PublicationError::Invalid(
+                "v2 checkpoint version reference uses the reserved none sentinel"
             ))
         );
     }
