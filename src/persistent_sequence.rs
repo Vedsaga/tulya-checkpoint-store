@@ -116,6 +116,12 @@ impl SequenceRange {
     }
 }
 
+/// Callback used by bounded persistent-sequence streaming.
+///
+/// Naming this trait-object shape keeps the core contract readable and avoids
+/// repeating a nested callback/result type at every streaming boundary.
+pub(crate) type SequenceSink<'a, E> = dyn FnMut(&[u8]) -> Result<(), E> + 'a;
+
 /// Representation-neutral persistent byte-sequence operations.
 ///
 /// Implementations must preserve every retained source root exactly. Append
@@ -155,7 +161,7 @@ pub(crate) trait PersistentSequence {
         &self,
         root: PersistentRoot,
         range: SequenceRange,
-        sink: &mut dyn FnMut(&[u8]) -> Result<(), Self::Error>,
+        sink: &mut SequenceSink<'_, Self::Error>,
     ) -> Result<(), Self::Error>;
 
     /// Verifies structural validity for the selected root.
