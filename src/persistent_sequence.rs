@@ -122,13 +122,18 @@ impl PersistentRoot {
 pub(crate) struct SequenceRange {
     offset: LogicalLength,
     length: LogicalLength,
+    end: LogicalLength,
 }
 
 impl SequenceRange {
     /// Creates a range only when its half-open end fits in `u64`.
     pub(crate) fn new(offset: LogicalLength, length: LogicalLength) -> Option<Self> {
-        offset.checked_add(length)?;
-        Some(Self { offset, length })
+        let end = offset.checked_add(length)?;
+        Some(Self {
+            offset,
+            length,
+            end,
+        })
     }
 
     /// Returns the range start.
@@ -141,11 +146,9 @@ impl SequenceRange {
         self.length
     }
 
-    /// Returns the checked half-open range end.
-    pub(crate) fn end(self) -> LogicalLength {
-        self.offset
-            .checked_add(self.length)
-            .expect("SequenceRange construction validates its end")
+    /// Returns the checked half-open range end captured at construction.
+    pub(crate) const fn end(self) -> LogicalLength {
+        self.end
     }
 }
 
