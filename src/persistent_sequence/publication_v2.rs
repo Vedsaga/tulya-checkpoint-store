@@ -130,11 +130,12 @@ pub(super) fn checkpoint_state_metadata(
             "v2 checkpoint canonical length exceeds u64",
         ))?;
     if let Some(messages) = messages {
-        logical_len = logical_len
-            .checked_add(messages.logical_len())
-            .ok_or(V2PublicationError::Overflow(
-                "v2 checkpoint canonical length exceeds u64",
-            ))?;
+        logical_len =
+            logical_len
+                .checked_add(messages.logical_len())
+                .ok_or(V2PublicationError::Overflow(
+                    "v2 checkpoint canonical length exceeds u64",
+                ))?;
     }
     if let Some(result) = result {
         logical_len = logical_len
@@ -219,10 +220,7 @@ pub(super) fn encode_v2_checkpoint(
     record: &V2CheckpointRecord,
 ) -> Result<Vec<u8>, V2PublicationError> {
     validate_identifier(&record.thread_id, "v2 checkpoint thread id is invalid")?;
-    validate_identifier(
-        &record.checkpoint_id,
-        "v2 checkpoint id is invalid",
-    )?;
+    validate_identifier(&record.checkpoint_id, "v2 checkpoint id is invalid")?;
     if let Some(parent) = record.parent_checkpoint_id.as_deref() {
         validate_identifier(parent, "v2 checkpoint parent id is invalid")?;
     }
@@ -247,17 +245,14 @@ pub(super) fn encode_v2_checkpoint(
         .ok_or(V2PublicationError::Overflow(
             "v2 checkpoint record length exceeds usize",
         ))?;
-    let record_len_u32 = u32::try_from(record_len).map_err(|_| {
-        V2PublicationError::Overflow("v2 checkpoint record length exceeds u32")
-    })?;
+    let record_len_u32 = u32::try_from(record_len)
+        .map_err(|_| V2PublicationError::Overflow("v2 checkpoint record length exceeds u32"))?;
     let thread_len = u32::try_from(record.thread_id.len())
         .map_err(|_| V2PublicationError::Overflow("v2 checkpoint thread length exceeds u32"))?;
-    let checkpoint_len = u32::try_from(record.checkpoint_id.len()).map_err(|_| {
-        V2PublicationError::Overflow("v2 checkpoint id length exceeds u32")
-    })?;
-    let parent_len = u32::try_from(parent.len()).map_err(|_| {
-        V2PublicationError::Overflow("v2 checkpoint parent length exceeds u32")
-    })?;
+    let checkpoint_len = u32::try_from(record.checkpoint_id.len())
+        .map_err(|_| V2PublicationError::Overflow("v2 checkpoint id length exceeds u32"))?;
+    let parent_len = u32::try_from(parent.len())
+        .map_err(|_| V2PublicationError::Overflow("v2 checkpoint parent length exceeds u32"))?;
 
     let mut output = Vec::with_capacity(record_len);
     output.extend_from_slice(&V2_CHECKPOINT_MAGIC);
@@ -323,16 +318,10 @@ pub(super) fn decode_v2_checkpoint(
 
     let checkpoint_no = read_u32(bytes, 8, "v2 checkpoint number is truncated")?;
     let identity_version = read_u32(bytes, 12, "v2 identity version is truncated")?;
-    let messages_version = decode_optional_version(read_u32(
-        bytes,
-        16,
-        "v2 messages version is truncated",
-    )?);
-    let result_version = decode_optional_version(read_u32(
-        bytes,
-        20,
-        "v2 result version is truncated",
-    )?);
+    let messages_version =
+        decode_optional_version(read_u32(bytes, 16, "v2 messages version is truncated")?);
+    let result_version =
+        decode_optional_version(read_u32(bytes, 20, "v2 result version is truncated")?);
     validate_version_reference(identity_version, version_count)?;
     if let Some(version) = messages_version {
         validate_version_reference(version, version_count)?;
@@ -347,12 +336,9 @@ pub(super) fn decode_v2_checkpoint(
         "v2 checkpoint thread length is truncated",
     )?)
     .map_err(|_| V2PublicationError::Overflow("v2 checkpoint thread length exceeds usize"))?;
-    let checkpoint_len = usize::try_from(read_u32(
-        bytes,
-        28,
-        "v2 checkpoint id length is truncated",
-    )?)
-    .map_err(|_| V2PublicationError::Overflow("v2 checkpoint id length exceeds usize"))?;
+    let checkpoint_len =
+        usize::try_from(read_u32(bytes, 28, "v2 checkpoint id length is truncated")?)
+            .map_err(|_| V2PublicationError::Overflow("v2 checkpoint id length exceeds usize"))?;
     let parent_len = usize::try_from(read_u32(
         bytes,
         32,
@@ -407,11 +393,12 @@ pub(super) fn decode_v2_checkpoint(
         .ok_or(V2PublicationError::Overflow(
             "v2 checkpoint identifier bytes exceed usize",
         ))?;
-    let payload_end = V2_CHECKPOINT_PREFIX_SIZE
-        .checked_add(payload_len)
-        .ok_or(V2PublicationError::Overflow(
-            "v2 checkpoint payload end exceeds usize",
-        ))?;
+    let payload_end =
+        V2_CHECKPOINT_PREFIX_SIZE
+            .checked_add(payload_len)
+            .ok_or(V2PublicationError::Overflow(
+                "v2 checkpoint payload end exceeds usize",
+            ))?;
     if payload_end != bytes.len() {
         return Err(V2PublicationError::Invalid(
             "v2 checkpoint identifier geometry mismatch",
@@ -519,10 +506,7 @@ fn validate_encodable_version_reference(version: u32) -> Result<(), V2Publicatio
     Ok(())
 }
 
-fn validate_version_reference(
-    version: u32,
-    version_count: u64,
-) -> Result<(), V2PublicationError> {
+fn validate_version_reference(version: u32, version_count: u64) -> Result<(), V2PublicationError> {
     validate_encodable_version_reference(version)?;
     if u64::from(version) >= version_count {
         return Err(V2PublicationError::Invalid(
@@ -561,16 +545,10 @@ fn require_record_len(
     Ok(())
 }
 
-fn read_u32(
-    bytes: &[u8],
-    offset: usize,
-    message: &'static str,
-) -> Result<u32, V2PublicationError> {
-    let end = offset
-        .checked_add(4)
-        .ok_or(V2PublicationError::Overflow(
-            "v2 publication u32 range exceeds usize",
-        ))?;
+fn read_u32(bytes: &[u8], offset: usize, message: &'static str) -> Result<u32, V2PublicationError> {
+    let end = offset.checked_add(4).ok_or(V2PublicationError::Overflow(
+        "v2 publication u32 range exceeds usize",
+    ))?;
     let encoded: [u8; 4] = bytes
         .get(offset..end)
         .ok_or(V2PublicationError::Invalid(message))?
@@ -579,16 +557,10 @@ fn read_u32(
     Ok(u32::from_le_bytes(encoded))
 }
 
-fn read_u64(
-    bytes: &[u8],
-    offset: usize,
-    message: &'static str,
-) -> Result<u64, V2PublicationError> {
-    let end = offset
-        .checked_add(8)
-        .ok_or(V2PublicationError::Overflow(
-            "v2 publication u64 range exceeds usize",
-        ))?;
+fn read_u64(bytes: &[u8], offset: usize, message: &'static str) -> Result<u64, V2PublicationError> {
+    let end = offset.checked_add(8).ok_or(V2PublicationError::Overflow(
+        "v2 publication u64 range exceeds usize",
+    ))?;
     let encoded: [u8; 8] = bytes
         .get(offset..end)
         .ok_or(V2PublicationError::Invalid(message))?
@@ -603,7 +575,13 @@ mod tests {
     use super::*;
 
     fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+        for byte in bytes {
+            output.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+            output.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
+        }
+        output
     }
 
     #[test]
@@ -643,9 +621,7 @@ mod tests {
         bad_flags[12] = 1;
         assert_eq!(
             decode_v2_version(&bad_flags, 9),
-            Err(V2PublicationError::Invalid(
-                "v2 version flags must be zero"
-            ))
+            Err(V2PublicationError::Invalid("v2 version flags must be zero"))
         );
 
         let mut bad_parent = encoded;
