@@ -10,6 +10,11 @@
 //! exposes persistent edit, random-access, historical-preservation, and work
 //! bounds that inform this contract. The Rust implementation is not currently
 //! mechanically proved to refine that Lean model.
+//!
+//! The production target also requires append, bounded streaming, and verify
+//! operations. They are intentionally not speculative trait methods here: each
+//! operation is added to the executable contract when its production caller
+//! and implementation land, so strict `dead_code` checks remain meaningful.
 
 /// Logical byte length of a persistent sequence.
 ///
@@ -116,35 +121,15 @@ impl SequenceRange {
     }
 }
 
-/// Callback used by bounded persistent-sequence streaming.
+/// Active representation-neutral persistent byte-sequence read operations.
 ///
-/// Naming this trait-object shape keeps the core contract readable and avoids
-/// repeating a nested callback/result type at every streaming boundary.
-pub(crate) type SequenceSink<'a, E> = dyn FnMut(&[u8]) -> Result<(), E> + 'a;
-
-/// Representation-neutral persistent byte-sequence operations.
-///
-/// Implementations must preserve every retained source root exactly. Append
-/// may share immutable nodes with its parent. `read_range` and `stream_range`
-/// must return the same bytes as full extraction of the requested root.
-///
-/// This trait states semantics, not yet the production complexity claim.
-/// Format v1 is allowed to have legacy traversal costs and is adapted through
-/// a read-only compatibility implementation because its transaction grammar
-/// couples sequence mutation to checkpoint publication. The balanced writable
-/// implementation introduced for the locality gate must support `append` and
-/// additionally enforce logarithmic/bounded depth and persisted subtree lengths.
+/// This first production seam contains only operations already exercised by
+/// checkpoint-store callers. Format v1 is allowed to retain legacy traversal
+/// costs behind this interface. The later balanced writable implementation
+/// must preserve these semantics while adding the remaining target operations
+/// and logarithmic/bounded locality guarantees.
 pub(crate) trait PersistentSequence {
     type Error;
-
-    /// Appends `bytes` to `parent`, or creates a new root when `parent` is
-    /// absent. A read-only compatibility adapter may reject this operation;
-    /// production writable implementations must support it.
-    fn append(
-        &mut self,
-        parent: Option<PersistentRoot>,
-        bytes: &[u8],
-    ) -> Result<PersistentRoot, Self::Error>;
 
     /// Returns the exact logical length represented by `root`.
     fn logical_len(&self, root: PersistentRoot) -> Result<LogicalLength, Self::Error>;
@@ -156,18 +141,6 @@ pub(crate) trait PersistentSequence {
         range: SequenceRange,
         output: &mut Vec<u8>,
     ) -> Result<(), Self::Error>;
-
-    /// Delivers the exact requested range in bounded implementation-defined
-    /// chunks without requiring one full-root output allocation.
-    fn stream_range(
-        &self,
-        root: PersistentRoot,
-        range: SequenceRange,
-        sink: &mut SequenceSink<'_, Self::Error>,
-    ) -> Result<(), Self::Error>;
-
-    /// Verifies structural validity for the selected root.
-    fn verify(&self, root: PersistentRoot) -> Result<(), Self::Error>;
 }
 
 #[cfg(test)]
