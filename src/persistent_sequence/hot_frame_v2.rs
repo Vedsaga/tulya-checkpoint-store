@@ -134,11 +134,12 @@ fn is_zero_padded_prefix(actual: &[u8], expected: &[u8]) -> bool {
     if actual.len() != expected.len() {
         return false;
     }
-    let written = actual.iter().position(|byte| *byte == 0).unwrap_or(actual.len());
-    actual.get(..written) == expected.get(..written)
-        && actual
-            .get(written..)
-            .is_some_and(|suffix| suffix.iter().all(|byte| *byte == 0))
+    (0..=actual.len()).rev().any(|written| {
+        actual.get(..written) == expected.get(..written)
+            && actual
+                .get(written..)
+                .is_some_and(|suffix| suffix.iter().all(|byte| *byte == 0))
+    })
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, V2HotFrameError> {
