@@ -1,7 +1,6 @@
 use super::*;
 use crate::persistent_sequence::{
     LogicalLength, PersistentRoot, PersistentSequence, SequenceRange, SequenceRepresentation,
-    SequenceSink,
 };
 
 impl CheckpointStore {
@@ -1566,8 +1565,6 @@ impl CheckpointStore {
     }
 }
 
-const LEGACY_V1_STREAM_CHUNK_BYTES: u64 = 64 * 1024;
-
 struct LegacyV1Sequence<'a> {
     store: &'a CheckpointStore,
 }
@@ -1585,16 +1582,6 @@ impl LegacyV1Sequence<'_> {
 
 impl PersistentSequence for LegacyV1Sequence<'_> {
     type Error = CheckpointStoreError;
-
-    fn append(
-        &mut self,
-        _parent: Option<PersistentRoot>,
-        _bytes: &[u8],
-    ) -> Result<PersistentRoot, Self::Error> {
-        Err(format_error(
-            "Format v1 sequence adapter is read-only; append requires the balanced writable representation",
-        ))
-    }
 
     fn logical_len(&self, root: PersistentRoot) -> Result<LogicalLength, Self::Error> {
         self.validate_root(root)?;
@@ -1618,44 +1605,5 @@ impl PersistentSequence for LegacyV1Sequence<'_> {
             range.length().get(),
             output,
         )
-    }
-
-    fn stream_range(
-        &self,
-        root: PersistentRoot,
-        range: SequenceRange,
-        sink: &mut SequenceSink<'_, Self::Error>,
-    ) -> Result<(), Self::Error> {
-        self.validate_root(root)?;
-        if range.end().get() > root.logical_len().get() {
-            return Err(format_error("checkpoint root range outside root"));
-        }
-        let end = range.end().get();
-        let mut cursor = range.offset().get();
-        while cursor < end {
-            let length = LEGACY_V1_STREAM_CHUNK_BYTES.min(end - cursor);
-            let chunk_range =
-                SequenceRange::new(LogicalLength::new(cursor), LogicalLength::new(length))
-                    .ok_or_else(|| format_error("checkpoint root stream range end overflow"))?;
-            let mut chunk = Vec::with_capacity(
-                usize::try_from(length)
-                    .map_err(|_| format_error("checkpoint root stream chunk exceeds usize"))?,
-            );
-            self.read_range(root, chunk_range, &mut chunk)?;
-            sink(&chunk)?;
-            cursor = cursor
-                .checked_add(length)
-                .ok_or_else(|| format_error("checkpoint root stream cursor overflow"))?;
-        }
-        Ok(())
-    }
-
-    fn verify(&self, root: PersistentRoot) -> Result<(), Self::Error> {
-        self.validate_root(root)?;
-        let actual = self.store.root_term_size(root.node_id())?;
-        if actual != root.logical_len().get() {
-            return Err(format_error("checkpoint root logical length mismatch"));
-        }
-        Ok(())
     }
 }
