@@ -8,10 +8,6 @@
 //! surrounding research modules.
 
 mod checkpoint_store;
-// Staged production-readiness seam. The next storage task adapts Format v1
-// reads/appends behind this contract and removes this temporary dead-code
-// allowance without changing released v1 bytes.
-#[allow(dead_code)]
 mod persistent_sequence;
 
 pub mod admin;
