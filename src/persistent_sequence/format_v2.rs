@@ -92,9 +92,11 @@ impl V2NodeRecord {
         let logical_len = u64::try_from(payload.len()).map_err(|_| {
             V2FormatError::Overflow("v2 sequence leaf payload length exceeds u64")
         })?;
-        payload_offset.checked_add(logical_len).ok_or(
-            V2FormatError::Overflow("v2 sequence leaf payload range exceeds u64"),
-        )?;
+        payload_offset
+            .checked_add(logical_len)
+            .ok_or(V2FormatError::Overflow(
+                "v2 sequence leaf payload range exceeds u64",
+            ))?;
         Ok(Self {
             height: 1,
             logical_len,
@@ -112,22 +114,24 @@ impl V2NodeRecord {
     ) -> Result<Self, V2FormatError> {
         validate_child_root(left)?;
         validate_child_root(right)?;
-        let height_difference = if left.height > right.height {
-            left.height - right.height
-        } else {
-            right.height - left.height
-        };
-        if height_difference > 1 {
+        if left.height.abs_diff(right.height) > 1 {
             return Err(V2FormatError::Invalid(
                 "v2 sequence branch children are not AVL-balanced",
             ));
         }
-        let height = left.height.max(right.height).checked_add(1).ok_or(
-            V2FormatError::Overflow("v2 sequence branch height exceeds u16"),
-        )?;
-        let logical_len = left.logical_len.checked_add(right.logical_len).ok_or(
-            V2FormatError::Overflow("v2 sequence branch logical length exceeds u64"),
-        )?;
+        let height = left
+            .height
+            .max(right.height)
+            .checked_add(1)
+            .ok_or(V2FormatError::Overflow(
+                "v2 sequence branch height exceeds u16",
+            ))?;
+        let logical_len = left
+            .logical_len
+            .checked_add(right.logical_len)
+            .ok_or(V2FormatError::Overflow(
+                "v2 sequence branch logical length exceeds u64",
+            ))?;
         Ok(Self {
             height,
             logical_len,
@@ -291,9 +295,11 @@ pub(super) fn decode_v2_node(bytes: &[u8]) -> Result<V2NodeRecord, V2FormatError
                     "v2 leaf reserved field must be zero",
                 ));
             }
-            field_a.checked_add(field_b).ok_or(V2FormatError::Overflow(
-                "v2 leaf payload range exceeds u64",
-            ))?;
+            field_a
+                .checked_add(field_b)
+                .ok_or(V2FormatError::Overflow(
+                    "v2 leaf payload range exceeds u64",
+                ))?;
             Ok(V2NodeRecord {
                 height,
                 logical_len,
@@ -455,7 +461,11 @@ fn require_record_len(
     Ok(())
 }
 
-fn read_byte(bytes: &[u8], offset: usize, message: &'static str) -> Result<u8, V2FormatError> {
+fn read_byte(
+    bytes: &[u8],
+    offset: usize,
+    message: &'static str,
+) -> Result<u8, V2FormatError> {
     bytes
         .get(offset)
         .copied()
