@@ -19,6 +19,7 @@
 //! surrounding research modules.
 
 mod checkpoint_store;
+mod error_classification;
 #[allow(dead_code)]
 mod format_authority;
 mod persistent_sequence;
@@ -29,4 +30,7 @@ pub mod format;
 pub use checkpoint_store::{
     fsck, CheckpointInfo, CheckpointStore, CheckpointStoreConfig, CheckpointStoreError,
     CheckpointStoreRecoveryMode, FsckReport, HotWalAppendReport, StoreId,
+};
+pub use error_classification::{
+    CheckpointStoreFailureKind, DurabilityIndeterminate, DurabilityOperation,
 };
