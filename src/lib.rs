@@ -8,6 +8,8 @@
 //! surrounding research modules.
 
 mod checkpoint_store;
+#[allow(dead_code)]
+mod format_authority;
 mod persistent_sequence;
 
 pub mod admin;
