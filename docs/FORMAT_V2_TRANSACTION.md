@@ -1,15 +1,17 @@
 # Format v2 WAL transaction (`T2W2`)
 
-Status: staged internal design. `T2W2` is not yet accepted by the production
-checkpoint-store WAL reader/writer, and public `crate::format::VERSION` remains
-1 until migration and dual-version recovery are implemented.
+Status: accepted staged **inner structural transaction**. `T2W2` is not by
+itself an authoritative client-visible checkpoint-store commit. The durable
+Format-v2 publication envelope is staged separately as `T2C2`; public
+`crate::format::VERSION` remains 1 until migration and dual-version recovery
+are implemented.
 
 ## Decision ledger
 
 **DECISION**
 
-Use a distinct `T2W2` transaction envelope for Format-v2 checkpoint commits.
-One transaction atomically carries:
+Use a distinct `T2W2` structural transaction for Format-v2 checkpoint changes.
+One transaction carries:
 
 1. newly appended persistent-sequence payload bytes;
 2. newly allocated `T2N2` balanced nodes;
@@ -17,7 +19,9 @@ One transaction atomically carries:
 4. exactly one `T2P2` checkpoint record.
 
 The transaction stores the starting payload/node/version/checkpoint watermarks
-and a SHA-256 digest over its canonical header prefix and body.
+and a SHA-256 digest over its canonical header prefix and body. A future durable
+mutation wraps exactly one complete `T2W2` in the `T2C2` publication envelope,
+which adds request/retry identity and defines the authority boundary.
 
 **WHY**
 
@@ -26,6 +30,9 @@ The existing `T2W1` grammar is tied to compact/wide v1 nodes, `T2R1` roots,
 reinterpretating those fields would silently change released Format-v1 bytes.
 A distinct grammar also lets recovery distinguish old and new semantics before
 parsing representation-specific records.
+
+Separating the append-local structural record from `T2C2` also keeps physical
+geometry validation independent from client request/idempotency semantics.
 
 **ALTERNATIVES REJECTED**
 
@@ -36,11 +43,15 @@ parsing representation-specific records.
 - Treating the SHA-256 transaction digest as sufficient validation: rejected;
   recovery must also validate topology and section geometry after integrity
   succeeds.
+- Making bare `T2W2` the final client-visible authority unit: rejected because
+  safe retry also requires durable request identity and a logical-operation
+  digest; those semantics are carried atomically by `T2C2`.
 
 **FORMAT IMPACT**
 
 New Format-v2 bytes only. No v1 magic, checksum, record, manifest, segment, or
-checkpoint field changes meaning.
+checkpoint field changes meaning. The accepted `T2W2` schema below remains
+unchanged when nested inside `T2C2`.
 
 ## Canonical envelope
 
@@ -119,14 +130,14 @@ For every new `T2N2` record with global ID `node_start + local_index`:
   references a newly allocated node its persisted root metadata must exactly
   equal that node's length, height, and commitment.
 
-These checks are independent of the outer transaction digest.
+These checks are independent of the transaction digest.
 
 Validation that requires metadata from already committed old nodes/versions is
-a later store-state integration responsibility. In particular, the staged
-codec cannot recompute a checkpoint state commitment when the `T2P2` record
-references versions that predate the transaction; production apply/recovery
-must resolve those version roots and verify the `T2P2` state commitment before
-publication.
+the responsibility of the pure v2 apply boundary and, later, production
+recovery. In particular, `T2W2` alone cannot recompute a checkpoint state
+commitment when the `T2P2` record references versions that predate the
+transaction. The apply layer must resolve those version roots and verify the
+`T2P2` state commitment before publication.
 
 ## Zero-delta checkpoint forks
 
@@ -138,20 +149,26 @@ node_delta_count = 0
 version_delta_count = 0
 ```
 
-Only the new `T2P2` record and transaction framing are written. This preserves
-metadata-only fork cost rather than manufacturing duplicate sequence nodes.
+The inner structural record contains only the new `T2P2` plus transaction
+framing. This preserves metadata-only fork cost rather than manufacturing
+duplicate sequence nodes.
 
-## Recovery rule
+## Recovery / authority rule
 
-A future Format-v2 hot-WAL scanner may treat an incomplete final transaction as
-an uncommitted suffix. Any complete record selected as committed must pass, in
-order:
+A future Format-v2 hot-WAL scanner frames **`T2C2`** records. Inside each
+complete candidate commit, its one `T2W2` must pass, in order:
 
-1. header/length/schema validation;
+1. `T2W2` header/length/schema validation;
 2. SHA-256 transaction integrity;
 3. expected starting-watermark validation;
 4. node/version/checkpoint canonical decoding;
 5. append-local topology/ownership validation; and
-6. store-state validation of old references and checkpoint commitment.
+6. committed-state validation of old references and checkpoint commitment.
 
-No `T2W2` bytes become authoritative merely because their digest is valid.
+The enclosing `T2C2` additionally validates request identity, logical-operation
+digest, and commit integrity. Only after all outer and inner checks pass may the
+state become client-visible.
+
+A bare `T2W2`, even one with a valid digest, is never authoritative. Likewise,
+a complete inner `T2W2` found inside an incomplete/torn `T2C2` belongs to an
+uncommitted suffix and must not be replayed independently.
