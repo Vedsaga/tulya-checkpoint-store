@@ -34,26 +34,31 @@ checkpoint-store format.
 | --- | --- | --- |
 | `persistent_sequence::PersistentRoot` | retained/published persistent AVL root | Design analogue. Rust currently wraps the released Format-v1 root node ID plus logical length; no refinement proof exists. |
 | `persistent_sequence::LogicalLength` | logical sequence length / bounded random-access domain | Fixed-width Rust boundary corresponding to a logical natural-number length. Machine conversion remains checked. |
-| `persistent_sequence::PersistentSequence::append` | persistent edit / historical edit | Intended semantic boundary: produce a new root without changing retained roots. Complexity guarantees are not yet claimed for the Format-v1 adapter. |
-| `PersistentSequence::read_range` / `stream_range` | random-access extraction | Intended to return exactly the selected logical bytes without requiring full-root materialization. |
-| `PersistentSequence::verify` | validity / verifier boundary | Structural verification hook. Exact Format-v2 commitment rules are intentionally not frozen yet. |
+| `PersistentSequence::logical_len` | stored/logical sequence length | Active compatibility boundary. Format v1 may still derive the value through legacy traversal; a production writable representation must make parent/root metadata sufficient for local append and navigation. |
+| `PersistentSequence::read_range` | random-access extraction | Active compatibility boundary returning exactly the selected logical bytes without full-root output materialization. Format v1 still retains legacy topology costs. |
+| planned sequence append | persistent edit / historical edit | Required production target, not yet an active trait method. It will be added when a writable representation and real checkpoint caller exist. |
+| planned bounded stream / structural verify | bounded extraction / validity and verifier boundary | Required production targets, not yet active trait methods. Exact Format-v2 commitment and verification rules remain intentionally unfrozen. |
 | `CheckpointStore` single-writer ownership | SWMR writer boundary | Operational analogue only. The existing Rust process-locking implementation is not claimed to refine the Lean SWMR machine. |
 
 ## Decision ledger: persistent-sequence seam
 
 ### Decision
 
-Introduce an internal representation-neutral `PersistentSequence` contract
-before replacing the legacy append tree.
+Introduce an internal representation-neutral persistent-sequence boundary before
+replacing the legacy append tree. Keep the executable trait limited to methods
+with real production callers; extend it as append, bounded streaming, and
+structural verification implementations land.
 
-The initial contract separates:
+The current seam separates:
 
 - physical root identity;
 - logical byte length;
 - representation identity;
-- append semantics;
-- range/stream access;
-- structural verification.
+- exact range access.
+
+The production target additionally requires append semantics, bounded streaming,
+and structural verification, but those operations are not carried as unused
+trait methods merely to mirror the final target interface.
 
 ### Why
 
@@ -65,6 +70,11 @@ Changing callers directly to a balanced tree would couple checkpoint semantics
 to a new representation and make format compatibility harder to reason about.
 A narrow sequence seam lets us first adapt Format v1 exactly, then introduce a
 balanced writable representation behind the same semantic boundary.
+
+Keeping only exercised operations in the active trait also preserves the value
+of strict `dead_code` checks and follows the project's no-speculative-abstraction
+rule. The full production interface remains an acceptance target in
+`docs/PRODUCTION_READINESS.md`, not a reason to keep unused executable surface.
 
 ### Compatibility rule
 
@@ -100,13 +110,16 @@ that is not linear in unchanged parent size.
 1. Compile the internal sequence contract without changing Format-v1 bytes.
 2. Adapt existing v1 root lookup, logical-length discovery, and range reads to
    typed `PersistentRoot` / `LogicalLength` boundaries.
-3. Route message append construction through the sequence abstraction while
-   keeping the existing v1 encoder byte-for-byte compatible.
+3. Add the writable append operation to the sequence boundary together with its
+   real checkpoint caller; do not pretend Format v1 has an independent append
+   primitive when transaction publication is coupled to it.
 4. Add structural tests that expose the current left-deep depth as a legacy
    property rather than an accepted production invariant.
 5. Design the balanced representation and commitment metadata; introduce
    Format v2 if the persisted representation changes.
-6. Add balancing, historical-preservation, range-locality, reopen, corruption,
+6. Add bounded streaming and structural verification to the sequence boundary
+   as their production implementations land.
+7. Add balancing, historical-preservation, range-locality, reopen, corruption,
    and scaling evidence before checking the corresponding production-readiness
    gates.
 
