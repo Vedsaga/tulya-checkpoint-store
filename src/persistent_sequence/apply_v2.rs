@@ -10,7 +10,7 @@ use super::publication_v2::{
     checkpoint_state_metadata, V2CheckpointRecord, V2PublicationError, V2VersionRecord,
 };
 use super::transaction_v2::{V2WalGeometry, V2WalTransaction};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 const V2_MAX_REQUEST_ID_BYTES: usize = 4096;
@@ -88,6 +88,7 @@ pub(super) struct V2CommittedState {
     pub(super) checkpoint_ordinals: HashMap<(String, String), u64>,
     pub(super) request_records: HashMap<Vec<u8>, V2RequestRecord>,
     pub(super) retired_requests: HashMap<Vec<u8>, [u8; 32]>,
+    pub(super) deleted_checkpoints: HashSet<(String, String)>,
 }
 
 impl V2CommittedState {
@@ -288,6 +289,11 @@ fn validate_checkpoint(
     if state.checkpoint_ordinals.contains_key(&key) {
         return Err(V2ApplyError::Invalid(
             "v2 checkpoint identity is already committed",
+        ));
+    }
+    if state.deleted_checkpoints.contains(&key) {
+        return Err(V2ApplyError::Invalid(
+            "v2 checkpoint identity was logically deleted",
         ));
     }
     if let Some(parent) = checkpoint.parent_checkpoint_id.as_ref() {
@@ -630,5 +636,26 @@ mod tests {
                 "v2 checkpoint parent is not a committed checkpoint in the same thread"
             ))
         );
+    }
+
+    #[test]
+    fn deleted_checkpoint_identity_cannot_be_reused() {
+        let mut state = V2CommittedState::default();
+        let initial = initial_transaction("cp-1");
+        let first = encode_v2_commit(V2WalGeometry::default(), &initial, None).unwrap();
+        apply_v2_commit(&mut state, &first).unwrap();
+        state
+            .deleted_checkpoints
+            .insert(("thread".to_owned(), "cp-2".to_owned()));
+        let base = state.geometry().unwrap();
+        let child = child_transaction(base, false);
+        let encoded = encode_v2_commit(base, &child, None).unwrap();
+        assert_eq!(
+            apply_v2_commit(&mut state, &encoded),
+            Err(V2ApplyError::Invalid(
+                "v2 checkpoint identity was logically deleted"
+            ))
+        );
+        assert_eq!(state.geometry().unwrap(), base);
     }
 }
