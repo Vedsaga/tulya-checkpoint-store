@@ -5,9 +5,7 @@
 //! Format v1 remains the only authoritative checkpoint-store format until
 //! migration and dual-version recovery are implemented.
 
-use super::format_v2::{
-    decode_v2_node, encode_v2_node, V2FormatError, V2NodeRecord, V2RootRecord,
-};
+use super::format_v2::{decode_v2_node, encode_v2_node, V2FormatError, V2NodeRecord, V2RootRecord};
 use super::publication_v2::{
     checkpoint_state_metadata, decode_v2_checkpoint, decode_v2_version, encode_v2_checkpoint,
     encode_v2_version, V2CheckpointRecord, V2PublicationError, V2VersionRecord,
@@ -209,8 +207,12 @@ pub(super) fn decode_v2_wal_transaction(
         "v2 WAL checkpoint record length is truncated",
     )?)
     .map_err(|_| V2WalError::Overflow("v2 WAL checkpoint record length exceeds usize"))?;
-    if usize::try_from(read_u32(bytes, 76, "v2 WAL node record width is truncated")?)
-        .map_err(|_| V2WalError::Overflow("v2 WAL node record width exceeds usize"))?
+    if usize::try_from(read_u32(
+        bytes,
+        76,
+        "v2 WAL node record width is truncated",
+    )?)
+    .map_err(|_| V2WalError::Overflow("v2 WAL node record width exceeds usize"))?
         != V2_WAL_NODE_RECORD_SIZE
     {
         return Err(V2WalError::Invalid(
@@ -230,9 +232,7 @@ pub(super) fn decode_v2_wal_transaction(
         ));
     }
     if read_u32(bytes, 84, "v2 WAL reserved field is truncated")? != 0 {
-        return Err(V2WalError::Invalid(
-            "v2 WAL reserved field must be zero",
-        ));
+        return Err(V2WalError::Invalid("v2 WAL reserved field must be zero"));
     }
     if payload_start != base.payload_len
         || node_start != base.node_count
@@ -441,11 +441,9 @@ fn validate_nodes(
         let field_a = read_u64(&encoded, 16, "v2 WAL node field A is truncated")?;
         let field_b = read_u64(&encoded, 24, "v2 WAL node field B is truncated")?;
         if node.height() == 1 {
-            let end = field_a
-                .checked_add(field_b)
-                .ok_or(V2WalError::Overflow(
-                    "v2 WAL leaf payload range exceeds u64",
-                ))?;
+            let end = field_a.checked_add(field_b).ok_or(V2WalError::Overflow(
+                "v2 WAL leaf payload range exceeds u64",
+            ))?;
             if field_a < base.payload_len || end > next.payload_len {
                 return Err(V2WalError::Invalid(
                     "v2 WAL new leaf references bytes outside the payload delta",
@@ -455,12 +453,13 @@ fn validate_nodes(
                 .map_err(|_| V2WalError::Overflow("v2 WAL leaf start exceeds usize"))?;
             let local_end = usize::try_from(end - base.payload_len)
                 .map_err(|_| V2WalError::Overflow("v2 WAL leaf end exceeds usize"))?;
-            let payload = transaction
-                .payload
-                .get(local_start..local_end)
-                .ok_or(V2WalError::Invalid(
-                    "v2 WAL leaf payload slice is outside the delta",
-                ))?;
+            let payload =
+                transaction
+                    .payload
+                    .get(local_start..local_end)
+                    .ok_or(V2WalError::Invalid(
+                        "v2 WAL leaf payload slice is outside the delta",
+                    ))?;
             if V2NodeRecord::leaf(field_a, payload)? != node {
                 return Err(V2WalError::Invalid(
                     "v2 WAL leaf commitment disagrees with payload bytes",
@@ -603,7 +602,10 @@ fn local_version_root(
         return None;
     }
     let local = usize::try_from(version_id - base.version_count).ok()?;
-    transaction.versions.get(local).map(|version| version.root())
+    transaction
+        .versions
+        .get(local)
+        .map(|version| version.root())
 }
 
 fn version_id_for_local(base_version_count: u64, local: usize) -> Result<u32, V2WalError> {
@@ -629,9 +631,12 @@ fn checked_total_len(
     version_count: usize,
     checkpoint_len: usize,
 ) -> Result<usize, V2WalError> {
-    let node_bytes = node_count
-        .checked_mul(V2_WAL_NODE_RECORD_SIZE)
-        .ok_or(V2WalError::Overflow("v2 WAL node table length exceeds usize"))?;
+    let node_bytes =
+        node_count
+            .checked_mul(V2_WAL_NODE_RECORD_SIZE)
+            .ok_or(V2WalError::Overflow(
+                "v2 WAL node table length exceeds usize",
+            ))?;
     let version_bytes = version_count
         .checked_mul(V2_WAL_VERSION_RECORD_SIZE)
         .ok_or(V2WalError::Overflow(
@@ -909,7 +914,10 @@ mod tests {
     #[test]
     fn schema_record_widths_match_nested_codecs() {
         let transaction = simple_initial_transaction();
-        assert_eq!(encode_v2_node(transaction.nodes[0]).len(), V2_WAL_NODE_RECORD_SIZE);
+        assert_eq!(
+            encode_v2_node(transaction.nodes[0]).len(),
+            V2_WAL_NODE_RECORD_SIZE
+        );
         assert_eq!(
             encode_v2_version(transaction.versions[0]).unwrap().len(),
             V2_WAL_VERSION_RECORD_SIZE
