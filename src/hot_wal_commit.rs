@@ -4,6 +4,7 @@
 //! so short writes and durability failures can be tested deterministically
 //! before the abstraction is wired into the production `HotWal` handle.
 
+#[cfg(feature = "fault-injection")]
 use crate::checkpoint_store::fault_injection::{
     configured_wal_io_fault, injected_disk_full_error, injected_io_error, WalIoFault,
 };
@@ -31,7 +32,9 @@ pub(crate) trait HotWalCommitIo {
 /// Production adapter over one already-positioned WAL file.
 pub(crate) struct FileHotWalCommitIo<'a> {
     file: &'a mut File,
+    #[cfg(feature = "fault-injection")]
     fault: Option<WalIoFault>,
+    #[cfg(feature = "fault-injection")]
     fault_written: usize,
 }
 
@@ -39,11 +42,14 @@ impl<'a> FileHotWalCommitIo<'a> {
     pub(crate) fn new(file: &'a mut File) -> Result<Self, CheckpointStoreError> {
         Ok(Self {
             file,
+            #[cfg(feature = "fault-injection")]
             fault: configured_wal_io_fault()?,
+            #[cfg(feature = "fault-injection")]
             fault_written: 0,
         })
     }
 
+    #[cfg(feature = "fault-injection")]
     fn record_fault_write(&mut self, count: usize) -> io::Result<()> {
         self.fault_written = self.fault_written.checked_add(count).ok_or_else(|| {
             io::Error::new(
@@ -57,36 +63,45 @@ impl<'a> FileHotWalCommitIo<'a> {
 
 impl HotWalCommitIo for FileHotWalCommitIo<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let count = match self.fault {
-            Some(WalIoFault::ShortWrite(limit)) => {
-                let take = bytes.len().min(limit);
-                self.file.write(bytes.get(..take).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "hot WAL short-write fault slice is outside input",
-                    )
-                })?)?
-            }
-            Some(WalIoFault::WriteEnospcAfter(limit)) => {
-                if self.fault_written >= limit {
-                    return Err(injected_disk_full_error());
+        #[cfg(feature = "fault-injection")]
+        {
+            let count = match self.fault {
+                Some(WalIoFault::ShortWrite(limit)) => {
+                    let take = bytes.len().min(limit);
+                    self.file.write(bytes.get(..take).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "hot WAL short-write fault slice is outside input",
+                        )
+                    })?)?
                 }
-                let take = bytes.len().min(limit - self.fault_written);
-                self.file.write(bytes.get(..take).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "hot WAL ENOSPC fault slice is outside input",
-                    )
-                })?)?
-            }
-            _ => self.file.write(bytes)?,
-        };
-        self.record_fault_write(count)?;
-        Ok(count)
+                Some(WalIoFault::WriteEnospcAfter(limit)) => {
+                    if self.fault_written >= limit {
+                        return Err(injected_disk_full_error());
+                    }
+                    let take = bytes.len().min(limit - self.fault_written);
+                    self.file.write(bytes.get(..take).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "hot WAL ENOSPC fault slice is outside input",
+                        )
+                    })?)?
+                }
+                _ => self.file.write(bytes)?,
+            };
+            self.record_fault_write(count)?;
+            return Ok(count);
+        }
+
+        #[cfg(not(feature = "fault-injection"))]
+        {
+            self.file.write(bytes)
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         self.file.flush()?;
+        #[cfg(feature = "fault-injection")]
         if self.fault == Some(WalIoFault::FlushEioAfter) {
             return Err(injected_io_error());
         }
@@ -95,6 +110,7 @@ impl HotWalCommitIo for FileHotWalCommitIo<'_> {
 
     fn sync_data(&mut self) -> io::Result<()> {
         self.file.sync_data()?;
+        #[cfg(feature = "fault-injection")]
         if self.fault == Some(WalIoFault::SyncEioAfter) {
             return Err(injected_io_error());
         }
