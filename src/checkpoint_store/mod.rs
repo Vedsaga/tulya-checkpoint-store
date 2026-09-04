@@ -1160,6 +1160,72 @@ enum PublicationRole {
     ManifestAuthority,
 }
 
+#[cfg(feature = "fault-injection")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactPublicationFaultStage {
+    SyncAfter,
+    RenameBefore,
+    RenameAfter,
+    DirectorySyncAfter,
+}
+
+#[cfg(feature = "fault-injection")]
+fn artifact_publication_fault_matches(
+    final_path: &Path,
+    fault: Option<PublicationIoFault>,
+    stage: ArtifactPublicationFaultStage,
+) -> bool {
+    let Some(name) = final_path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let is_segment = name.starts_with("structured-g") && name.ends_with(".t3s");
+    let is_route = name.starts_with("route-g") && name.ends_with(".t3r");
+    matches!(
+        (is_segment, is_route, stage, fault),
+        (
+            true,
+            false,
+            ArtifactPublicationFaultStage::SyncAfter,
+            Some(PublicationIoFault::SegmentSyncEioAfter)
+        ) | (
+            true,
+            false,
+            ArtifactPublicationFaultStage::RenameBefore,
+            Some(PublicationIoFault::SegmentRenameEioBefore)
+        ) | (
+            true,
+            false,
+            ArtifactPublicationFaultStage::RenameAfter,
+            Some(PublicationIoFault::SegmentRenameEioAfter)
+        ) | (
+            true,
+            false,
+            ArtifactPublicationFaultStage::DirectorySyncAfter,
+            Some(PublicationIoFault::SegmentDirSyncEioAfter)
+        ) | (
+            false,
+            true,
+            ArtifactPublicationFaultStage::SyncAfter,
+            Some(PublicationIoFault::RouteSyncEioAfter)
+        ) | (
+            false,
+            true,
+            ArtifactPublicationFaultStage::RenameBefore,
+            Some(PublicationIoFault::RouteRenameEioBefore)
+        ) | (
+            false,
+            true,
+            ArtifactPublicationFaultStage::RenameAfter,
+            Some(PublicationIoFault::RouteRenameEioAfter)
+        ) | (
+            false,
+            true,
+            ArtifactPublicationFaultStage::DirectorySyncAfter,
+            Some(PublicationIoFault::RouteDirSyncEioAfter)
+        )
+    )
+}
+
 fn publish_existing_tmp_with_role(
     tmp: &Path,
     final_path: &Path,
@@ -1169,11 +1235,7 @@ fn publish_existing_tmp_with_role(
         return Err(format_error("staged temporary file is missing"));
     }
     #[cfg(feature = "fault-injection")]
-    let publication_fault = if role == PublicationRole::ManifestAuthority {
-        configured_publication_io_fault()?
-    } else {
-        None
-    };
+    let publication_fault = configured_publication_io_fault()?;
 
     OpenOptions::new()
         .read(true)
@@ -1183,7 +1245,29 @@ fn publish_existing_tmp_with_role(
     maybe_file_crash(final_path, "sync");
 
     #[cfg(feature = "fault-injection")]
+    if role == PublicationRole::Artifact
+        && artifact_publication_fault_matches(
+            final_path,
+            publication_fault,
+            ArtifactPublicationFaultStage::SyncAfter,
+        )
+    {
+        return Err(injected_io_error().into());
+    }
+
+    #[cfg(feature = "fault-injection")]
     if publication_fault == Some(PublicationIoFault::ManifestSyncEioAfter) {
+        return Err(injected_io_error().into());
+    }
+
+    #[cfg(feature = "fault-injection")]
+    if role == PublicationRole::Artifact
+        && artifact_publication_fault_matches(
+            final_path,
+            publication_fault,
+            ArtifactPublicationFaultStage::RenameBefore,
+        )
+    {
         return Err(injected_io_error().into());
     }
 
@@ -1206,6 +1290,17 @@ fn publish_existing_tmp_with_role(
     maybe_file_crash(final_path, "rename");
 
     #[cfg(feature = "fault-injection")]
+    if role == PublicationRole::Artifact
+        && artifact_publication_fault_matches(
+            final_path,
+            publication_fault,
+            ArtifactPublicationFaultStage::RenameAfter,
+        )
+    {
+        return Err(injected_io_error().into());
+    }
+
+    #[cfg(feature = "fault-injection")]
     if publication_fault == Some(PublicationIoFault::ManifestRenameEioAfter) {
         return Err(durability_indeterminate_error(
             DurabilityOperation::Rename,
@@ -1226,6 +1321,17 @@ fn publish_existing_tmp_with_role(
         });
     }
     maybe_file_crash(final_path, "dir-sync");
+
+    #[cfg(feature = "fault-injection")]
+    if role == PublicationRole::Artifact
+        && artifact_publication_fault_matches(
+            final_path,
+            publication_fault,
+            ArtifactPublicationFaultStage::DirectorySyncAfter,
+        )
+    {
+        return Err(injected_io_error().into());
+    }
 
     #[cfg(feature = "fault-injection")]
     if publication_fault == Some(PublicationIoFault::ManifestDirSyncEioAfter) {
