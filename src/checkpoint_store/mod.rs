@@ -32,7 +32,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use xxhash_rust::xxh3::{xxh3_64, Xxh3};
 
-use crate::error_classification::recovery_required_after_commit_error;
+use crate::error_classification::{
+    durability_indeterminate_error, recovery_required_after_commit_error, DurabilityOperation,
+};
 use crate::hot_wal_commit::{FileHotWalCommitIo, HotWalCommitter};
 
 mod storage_format;
@@ -1151,7 +1153,17 @@ fn tmp_path_for(path: &Path) -> Result<PathBuf, CheckpointStoreError> {
     Ok(parent.join(format!(".{name}.tmp")))
 }
 
-fn publish_existing_tmp(tmp: &Path, final_path: &Path) -> Result<(), CheckpointStoreError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicationRole {
+    Artifact,
+    ManifestAuthority,
+}
+
+fn publish_existing_tmp_with_role(
+    tmp: &Path,
+    final_path: &Path,
+    role: PublicationRole,
+) -> Result<(), CheckpointStoreError> {
     if !tmp.exists() {
         return Err(format_error("staged temporary file is missing"));
     }
@@ -1161,18 +1173,44 @@ fn publish_existing_tmp(tmp: &Path, final_path: &Path) -> Result<(), CheckpointS
         .open(tmp)?
         .sync_all()?;
     maybe_file_crash(final_path, "sync");
-    fs::rename(tmp, final_path)?;
+
+    if let Err(source) = fs::rename(tmp, final_path) {
+        return Err(if role == PublicationRole::ManifestAuthority {
+            durability_indeterminate_error(DurabilityOperation::Rename, final_path, source)
+        } else {
+            source.into()
+        });
+    }
     maybe_file_crash(final_path, "rename");
-    sync_dir(
-        final_path
-            .parent()
-            .ok_or_else(|| format_error("final path has no parent"))?,
-    )?;
+
+    let parent = final_path
+        .parent()
+        .ok_or_else(|| format_error("final path has no parent"))?;
+    if let Err(error) = sync_dir(parent) {
+        return Err(match (role, error) {
+            (PublicationRole::ManifestAuthority, CheckpointStoreError::Io(source)) => {
+                durability_indeterminate_error(
+                    DurabilityOperation::DirectorySync,
+                    parent,
+                    source,
+                )
+            }
+            (_, other) => other,
+        });
+    }
     maybe_file_crash(final_path, "dir-sync");
     Ok(())
 }
 
-fn staged_write_new(path: &Path, bytes: &[u8]) -> Result<(), CheckpointStoreError> {
+fn publish_existing_tmp(tmp: &Path, final_path: &Path) -> Result<(), CheckpointStoreError> {
+    publish_existing_tmp_with_role(tmp, final_path, PublicationRole::Artifact)
+}
+
+fn staged_write_with_role(
+    path: &Path,
+    bytes: &[u8],
+    role: PublicationRole,
+) -> Result<(), CheckpointStoreError> {
     let parent = path
         .parent()
         .ok_or_else(|| format_error("target path has no parent"))?;
@@ -1186,7 +1224,15 @@ fn staged_write_new(path: &Path, bytes: &[u8]) -> Result<(), CheckpointStoreErro
     file.flush()?;
     drop(file);
     maybe_file_crash(path, "write");
-    publish_existing_tmp(&tmp, path)
+    publish_existing_tmp_with_role(&tmp, path, role)
+}
+
+fn staged_write_new(path: &Path, bytes: &[u8]) -> Result<(), CheckpointStoreError> {
+    staged_write_with_role(path, bytes, PublicationRole::Artifact)
+}
+
+fn staged_write_manifest(path: &Path, bytes: &[u8]) -> Result<(), CheckpointStoreError> {
+    staged_write_with_role(path, bytes, PublicationRole::ManifestAuthority)
 }
 
 struct RecycleResult {
