@@ -42,7 +42,7 @@ The matrix in `tests/hot_wal_faults.rs` checks:
    - reopen reconstructs the exact checkpoint.
 
 2. **ENOSPC before any record byte**
-   - result class is ordinary `Io`;
+   - result class is `Capacity` because ENOSPC occurred before WAL mutation;
    - the WAL prefix remains byte-for-byte unchanged;
    - the same open writer can retry after the fault is removed.
 
