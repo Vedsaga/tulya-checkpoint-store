@@ -22,7 +22,6 @@ mod checkpoint_store;
 mod error_classification;
 #[allow(dead_code)]
 mod format_authority;
-#[allow(dead_code)]
 mod hot_wal_commit;
 mod persistent_sequence;
 
