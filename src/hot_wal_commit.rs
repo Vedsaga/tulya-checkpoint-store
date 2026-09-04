@@ -100,10 +100,7 @@ impl HotWalCommitter {
                     return self.write_failure(
                         path,
                         written,
-                        io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "hot WAL write made no progress",
-                        ),
+                        io::Error::new(io::ErrorKind::WriteZero, "hot WAL write made no progress"),
                     );
                 }
                 Ok(count) if count <= remaining.len() => {
