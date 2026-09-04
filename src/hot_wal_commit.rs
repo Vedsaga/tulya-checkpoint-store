@@ -110,14 +110,13 @@ impl HotWalCommitter {
                     })?;
                 }
                 Ok(_) => {
-                    return self.write_failure(
+                    return Err(self.recovery_required_error(
                         path,
-                        written,
-                        io::Error::new(
+                        Some(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "hot WAL writer reported more bytes than supplied",
-                        ),
-                    );
+                        )),
+                    ));
                 }
                 Err(source) => return self.write_failure(path, written, source),
             }
@@ -202,6 +201,7 @@ mod tests {
         fail_write_after: Option<usize>,
         fail_flush: bool,
         fail_sync: bool,
+        overreport_write: bool,
         write_calls: usize,
         flush_calls: usize,
         sync_calls: usize,
@@ -215,6 +215,7 @@ mod tests {
                 fail_write_after: None,
                 fail_flush: false,
                 fail_sync: false,
+                overreport_write: false,
                 write_calls: 0,
                 flush_calls: 0,
                 sync_calls: 0,
@@ -225,6 +226,9 @@ mod tests {
     impl HotWalCommitIo for ScriptedIo {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             self.write_calls = self.write_calls.saturating_add(1);
+            if self.overreport_write {
+                return Ok(bytes.len().saturating_add(1));
+            }
             if let Some(limit) = self.fail_write_after {
                 if self.bytes.len() >= limit {
                     return Err(io::Error::from_raw_os_error(28));
@@ -319,6 +323,21 @@ mod tests {
         );
         assert_eq!(io.write_calls, write_calls);
         assert_eq!(io.bytes, b"rec");
+    }
+
+    #[test]
+    fn invalid_overreported_write_poisoning_requires_recovery() {
+        let path = PathBuf::from("hot.wal");
+        let mut committer = HotWalCommitter::default();
+        let mut io = ScriptedIo::healthy(32);
+        io.overreport_write = true;
+
+        let error = committer.commit(&path, &mut io, b"record").unwrap_err();
+        assert_eq!(
+            error.failure_kind(),
+            CheckpointStoreFailureKind::RecoveryRequired
+        );
+        assert!(committer.requires_recovery());
     }
 
     #[test]
