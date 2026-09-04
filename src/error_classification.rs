@@ -199,9 +199,7 @@ impl CheckpointStoreError {
             Self::Io(error) if embedded_recovery_required(error).is_some() => {
                 CheckpointStoreFailureKind::RecoveryRequired
             }
-            Self::Io(error) if io_error_is_capacity(error) => {
-                CheckpointStoreFailureKind::Capacity
-            }
+            Self::Io(error) if io_error_is_capacity(error) => CheckpointStoreFailureKind::Capacity,
             Self::Io(_) => CheckpointStoreFailureKind::Io,
             Self::Json(error) => match error.classify() {
                 JsonCategory::Io => CheckpointStoreFailureKind::Io,
