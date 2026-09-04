@@ -34,7 +34,6 @@ pub(super) fn maybe_file_crash(path: &Path, stage: &str) {
     }
 }
 
-
 #[cfg(feature = "fault-injection")]
 pub(crate) const WAL_IO_FAULT_ENV: &str = "TULYA_CHECKPOINT_STORE_WAL_IO_FAULT";
 
