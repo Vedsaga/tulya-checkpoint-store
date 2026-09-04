@@ -1531,3 +1531,35 @@ fn recovery_required_writer_blocks_mutations_but_keeps_reads_available(
     assert_eq!(store.read_checkpoint("thread", "cp-1")?, expected);
     Ok(())
 }
+
+
+#[test]
+fn prepared_transaction_apply_does_not_publish_before_commit(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut state = StoreState::default();
+    let encoded = transaction(0, 1, 0, 0, b"{}", "cp-1", None);
+    let tx = parse_transaction(&encoded, Geometry::default(), 0)?;
+    let before = state.geometry()?;
+
+    let prepared = prepare_transaction_apply(&mut state, tx)?;
+
+    assert_eq!(state.geometry()?, before);
+    assert!(state.checkpoints.is_empty());
+    assert!(state.thread_ordinals.is_empty());
+    assert!(state.checkpoint_ordinals.is_empty());
+
+    apply_prepared_transaction(&mut state, prepared);
+
+    let after = state.geometry()?;
+    assert_eq!(after.checkpoint_count, 1);
+    assert_eq!(after.version_count, 1);
+    assert_eq!(state.checkpoints.len(), 1);
+    assert_eq!(state.threads, vec!["thread".to_owned()]);
+    assert_eq!(
+        state
+            .checkpoint_ordinals
+            .get(&("thread".to_owned(), "cp-1".to_owned())),
+        Some(&0)
+    );
+    Ok(())
+}
