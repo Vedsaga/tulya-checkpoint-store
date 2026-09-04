@@ -1490,7 +1490,6 @@ fn lazy_checkpoint_range_reads_above_payload_fast_path_cap(
     Ok(())
 }
 
-
 #[test]
 fn recovery_required_writer_blocks_mutations_but_keeps_reads_available(
 ) -> Result<(), Box<dyn std::error::Error>> {
