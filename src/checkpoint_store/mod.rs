@@ -640,10 +640,9 @@ impl HotWal {
                 return Err(self.recovery_required_after_mutation(error));
             }
             if let Err(source) = self.file.seek(SeekFrom::Start(self.logical_tail)) {
-                return Err(
-                    self.committer
-                        .recovery_required_error(&self.path, Some(source)),
-                );
+                return Err(self
+                    .committer
+                    .recovery_required_error(&self.path, Some(source)));
             }
             new_capacity
         } else {
@@ -652,8 +651,7 @@ impl HotWal {
 
         let timings = {
             let mut io = FileHotWalCommitIo::new(&mut self.file);
-            self.committer
-                .commit(&self.path, &mut io, transaction)?
+            self.committer.commit(&self.path, &mut io, transaction)?
         };
         self.logical_tail = required_tail;
         Ok(HotWalAppendReport {
@@ -704,17 +702,15 @@ impl HotWal {
         let mut file = match OpenOptions::new().read(true).write(true).open(&self.path) {
             Ok(file) => file,
             Err(source) => {
-                return Err(
-                    self.committer
-                        .recovery_required_error(&self.path, Some(source)),
-                );
+                return Err(self
+                    .committer
+                    .recovery_required_error(&self.path, Some(source)));
             }
         };
         if let Err(source) = file.seek(SeekFrom::Start(new_tail)) {
-            return Err(
-                self.committer
-                    .recovery_required_error(&self.path, Some(source)),
-            );
+            return Err(self
+                .committer
+                .recovery_required_error(&self.path, Some(source)));
         }
         self.file = file;
         self.logical_tail = new_tail;
