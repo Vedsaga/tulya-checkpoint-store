@@ -104,3 +104,11 @@ Retry safety is part of the database contract, but adding variants directly to t
 **FORMAT IMPACT**
 
 None. This is runtime API/error semantics only. Format v1 and staged Format v2 bytes are unchanged.
+
+
+## Committed-authority recovery context
+
+`RecoveryRequired::authority_committed()` is false for a poisoned writer whose
+logical authority is not known to have changed, and true when manifest authority
+is already known durable but post-commit maintenance failed. The latter must not
+be treated as a rejected logical operation.
