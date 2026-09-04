@@ -199,7 +199,7 @@ impl CheckpointStoreError {
             Self::Io(error) if embedded_recovery_required(error).is_some() => {
                 CheckpointStoreFailureKind::RecoveryRequired
             }
-            Self::Io(error) if error.kind() == io::ErrorKind::OutOfMemory => {
+            Self::Io(error) if io_error_is_capacity(error) => {
                 CheckpointStoreFailureKind::Capacity
             }
             Self::Io(_) => CheckpointStoreFailureKind::Io,
@@ -240,6 +240,28 @@ impl CheckpointStoreError {
             Self::Io(error) => embedded_recovery_required(error),
             _ => None,
         }
+    }
+}
+
+fn io_error_is_capacity(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::OutOfMemory {
+        return true;
+    }
+    let Some(code) = error.raw_os_error() else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        code == 28
+    }
+    #[cfg(windows)]
+    {
+        code == 112
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = code;
+        false
     }
 }
 
@@ -373,6 +395,18 @@ mod tests {
     #[test]
     fn allocation_reserve_failure_is_classified_as_capacity() {
         let error = capacity_error("allocation reserve failed before WAL commit");
+        assert_eq!(error.failure_kind(), CheckpointStoreFailureKind::Capacity);
+    }
+
+    #[test]
+    fn definite_storage_full_is_classified_as_capacity() {
+        #[cfg(unix)]
+        let error = CheckpointStoreError::Io(io::Error::from_raw_os_error(28));
+        #[cfg(windows)]
+        let error = CheckpointStoreError::Io(io::Error::from_raw_os_error(112));
+        #[cfg(not(any(unix, windows)))]
+        let error = capacity_error("platform-independent capacity failure");
+
         assert_eq!(error.failure_kind(), CheckpointStoreFailureKind::Capacity);
     }
 
