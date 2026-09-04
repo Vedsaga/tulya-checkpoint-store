@@ -125,7 +125,6 @@ pub(crate) fn injected_io_error() -> io::Error {
     io::Error::other("injected hot WAL I/O failure")
 }
 
-
 #[cfg(feature = "fault-injection")]
 pub(crate) const PUBLICATION_IO_FAULT_ENV: &str =
     "TULYA_CHECKPOINT_STORE_PUBLICATION_IO_FAULT";
