@@ -68,7 +68,8 @@ not at the end of all maintenance.
 
 Before manifest authority:
 
-- segment/route staging failure: definite failure of this publication attempt;
+- segment/route construction failure before named publication: definite failure, writer remains usable unless the underlying path separately poisoned it;
+- segment/route named publication failure: logical authority remains old, but the writer returns pre-authority `RecoveryRequired` because an orphan final/tmp artifact may require reopen cleanup before the generation name is reused;
 - manifest byte write/flush/tmp-file sync failure: old authority remains;
 - validation/encoding/allocation failure: old authority remains.
 
@@ -175,7 +176,7 @@ This internal boundary is accepted only after:
   retaining readable committed state;
 - the full library suite and existing crash matrix remain green.
 
-The live syscall-result matrix is staged in
-`tests/publication_faults.rs` and documented in
-`docs/LIVE_PUBLICATION_FAULT_INJECTION.md`. That evidence must pass before the
-broader resilience fault-injection gate can move.
+The accepted manifest/WAL-recycle syscall-result matrix is documented in
+`docs/LIVE_PUBLICATION_FAULT_INJECTION.md`. Immutable segment/route publication
+faults are staged separately in
+`docs/LIVE_IMMUTABLE_ARTIFACT_FAULT_INJECTION.md`.
