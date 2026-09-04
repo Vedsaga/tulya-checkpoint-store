@@ -1,6 +1,6 @@
 # Live hot-WAL I/O fault injection
 
-Status: staged production-resilience evidence. Local Rust 1.80 verification is required before this unit is accepted.
+Status: accepted foreground hot-WAL resilience evidence. Rust 1.80 formatting and strict feature-enabled Clippy passed; the live file-backed matrix passed, the hot-WAL state machine passed 6/6, the full library suite passed 107/107, and the existing 32-case seal crash matrix remained green. This does not complete the broader publication fault-injection gate.
 
 ## DECISION
 
