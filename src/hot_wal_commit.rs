@@ -4,6 +4,9 @@
 //! so short writes and durability failures can be tested deterministically
 //! before the abstraction is wired into the production `HotWal` handle.
 
+use crate::checkpoint_store::fault_injection::{
+    configured_wal_io_fault, injected_disk_full_error, injected_io_error, WalIoFault,
+};
 use crate::checkpoint_store::CheckpointStoreError;
 use crate::error_classification::{
     durability_indeterminate_error, recovery_required_error, DurabilityOperation,
@@ -28,25 +31,74 @@ pub(crate) trait HotWalCommitIo {
 /// Production adapter over one already-positioned WAL file.
 pub(crate) struct FileHotWalCommitIo<'a> {
     file: &'a mut File,
+    fault: Option<WalIoFault>,
+    fault_written: usize,
 }
 
 impl<'a> FileHotWalCommitIo<'a> {
-    pub(crate) fn new(file: &'a mut File) -> Self {
-        Self { file }
+    pub(crate) fn new(file: &'a mut File) -> Result<Self, CheckpointStoreError> {
+        Ok(Self {
+            file,
+            fault: configured_wal_io_fault()?,
+            fault_written: 0,
+        })
+    }
+
+    fn record_fault_write(&mut self, count: usize) -> io::Result<()> {
+        self.fault_written = self.fault_written.checked_add(count).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "hot WAL fault-injection write counter overflow",
+            )
+        })?;
+        Ok(())
     }
 }
 
 impl HotWalCommitIo for FileHotWalCommitIo<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.file.write(bytes)
+        let count = match self.fault {
+            Some(WalIoFault::ShortWrite(limit)) => {
+                let take = bytes.len().min(limit);
+                self.file.write(bytes.get(..take).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "hot WAL short-write fault slice is outside input",
+                    )
+                })?)?
+            }
+            Some(WalIoFault::WriteEnospcAfter(limit)) => {
+                if self.fault_written >= limit {
+                    return Err(injected_disk_full_error());
+                }
+                let take = bytes.len().min(limit - self.fault_written);
+                self.file.write(bytes.get(..take).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "hot WAL ENOSPC fault slice is outside input",
+                    )
+                })?)?
+            }
+            _ => self.file.write(bytes)?,
+        };
+        self.record_fault_write(count)?;
+        Ok(count)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
+        self.file.flush()?;
+        if self.fault == Some(WalIoFault::FlushEioAfter) {
+            return Err(injected_io_error());
+        }
+        Ok(())
     }
 
     fn sync_data(&mut self) -> io::Result<()> {
-        self.file.sync_data()
+        self.file.sync_data()?;
+        if self.fault == Some(WalIoFault::SyncEioAfter) {
+            return Err(injected_io_error());
+        }
+        Ok(())
     }
 }
 
