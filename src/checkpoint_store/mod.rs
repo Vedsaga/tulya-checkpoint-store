@@ -33,7 +33,8 @@ use thiserror::Error;
 use xxhash_rust::xxh3::{xxh3_64, Xxh3};
 
 use crate::error_classification::{
-    durability_indeterminate_error, recovery_required_after_commit_error, DurabilityOperation,
+    durability_indeterminate_error, recovery_required_after_commit_error, recovery_required_error,
+    DurabilityOperation,
 };
 use crate::hot_wal_commit::{FileHotWalCommitIo, HotWalCommitter};
 
