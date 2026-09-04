@@ -106,6 +106,16 @@ Retry safety is part of the database contract, but adding variants directly to t
 None. This is runtime API/error semantics only. Format v1 and staged Format v2 bytes are unchanged.
 
 
+## Immutable publication recovery context
+
+A named immutable segment/route publication failure is a definite logical
+failure because manifest authority has not changed, but the writer still
+returns `RecoveryRequired` with `authority_committed() == false`. A final or
+temporary generation artifact may already exist, and reopen must normalize
+unreferenced files before the generation name is reused. This is distinct from
+`DurabilityIndeterminate`, which is reserved for uncertainty at the manifest
+authority transition itself.
+
 ## Committed-authority recovery context
 
 `RecoveryRequired::authority_committed()` is false for a poisoned writer whose
