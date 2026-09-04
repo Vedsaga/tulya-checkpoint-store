@@ -1167,12 +1167,33 @@ fn publish_existing_tmp_with_role(
     if !tmp.exists() {
         return Err(format_error("staged temporary file is missing"));
     }
+    #[cfg(feature = "fault-injection")]
+    let publication_fault = if role == PublicationRole::ManifestAuthority {
+        configured_publication_io_fault()?
+    } else {
+        None
+    };
+
     OpenOptions::new()
         .read(true)
         .write(true)
         .open(tmp)?
         .sync_all()?;
     maybe_file_crash(final_path, "sync");
+
+    #[cfg(feature = "fault-injection")]
+    if publication_fault == Some(PublicationIoFault::ManifestSyncEioAfter) {
+        return Err(injected_io_error().into());
+    }
+
+    #[cfg(feature = "fault-injection")]
+    if publication_fault == Some(PublicationIoFault::ManifestRenameEioBefore) {
+        return Err(durability_indeterminate_error(
+            DurabilityOperation::Rename,
+            final_path,
+            injected_io_error(),
+        ));
+    }
 
     if let Err(source) = fs::rename(tmp, final_path) {
         return Err(if role == PublicationRole::ManifestAuthority {
@@ -1182,6 +1203,15 @@ fn publish_existing_tmp_with_role(
         });
     }
     maybe_file_crash(final_path, "rename");
+
+    #[cfg(feature = "fault-injection")]
+    if publication_fault == Some(PublicationIoFault::ManifestRenameEioAfter) {
+        return Err(durability_indeterminate_error(
+            DurabilityOperation::Rename,
+            final_path,
+            injected_io_error(),
+        ));
+    }
 
     let parent = final_path
         .parent()
@@ -1195,6 +1225,16 @@ fn publish_existing_tmp_with_role(
         });
     }
     maybe_file_crash(final_path, "dir-sync");
+
+    #[cfg(feature = "fault-injection")]
+    if publication_fault == Some(PublicationIoFault::ManifestDirSyncEioAfter) {
+        return Err(durability_indeterminate_error(
+            DurabilityOperation::DirectorySync,
+            parent,
+            injected_io_error(),
+        ));
+    }
+
     Ok(())
 }
 
@@ -1242,6 +1282,9 @@ fn recycle_hot_file(
     logical_tail: u64,
     config: CheckpointStoreConfig,
 ) -> Result<RecycleResult, CheckpointStoreError> {
+    #[cfg(feature = "fault-injection")]
+    let publication_fault = configured_publication_io_fault()?;
+
     if source_offset > logical_tail {
         return Err(format_error(
             "WAL recycle source offset exceeds logical tail",
@@ -1276,16 +1319,39 @@ fn recycle_hot_file(
         config.preinit_chunk_bytes,
     )?;
     maybe_crash("after-wal-sync");
+
+    #[cfg(feature = "fault-injection")]
+    if publication_fault == Some(PublicationIoFault::WalRecycleSyncEioAfter) {
+        return Err(injected_io_error().into());
+    }
+
     let peak = tree_storage(dir)?;
     drop(output);
+
+    #[cfg(feature = "fault-injection")]
+    if publication_fault == Some(PublicationIoFault::WalRecycleRenameEioBefore) {
+        return Err(injected_io_error().into());
+    }
+
     fs::rename(&tmp, hot_path)?;
     maybe_crash("after-wal-rename");
-    sync_dir(
-        hot_path
-            .parent()
-            .ok_or_else(|| format_error("hot WAL path has no parent"))?,
-    )?;
+
+    #[cfg(feature = "fault-injection")]
+    if publication_fault == Some(PublicationIoFault::WalRecycleRenameEioAfter) {
+        return Err(injected_io_error().into());
+    }
+
+    let parent = hot_path
+        .parent()
+        .ok_or_else(|| format_error("hot WAL path has no parent"))?;
+    sync_dir(parent)?;
     maybe_crash("after-wal-dir-sync");
+
+    #[cfg(feature = "fault-injection")]
+    if publication_fault == Some(PublicationIoFault::WalRecycleDirSyncEioAfter) {
+        return Err(injected_io_error().into());
+    }
+
     Ok(RecycleResult { peak })
 }
 
