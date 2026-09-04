@@ -1,6 +1,6 @@
 # Hot-WAL commit failure state machine
 
-Status: staged internal resilience contract. It is not yet wired into the production `CheckpointStore::HotWal` implementation.
+Status: production-wired resilience contract for foreground hot-WAL commit publication. Live syscall fault injection remains a separate acceptance unit.
 
 ## DECISION
 
@@ -30,7 +30,8 @@ Failure classification is:
 - write failure after any record byte was written: `RecoveryRequired`; do not write again on that handle;
 - flush failure after the complete record was written: `DurabilityIndeterminate`; do not write again on that handle;
 - `sync_data` failure after the complete record was written: `DurabilityIndeterminate`; do not write again on that handle;
-- any later mutation attempt on a poisoned writer: `RecoveryRequired`, with no I/O attempted.
+- any later mutation attempt on a poisoned writer: `RecoveryRequired`, with no I/O attempted;
+- reserve-capacity preparation that fails after mutable WAL preparation begins: the handle is marked recovery-required before returning.
 
 A successful commit performs exactly one successful `sync_data` for the record. There must be no fallible operation after the successful durability barrier and before the caller is told the commit succeeded. In particular, report-only metadata lookups must happen before commit or use already-known values; a post-sync metadata failure must never turn a durable commit into an apparent failed append.
 
@@ -70,6 +71,8 @@ None. This changes runtime failure handling only. Format v1 bytes, Format-v2 sta
 
 ## Current implementation boundary
 
-`src/hot_wal_commit.rs` contains the staged commit state machine, the production `File` adapter, and deterministic scripted-I/O unit tests. It is intentionally behind a scoped `dead_code` allowance until the next unit replaces the direct `File::write_all` / `flush` / `sync_data` sequence in the production `HotWal` implementation.
+`src/hot_wal_commit.rs` contains the commit state machine, the production `File` adapter, and deterministic scripted-I/O unit tests. `CheckpointStore::HotWal::append` now delegates complete-record write/flush/`sync_data` publication to this state machine. Report capacity is determined before the durability barrier, so successful `sync_data` is followed only by infallible in-memory bookkeeping.
 
-The next integration unit must additionally ensure all `CheckpointStore` mutation paths refuse to seal, prune, reidentify, recycle, or append when the hot writer is recovery-required. Read-only verification and inspection may remain available.
+`CheckpointStore` mutation entry points refuse append, seal, prune, reidentify, reclaim, or recycle work once the hot writer is recovery-required. Read-only checkpoint access remains available and reflects the last state published into the current process; callers that received `DurabilityIndeterminate` must reopen before treating that process-local view as authoritative.
+
+The next acceptance unit injects failures through the live file-backed path, including short/partial writes, ENOSPC, flush/`sync_data` failures, reserve-extension failure, and reopen normalization. Publication/manifest/rename/directory-sync fault semantics remain a separate durability unit.
