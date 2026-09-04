@@ -160,6 +160,24 @@ impl CheckpointStore {
         }
     }
 
+    fn committed_maintenance_at<T>(
+        &mut self,
+        path: &Path,
+        result: Result<T, CheckpointStoreError>,
+    ) -> Result<T, CheckpointStoreError> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.hot.poison();
+                let source = match error {
+                    CheckpointStoreError::Io(source) => Some(source),
+                    other => Some(io::Error::other(other.to_string())),
+                };
+                Err(recovery_required_after_commit_error(path, source))
+            }
+        }
+    }
+
     /// Returns this store's persistent identity.
     #[must_use]
     pub fn store_id(&self) -> StoreId {
@@ -341,10 +359,11 @@ impl CheckpointStore {
         self.state = compacted.state;
         self.range_sizes.borrow_mut().clear();
 
-        let reclaim_result = reclaim_unreferenced_generation_files(&self.dir, &self.manifest);
-        self.committed_maintenance(reclaim_result)?;
-        let reclaimed_result = tree_storage(&self.dir);
-        let reclaimed = self.committed_maintenance(reclaimed_result)?;
+        let store_dir = self.dir.clone();
+        let reclaim_result = reclaim_unreferenced_generation_files(&store_dir, &self.manifest);
+        self.committed_maintenance_at(&store_dir, reclaim_result)?;
+        let reclaimed_result = tree_storage(&store_dir);
+        let reclaimed = self.committed_maintenance_at(&store_dir, reclaimed_result)?;
         Ok(PruneReport {
             generation,
             deleted_checkpoint_count,
