@@ -99,6 +99,60 @@ For zero live geometry, active requests and any residual sequence state are an
 error. If no retired/deleted identities exist, no snapshot is emitted. If
 retired/deleted identities remain, a tombstone-only `T2S2` is emitted.
 
+## Fail-atomic request retirement
+
+**DECISION**
+
+Moving a request identity from the active ledger to the retired ledger is a
+prepare-then-commit semantic transition:
+
+```text
+validate request id
+reject if retired identity already exists
+read active record without mutation
+allocate/copy retired key
+reserve retired-map insertion capacity
+remove active record
+insert retired record
+```
+
+Every fallible validation/allocation step occurs before the active ledger is
+mutated. Once the active record is removed, the remaining retired-ledger insert
+uses already-owned key bytes and already-reserved map capacity.
+
+**WHY**
+
+Normal validated v2 states keep active and retired request sets disjoint, but
+the mutation helper itself must not rely on that invariant to remain
+fail-atomic. The prior implementation removed the active entry first and only
+then discovered an already-retired identity, returning an error after partially
+changing semantic state.
+
+Allocation is part of the same boundary: merely checking the retired map before
+removal is insufficient if key allocation or map growth can still fail after
+the active entry has been removed.
+
+The internal `V2ApplyError::Capacity` class represents a pre-mutation
+reservation failure. It does not change the public v1 error taxonomy and is not
+yet part of a public v2 API.
+
+**ALTERNATIVES REJECTED**
+
+- Remove active first and restore it on error: rejected because rollback itself
+  adds mutation complexity and another allocation-sensitive path.
+- Assume active/retired disjointness makes the helper safe: rejected because
+  helpers should fail closed even when handed internally inconsistent state.
+- Insert retired first and remove active second: rejected because a successful
+  insert followed by any later error would temporarily create overlapping
+  ledgers and complicate invariants.
+- Ignore allocation failure as practically impossible: rejected for a storage
+  transition whose purpose is preserving deletion/idempotency authority.
+
+**FORMAT IMPACT**
+
+None. No `T2S2`, `T2D2`, WAL, manifest, or Format-v1 bytes change. This is
+an in-memory semantic-transition hardening only.
+
 ## Acceptance properties
 
 The focused backend tests require:
@@ -108,6 +162,7 @@ The focused backend tests require:
 - a brand-new empty state exports no snapshot and can accept the first commit;
 - a hot suffix encoded against the wrong base geometry fails closed;
 - retired request identity survives seal/reopen;
+- request retirement is fail-atomic when active/retired ledgers are internally inconsistent;
 - a tombstone-only base survives reopen and blocks reuse of the deleted
   checkpoint identity; and
 - corrupt sealed bytes are rejected before hot replay.
