@@ -120,6 +120,19 @@ impl CheckpointStore {
         self.hot.ensure_writable()
     }
 
+    fn pre_authority_artifact_failure(
+        &mut self,
+        path: &Path,
+        error: CheckpointStoreError,
+    ) -> CheckpointStoreError {
+        self.hot.poison();
+        let source = match error {
+            CheckpointStoreError::Io(source) => Some(source),
+            other => Some(io::Error::other(other.to_string())),
+        };
+        recovery_required_error(path, source)
+    }
+
     fn publish_manifest_authority(
         &mut self,
         next_manifest: &Manifest,
