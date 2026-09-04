@@ -19,7 +19,7 @@ The crate therefore exposes a stable, non-exhaustive `CheckpointStoreFailureKind
 - `Capacity`: a configured, representable, allocation, storage-full, or bounded resource limit was exceeded before commit authority changed. Fallible pre-commit container reservations and definite pre-write ENOSPC use this class rather than panicking, masquerading as format corruption, or collapsing into generic I/O.
 - `Io`: an I/O operation definitely failed and is not classified as an indeterminate commit outcome.
 - `DurabilityIndeterminate`: complete authoritative commit bytes may already have become durable although the caller did not receive success. The writer must not continue normal writes; reopen/recovery plus request identity resolves the result.
-- `RecoveryRequired`: mutable WAL bytes may have changed without a complete acknowledged commit, or the handle is already poisoned by such a failure. No further mutation is permitted on that handle until reopen/recovery normalizes authority.
+- `RecoveryRequired`: the current writer cannot safely continue without reopen. Causes include mutable WAL bytes changing without a complete acknowledged commit, orphan immutable generation artifacts after a definite pre-authority failure, or post-authority physical maintenance failure. No further mutation is permitted on that handle until reopen/recovery normalizes physical state against authority. `authority_committed()` distinguishes a definitely committed authority transition from pre-authority poison.
 - `Precondition`: the operation is valid only in a different lifecycle state, for example pruning an unsealed store.
 - `LegacyUnclassified`: an older error site has not yet been migrated with enough context for a precise behavioral class.
 
@@ -66,7 +66,7 @@ For `DurabilityIndeterminate`, the safe resolution sequence is:
 3. classify the original request identity against the recovered request ledger,
 4. return already-committed, deleted, conflict, or retry-new accordingly.
 
-For `RecoveryRequired`, no mutation is permitted on the same handle. Recovery must first remove or accept the physical suffix according to the WAL framing/checksum rules and reconstruct the logical tail.
+For `RecoveryRequired`, no mutation is permitted on the same handle. Reopen must normalize physical state against durable authority before mutation resumes. Depending on the cause, this means accepting/removing a framed WAL suffix, deleting unreferenced immutable generation artifacts, completing old-generation reclamation, or reopening after another post-authority maintenance failure.
 
 Requestless writes cannot in general be resolved safely after an indeterminate durability result. Production adapter paths therefore need durable request identity for exactly-once retry semantics.
 
@@ -110,9 +110,11 @@ None. This is runtime API/error semantics only. Format v1 and staged Format v2 b
 
 A named immutable segment/route publication failure is a definite logical
 failure because manifest authority has not changed, but the writer still
-returns `RecoveryRequired` with `authority_committed() == false`. A final or
-temporary generation artifact may already exist, and reopen must normalize
-unreferenced files before the generation name is reused. This is distinct from
+returns `RecoveryRequired` with `authority_committed() == false`. The same
+rule applies to a definite generation-manifest write/flush/tmp-sync failure
+after those immutable artifacts have been published. A final or temporary
+generation artifact may already exist, and reopen must normalize unreferenced
+files before the generation name is reused. This is distinct from
 `DurabilityIndeterminate`, which is reserved for uncertainty at the manifest
 authority transition itself.
 
