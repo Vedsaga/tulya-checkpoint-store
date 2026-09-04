@@ -161,10 +161,7 @@ impl CheckpointStore {
         let store_id = StoreId::generate()?;
         let mut next_manifest = self.manifest.clone();
         next_manifest.store_id = Some(store_id);
-        staged_write_new(
-            &self.dir.join(MANIFEST_FILE),
-            &manifest_bytes(&next_manifest)?,
-        )?;
+        self.publish_manifest_authority(&next_manifest)?;
         self.manifest = next_manifest;
         self.store_id = store_id;
         Ok(store_id)
