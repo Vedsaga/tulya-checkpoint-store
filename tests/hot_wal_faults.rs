@@ -17,6 +17,12 @@ struct FaultEnv {
 }
 
 impl FaultEnv {
+    fn clear() -> Self {
+        let previous = std::env::var_os(WAL_IO_FAULT_ENV);
+        std::env::remove_var(WAL_IO_FAULT_ENV);
+        Self { previous }
+    }
+
     fn set(value: &str) -> Self {
         let previous = std::env::var_os(WAL_IO_FAULT_ENV);
         std::env::set_var(WAL_IO_FAULT_ENV, value);
@@ -75,6 +81,8 @@ fn small_reserve_config() -> CheckpointStoreConfig {
 
 #[test]
 fn live_file_backed_hot_wal_faults_recover_to_exact_state() -> Result<(), Box<dyn Error>> {
+    let _clean_fault_environment = FaultEnv::clear();
+
     // Real short writes must be completed by the foreground commit loop.
     {
         let temp = tempfile::tempdir()?;
@@ -103,7 +111,7 @@ fn live_file_backed_hot_wal_faults_recover_to_exact_state() -> Result<(), Box<dy
             let _fault = FaultEnv::set("write-enospc-after=0");
             expect_error(store.append_checkpoint("thread", "retry", 1, None, b"{}"))?
         };
-        assert_kind(&error, CheckpointStoreFailureKind::Io);
+        assert_kind(&error, CheckpointStoreFailureKind::Capacity);
         assert_eq!(hot_prefix(temp.path(), 256)?, before);
 
         store.append_checkpoint("thread", "retry", 1, None, b"{}")?;
