@@ -115,6 +115,10 @@ impl CheckpointStore {
         Ok(store)
     }
 
+    fn ensure_mutation_allowed(&self) -> Result<(), CheckpointStoreError> {
+        self.hot.ensure_writable()
+    }
+
     /// Returns this store's persistent identity.
     #[must_use]
     pub fn store_id(&self) -> StoreId {
@@ -125,6 +129,7 @@ impl CheckpointStore {
     /// explicitly independent store. Checkpoints and request-ledger bytes are
     /// unchanged; this method does not create a branch or copy any files.
     pub fn reidentify_copied_store(&mut self) -> Result<StoreId, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         let store_id = StoreId::generate()?;
         let mut next_manifest = self.manifest.clone();
         next_manifest.store_id = Some(store_id);
@@ -149,6 +154,7 @@ impl CheckpointStore {
         thread_id: &str,
         checkpoint_id: &str,
     ) -> Result<PruneReport, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         validate_checkpoint_identifier(thread_id, "thread id")?;
         validate_checkpoint_identifier(checkpoint_id, "checkpoint id")?;
         if self.hot.logical_tail() != 0 {
@@ -207,6 +213,7 @@ impl CheckpointStore {
         &mut self,
         deleted_keys: HashSet<(String, String)>,
     ) -> Result<PruneReport, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         if self.hot.logical_tail() != 0 {
             return Err(CheckpointStoreError::PruneRequiresSealedStore);
         }
@@ -302,6 +309,7 @@ impl CheckpointStore {
     /// active. If a reader is still active, this call is safe and leaves the
     /// obsolete files for a later drain.
     pub fn reclaim_deferred_generations(&self) -> Result<StoreStorage, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         reclaim_unreferenced_generation_files(&self.dir, &self.manifest)?;
         tree_storage(&self.dir)
     }
@@ -318,6 +326,7 @@ impl CheckpointStore {
         &mut self,
         transaction: &[u8],
     ) -> Result<HotWalAppendReport, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         let requestless = parse_transaction_unchecked(transaction, 0)?;
         reject_deleted_checkpoint(&self.state, &requestless)?;
         let geometry = Geometry::from_state(&self.state)?;
@@ -345,6 +354,7 @@ impl CheckpointStore {
         parent_checkpoint_id: Option<&str>,
         identity: &[u8],
     ) -> Result<HotWalAppendReport, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         let geometry = self.state.geometry()?;
         let transaction = encode_single_identity_transaction(
             &geometry,
@@ -388,6 +398,7 @@ impl CheckpointStore {
         parent_checkpoint_id: Option<&str>,
         messages: &[Value],
     ) -> Result<HotWalAppendReport, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         if messages.is_empty() {
             return Err(format_error("message checkpoint delta is empty"));
         }
@@ -672,6 +683,7 @@ impl CheckpointStore {
         canonical_state_hash: u64,
         policy: BoundedWalLifecyclePolicy,
     ) -> Result<BoundedWalAppendReport, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         let geometry = self.state.geometry()?;
         let transaction = encode_identity_leaf_transaction(
             &geometry,
@@ -735,6 +747,7 @@ impl CheckpointStore {
         transaction: &[u8],
         policy: BoundedWalLifecyclePolicy,
     ) -> Result<BoundedWalAppendReport, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         policy.validate()?;
         let transaction_bytes = u64::try_from(transaction.len())
             .map_err(|_| format_error("bounded WAL transaction length exceeds u64"))?;
@@ -782,6 +795,7 @@ impl CheckpointStore {
         request_id: &[u8],
         transaction: &[u8],
     ) -> Result<CheckpointStoreAppendOutcome, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         validate_request_id(request_id)?;
         let requestless = parse_transaction_unchecked(transaction, 0)?;
         if requestless.request_id.is_some() {
@@ -815,6 +829,7 @@ impl CheckpointStore {
         transaction: &[u8],
         tx: ParsedTransaction,
     ) -> Result<HotWalAppendReport, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         validate_transaction_against_state(&self.state, &tx)?;
         let report = self.hot.append(transaction)?;
         maybe_crash("after-hot-sync-before-memory-publication");
@@ -835,6 +850,7 @@ impl CheckpointStore {
         &mut self,
         checkpoint_count: u64,
     ) -> Result<SealReport, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         if checkpoint_count <= self.manifest.checkpoint_count {
             return Err(format_error(
                 "seal target must advance checkpoint authority",
@@ -949,13 +965,16 @@ impl CheckpointStore {
             &manifest_bytes(&next_manifest)?,
         )?;
         let coexistence = tree_storage(&self.dir)?;
-        let recycle = recycle_hot_file(
+        let recycle = match recycle_hot_file(
             &self.dir,
             &hot_path,
             source_offset,
             parsed.logical_tail,
             self.config,
-        )?;
+        ) {
+            Ok(recycle) => recycle,
+            Err(error) => return Err(self.hot.recovery_required_after_mutation(error)),
+        };
         let suffix_len = parsed.logical_tail.saturating_sub(source_offset);
         self.hot.replace_after_recycle(suffix_len)?;
         self.manifest = next_manifest;
