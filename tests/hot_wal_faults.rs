@@ -131,8 +131,7 @@ fn live_file_backed_hot_wal_faults_recover_to_exact_state() -> Result<(), Box<dy
         assert_kind(&error, CheckpointStoreFailureKind::RecoveryRequired);
         assert!(hot_prefix(temp.path(), 16)?.iter().any(|byte| *byte != 0));
 
-        let blocked =
-            expect_error(store.append_checkpoint("thread", "blocked", 2, None, b"{}"))?;
+        let blocked = expect_error(store.append_checkpoint("thread", "blocked", 2, None, b"{}"))?;
         assert_kind(&blocked, CheckpointStoreFailureKind::RecoveryRequired);
         let local_missing = expect_error(store.read_checkpoint("thread", "partial"))?;
         assert_kind(&local_missing, CheckpointStoreFailureKind::Stale);
@@ -159,10 +158,7 @@ fn live_file_backed_hot_wal_faults_recover_to_exact_state() -> Result<(), Box<dy
             let _fault = FaultEnv::set("flush-eio-after");
             expect_error(store.append_checkpoint("thread", "flush", 1, None, b"{}"))?
         };
-        assert_kind(
-            &error,
-            CheckpointStoreFailureKind::DurabilityIndeterminate,
-        );
+        assert_kind(&error, CheckpointStoreFailureKind::DurabilityIndeterminate);
         assert_eq!(
             error
                 .durability_indeterminate()
@@ -170,8 +166,7 @@ fn live_file_backed_hot_wal_faults_recover_to_exact_state() -> Result<(), Box<dy
                 .operation(),
             DurabilityOperation::WalFlush
         );
-        let blocked =
-            expect_error(store.append_checkpoint("thread", "blocked", 2, None, b"{}"))?;
+        let blocked = expect_error(store.append_checkpoint("thread", "blocked", 2, None, b"{}"))?;
         assert_kind(&blocked, CheckpointStoreFailureKind::RecoveryRequired);
         drop(store);
 
@@ -200,10 +195,7 @@ fn live_file_backed_hot_wal_faults_recover_to_exact_state() -> Result<(), Box<dy
             let _fault = FaultEnv::set("sync-eio-after");
             expect_error(store.append_checkpoint("thread", "synced", 1, None, b"{}"))?
         };
-        assert_kind(
-            &error,
-            CheckpointStoreFailureKind::DurabilityIndeterminate,
-        );
+        assert_kind(&error, CheckpointStoreFailureKind::DurabilityIndeterminate);
         assert_eq!(
             error
                 .durability_indeterminate()
@@ -239,8 +231,7 @@ fn live_file_backed_hot_wal_faults_recover_to_exact_state() -> Result<(), Box<dy
         };
         assert_kind(&error, CheckpointStoreFailureKind::RecoveryRequired);
         assert!(store.hot_capacity_bytes()? > before_capacity);
-        let blocked =
-            expect_error(store.append_checkpoint("thread", "blocked", 2, None, b"{}"))?;
+        let blocked = expect_error(store.append_checkpoint("thread", "blocked", 2, None, b"{}"))?;
         assert_kind(&blocked, CheckpointStoreFailureKind::RecoveryRequired);
         drop(store);
 
