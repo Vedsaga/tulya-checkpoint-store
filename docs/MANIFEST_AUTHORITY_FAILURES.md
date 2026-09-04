@@ -1,8 +1,10 @@
 # Manifest authority failure boundary
 
-Status: staged internal resilience contract. This unit defines the logical
-authority transition before live manifest/rename/directory-sync fault injection
-is accepted.
+Status: accepted internal resilience contract. Rust 1.80 formatting and strict
+feature-enabled Clippy passed; error classification passed 8/8, the committed
+maintenance invariant passed, and the full library suite passed 109/109. Live
+manifest/rename/directory-sync and WAL-recycle fault evidence is staged
+separately in `docs/LIVE_PUBLICATION_FAULT_INJECTION.md`.
 
 ## DECISION
 
@@ -173,6 +175,7 @@ This internal boundary is accepted only after:
   retaining readable committed state;
 - the full library suite and existing crash matrix remain green.
 
-The following unit will add live fault injection for manifest sync/rename/
-directory-sync and post-authority WAL recycle operations. That live evidence is
-required before the broader resilience fault-injection gate can move.
+The live syscall-result matrix is staged in
+`tests/publication_faults.rs` and documented in
+`docs/LIVE_PUBLICATION_FAULT_INJECTION.md`. That evidence must pass before the
+broader resilience fault-injection gate can move.
