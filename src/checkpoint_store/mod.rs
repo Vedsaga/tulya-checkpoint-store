@@ -32,6 +32,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use xxhash_rust::xxh3::{xxh3_64, Xxh3};
 
+use crate::error_classification::recovery_required_after_commit_error;
 use crate::hot_wal_commit::{FileHotWalCommitIo, HotWalCommitter};
 
 mod storage_format;
@@ -697,29 +698,49 @@ impl HotWal {
         }
     }
 
+    fn recovery_required_after_committed_authority(
+        &mut self,
+        error: CheckpointStoreError,
+    ) -> CheckpointStoreError {
+        self.committer.mark_recovery_required();
+        let source = match error {
+            CheckpointStoreError::Io(source) => Some(source),
+            other => Some(io::Error::other(other.to_string())),
+        };
+        recovery_required_after_commit_error(&self.path, source)
+    }
+
     fn replace_after_recycle(&mut self, new_tail: u64) -> Result<(), CheckpointStoreError> {
         self.ensure_writable()?;
         let mut file = match OpenOptions::new().read(true).write(true).open(&self.path) {
             Ok(file) => file,
             Err(source) => {
-                return Err(self
-                    .committer
-                    .recovery_required_error(&self.path, Some(source)));
+                self.committer.mark_recovery_required();
+                return Err(recovery_required_after_commit_error(
+                    &self.path,
+                    Some(source),
+                ));
             }
         };
         if let Err(source) = file.seek(SeekFrom::Start(new_tail)) {
-            return Err(self
-                .committer
-                .recovery_required_error(&self.path, Some(source)));
+            self.committer.mark_recovery_required();
+            return Err(recovery_required_after_commit_error(
+                &self.path,
+                Some(source),
+            ));
         }
         self.file = file;
         self.logical_tail = new_tail;
         Ok(())
     }
 
+    fn poison(&mut self) {
+        self.committer.mark_recovery_required();
+    }
+
     #[cfg(test)]
     fn poison_for_test(&mut self) {
-        self.committer.mark_recovery_required();
+        self.poison();
     }
 }
 
