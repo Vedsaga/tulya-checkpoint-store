@@ -137,7 +137,7 @@ impl CheckpointStore {
         }
     }
 
-    fn committed_maintenance<T>(
+    pub(super) fn committed_maintenance<T>(
         &mut self,
         result: Result<T, CheckpointStoreError>,
     ) -> Result<T, CheckpointStoreError> {
