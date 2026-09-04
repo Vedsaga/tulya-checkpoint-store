@@ -890,8 +890,10 @@ fn preinitialize_range(
     if to <= from {
         return Ok(());
     }
+    #[cfg(feature = "fault-injection")]
     let fault = configured_wal_io_fault()?;
     file.set_len(to)?;
+    #[cfg(feature = "fault-injection")]
     if fault == Some(WalIoFault::ReserveEnospcAfterSetLen) {
         return Err(injected_disk_full_error().into());
     }
