@@ -956,6 +956,9 @@ fn reclaim_unreferenced_generation_files(
     dir: &Path,
     manifest: &Manifest,
 ) -> Result<bool, CheckpointStoreError> {
+    #[cfg(feature = "fault-injection")]
+    let publication_fault = configured_publication_io_fault()?;
+
     let Some(_reclaim_guard) = ReaderReclaimGuard::try_acquire_exclusive(dir)? else {
         return Ok(false);
     };
@@ -981,12 +984,27 @@ fn reclaim_unreferenced_generation_files(
             || (name.starts_with(".route-g") && name.ends_with(".t3r.tmp"))
             || name == ".manifest.json.tmp";
         if generation_artifact && !referenced.contains(name) {
+            #[cfg(feature = "fault-injection")]
+            if publication_fault == Some(PublicationIoFault::PruneReclaimDeleteEioBefore) {
+                return Err(injected_io_error().into());
+            }
+
             fs::remove_file(path)?;
             removed = true;
+
+            #[cfg(feature = "fault-injection")]
+            if publication_fault == Some(PublicationIoFault::PruneReclaimDeleteEioAfter) {
+                return Err(injected_io_error().into());
+            }
         }
     }
     if removed {
         sync_dir(dir)?;
+
+        #[cfg(feature = "fault-injection")]
+        if publication_fault == Some(PublicationIoFault::PruneReclaimDirSyncEioAfter) {
+            return Err(injected_io_error().into());
+        }
     }
     Ok(true)
 }
