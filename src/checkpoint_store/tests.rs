@@ -1532,7 +1532,6 @@ fn recovery_required_writer_blocks_mutations_but_keeps_reads_available(
     Ok(())
 }
 
-
 #[test]
 fn prepared_transaction_apply_does_not_publish_before_commit(
 ) -> Result<(), Box<dyn std::error::Error>> {
