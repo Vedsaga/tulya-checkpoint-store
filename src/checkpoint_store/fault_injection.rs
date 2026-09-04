@@ -131,6 +131,14 @@ pub(crate) const PUBLICATION_IO_FAULT_ENV: &str = "TULYA_CHECKPOINT_STORE_PUBLIC
 #[cfg(feature = "fault-injection")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PublicationIoFault {
+    SegmentSyncEioAfter,
+    SegmentRenameEioBefore,
+    SegmentRenameEioAfter,
+    SegmentDirSyncEioAfter,
+    RouteSyncEioAfter,
+    RouteRenameEioBefore,
+    RouteRenameEioAfter,
+    RouteDirSyncEioAfter,
     ManifestSyncEioAfter,
     ManifestRenameEioBefore,
     ManifestRenameEioAfter,
@@ -153,6 +161,14 @@ pub(crate) fn configured_publication_io_fault() -> io::Result<Option<Publication
         )
     })?;
     let fault = match raw.as_str() {
+        "segment-sync-eio-after" => PublicationIoFault::SegmentSyncEioAfter,
+        "segment-rename-eio-before" => PublicationIoFault::SegmentRenameEioBefore,
+        "segment-rename-eio-after" => PublicationIoFault::SegmentRenameEioAfter,
+        "segment-dir-sync-eio-after" => PublicationIoFault::SegmentDirSyncEioAfter,
+        "route-sync-eio-after" => PublicationIoFault::RouteSyncEioAfter,
+        "route-rename-eio-before" => PublicationIoFault::RouteRenameEioBefore,
+        "route-rename-eio-after" => PublicationIoFault::RouteRenameEioAfter,
+        "route-dir-sync-eio-after" => PublicationIoFault::RouteDirSyncEioAfter,
         "manifest-sync-eio-after" => PublicationIoFault::ManifestSyncEioAfter,
         "manifest-rename-eio-before" => PublicationIoFault::ManifestRenameEioBefore,
         "manifest-rename-eio-after" => PublicationIoFault::ManifestRenameEioAfter,
