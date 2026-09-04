@@ -35,6 +35,8 @@ Failure classification is:
 
 A successful commit performs exactly one successful `sync_data` for the record. There must be no fallible operation after the successful durability barrier and before the caller is told the commit succeeded. In particular, report-only metadata lookups must happen before commit or use already-known values; a post-sync metadata failure must never turn a durable commit into an apparent failed append.
 
+The in-memory state publication follows the same rule. The parsed transaction is validated against current geometry/topology, every affected vector/map is fallibly reserved, and all extra owned keys/records needed for publication are built before the WAL call. After successful `sync_data`, `apply_prepared_transaction` has no `Result`: it only copies/moves the already-prepared delta into already-reserved containers.
+
 ## WHY
 
 A database cannot safely infer commit outcome from a failed durability syscall. Once a complete record has reached the kernel, a flush or sync error can coexist with bytes that later appear during recovery. Continuing to append from the same process state would mix an unacknowledged physical record with an in-memory logical tail that did not advance.
@@ -71,7 +73,7 @@ None. This changes runtime failure handling only. Format v1 bytes, Format-v2 sta
 
 ## Current implementation boundary
 
-`src/hot_wal_commit.rs` contains the commit state machine, the production `File` adapter, and deterministic scripted-I/O unit tests. `CheckpointStore::HotWal::append` now delegates complete-record write/flush/`sync_data` publication to this state machine. Report capacity is determined before the durability barrier, so successful `sync_data` is followed only by infallible in-memory bookkeeping.
+`src/hot_wal_commit.rs` contains the commit state machine, the production `File` adapter, and deterministic scripted-I/O unit tests. `CheckpointStore::HotWal::append` now delegates complete-record write/flush/`sync_data` publication to this state machine. Report capacity is determined before the durability barrier. `prepare_transaction_apply` performs logical validation, fallible capacity reservation, and publication-key construction before WAL mutation; successful `sync_data` is followed by only the infallible prepared-state publication.
 
 `CheckpointStore` mutation entry points refuse append, seal, prune, reidentify, reclaim, or recycle work once the hot writer is recovery-required. Read-only checkpoint access remains available and reflects the last state published into the current process; callers that received `DurabilityIndeterminate` must reopen before treating that process-local view as authoritative.
 
