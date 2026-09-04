@@ -301,29 +301,32 @@ impl CheckpointStore {
                 })
                 .collect(),
         };
-        staged_write_new(
-            &self.dir.join(MANIFEST_FILE),
-            &manifest_bytes(&next_manifest)?,
-        )?;
+        let deleted_checkpoint_count = u64::try_from(deleted_keys.len())
+            .map_err(|_| format_error("deleted checkpoint count overflow"))?;
+        let retained_checkpoint_count = u64::try_from(compacted.state.checkpoints.len())
+            .map_err(|_| format_error("retained checkpoint count overflow"))?;
+        let rewritten_bytes = replacement
+            .finalized
+            .meta
+            .segment_file_bytes
+            .checked_add(replacement.route_meta.route_file_bytes)
+            .ok_or_else(|| format_error("prune rewritten byte count overflow"))?;
         let coexistence = tree_storage(&self.dir)?;
 
+        self.publish_manifest_authority(&next_manifest)?;
         self.manifest = next_manifest;
         self.state = compacted.state;
         self.range_sizes.borrow_mut().clear();
-        reclaim_unreferenced_generation_files(&self.dir, &self.manifest)?;
-        let reclaimed = tree_storage(&self.dir)?;
+
+        let reclaim_result = reclaim_unreferenced_generation_files(&self.dir, &self.manifest);
+        self.committed_maintenance(reclaim_result)?;
+        let reclaimed_result = tree_storage(&self.dir);
+        let reclaimed = self.committed_maintenance(reclaimed_result)?;
         Ok(PruneReport {
             generation,
-            deleted_checkpoint_count: u64::try_from(deleted_keys.len())
-                .map_err(|_| format_error("deleted checkpoint count overflow"))?,
-            retained_checkpoint_count: u64::try_from(self.state.checkpoints.len())
-                .map_err(|_| format_error("retained checkpoint count overflow"))?,
-            rewritten_bytes: replacement
-                .finalized
-                .meta
-                .segment_file_bytes
-                .checked_add(replacement.route_meta.route_file_bytes)
-                .ok_or_else(|| format_error("prune rewritten byte count overflow"))?,
+            deleted_checkpoint_count,
+            retained_checkpoint_count,
+            rewritten_bytes,
             before,
             coexistence,
             reclaimed,
