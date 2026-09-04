@@ -90,7 +90,7 @@ impl HotWalCommitIo for FileHotWalCommitIo<'_> {
                 _ => self.file.write(bytes)?,
             };
             self.record_fault_write(count)?;
-            return Ok(count);
+            Ok(count)
         }
 
         #[cfg(not(feature = "fault-injection"))]
