@@ -1715,6 +1715,10 @@ fn assert_no_generation_artifacts(
             !name.contains(&needle),
             "unexpected unreferenced generation artifact after reopen: {name}"
         );
+        assert_ne!(
+            name, ".manifest.json.tmp",
+            "reopen left the staged manifest temporary file behind"
+        );
     }
     Ok(())
 }
@@ -1886,6 +1890,11 @@ fn run_prune_new_authority_indeterminate_fault(
         store.read_checkpoint("thread", "C")?,
         b"{\"identity\":{\"deleted\":true},\"messages\":[]}"
     );
+    assert!(matches!(
+        store.append_encoded_transaction(&tx_c),
+        Err(error)
+            if error.failure_kind() == crate::CheckpointStoreFailureKind::RecoveryRequired
+    ));
     drop(store);
 
     let mut reopened = CheckpointStore::open(temp.path(), CheckpointStoreConfig::default())?;
