@@ -517,9 +517,7 @@ mod tests {
         state
             .request_records
             .insert(b"req-1".to_vec(), active.clone());
-        state
-            .retired_requests
-            .insert(b"req-1".to_vec(), [0x22; 32]);
+        state.retired_requests.insert(b"req-1".to_vec(), [0x22; 32]);
 
         assert_eq!(
             state.retire_request(b"req-1"),
@@ -527,7 +525,10 @@ mod tests {
                 "v2 request identity is already retired"
             ))
         );
-        assert_eq!(state.request_records.get(b"req-1".as_slice()), Some(&active));
+        assert_eq!(
+            state.request_records.get(b"req-1".as_slice()),
+            Some(&active)
+        );
         assert_eq!(
             state.retired_requests.get(b"req-1".as_slice()),
             Some(&[0x22; 32])
@@ -544,7 +545,10 @@ mod tests {
         apply_v2_commit(&mut state, &encoded).unwrap();
         state.retire_request(b"req-1").unwrap();
         assert!(!state.request_records.contains_key(b"req-1".as_slice()));
-        assert_eq!(state.retired_requests.get(b"req-1".as_slice()), Some(&digest));
+        assert_eq!(
+            state.retired_requests.get(b"req-1".as_slice()),
+            Some(&digest)
+        );
         assert_eq!(
             state.classify_request(b"req-1", digest),
             Ok(V2RequestStatus::Retired)
