@@ -53,15 +53,25 @@ after close/reopen.
 `manifest-sync-eio-after` performs the real manifest temporary-file
 `sync_all` and then returns EIO before rename.
 
-Expected behavior:
+Expected behavior for a generation-changing seal/prune:
 
-- result is definite ordinary `Io`;
+- logical authority is definitely old;
 - `DurabilityIndeterminate` is absent;
-- the writer is not poisoned;
-- process and reopen both retain old manifest authority;
-- ordinary hot-WAL mutation remains possible.
+- the result is pre-authority `RecoveryRequired` with
+  `authority_committed() == false`;
+- the writer is poisoned because segment/route generation artifacts were
+  already published and the generation name must not be reused before cleanup;
+- reopen retains old manifest authority and removes unreferenced generation
+  artifacts;
+- mutation may resume only after reopen.
 
-The synchronized temporary manifest is not authority.
+The synchronized temporary manifest is not authority. The recovery requirement
+comes from already-published immutable generation files, not from uncertainty
+about manifest authority itself.
+
+For manifest-only operations such as store re-identification or initial
+manifest creation, this generation-orphan rule does not apply because no
+segment/route generation artifacts precede the manifest write.
 
 ### Rename error before the real rename
 
@@ -143,6 +153,8 @@ Rejected because a crash has no returned error object and cannot verify
 ### Mark manifest temporary-file sync failure indeterminate
 
 Rejected because the temporary file is not authority and has not been renamed.
+For generation-changing operations the writer still requires reopen, but that
+is pre-authority `RecoveryRequired`, not `DurabilityIndeterminate`.
 
 ### Return success after WAL recycle maintenance fails
 
