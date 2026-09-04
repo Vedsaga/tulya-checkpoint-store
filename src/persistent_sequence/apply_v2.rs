@@ -22,6 +22,7 @@ pub(super) enum V2ApplyError {
     Publication(V2PublicationError),
     Invalid(&'static str),
     Overflow(&'static str),
+    Capacity(&'static str),
     RequestConflict,
 }
 
@@ -31,7 +32,9 @@ impl fmt::Display for V2ApplyError {
             Self::Commit(error) => write!(formatter, "{error}"),
             Self::Format(error) => write!(formatter, "{error}"),
             Self::Publication(error) => write!(formatter, "{error}"),
-            Self::Invalid(message) | Self::Overflow(message) => formatter.write_str(message),
+            Self::Invalid(message) | Self::Overflow(message) | Self::Capacity(message) => {
+                formatter.write_str(message)
+            }
             Self::RequestConflict => formatter.write_str(
                 "v2 request identity was already used for a different logical operation",
             ),
@@ -132,21 +135,31 @@ impl V2CommittedState {
 
     pub(super) fn retire_request(&mut self, request_id: &[u8]) -> Result<(), V2ApplyError> {
         validate_request_id(request_id)?;
-        let record = self
-            .request_records
-            .remove(request_id)
-            .ok_or(V2ApplyError::Invalid(
-                "v2 active request identity is absent",
-            ))?;
-        if self
-            .retired_requests
-            .insert(request_id.to_vec(), record.operation_digest)
-            .is_some()
-        {
+        if self.retired_requests.contains_key(request_id) {
             return Err(V2ApplyError::Invalid(
                 "v2 request identity is already retired",
             ));
         }
+
+        let operation_digest = self
+            .request_records
+            .get(request_id)
+            .ok_or(V2ApplyError::Invalid(
+                "v2 active request identity is absent",
+            ))?
+            .operation_digest;
+
+        let mut retired_key = Vec::new();
+        retired_key
+            .try_reserve_exact(request_id.len())
+            .map_err(|_| V2ApplyError::Capacity("v2 retired request key allocation failed"))?;
+        retired_key.extend_from_slice(request_id);
+        self.retired_requests
+            .try_reserve(1)
+            .map_err(|_| V2ApplyError::Capacity("v2 retired request map allocation failed"))?;
+
+        let _ = self.request_records.remove(request_id);
+        let _ = self.retired_requests.insert(retired_key, operation_digest);
         Ok(())
     }
 }
@@ -491,6 +504,33 @@ mod tests {
         assert_eq!(
             apply_v2_commit(&mut state, &conflict),
             Err(V2ApplyError::RequestConflict)
+        );
+    }
+
+    #[test]
+    fn retire_request_is_fail_atomic_when_ledgers_overlap() {
+        let mut state = V2CommittedState::default();
+        let active = V2RequestRecord {
+            operation_digest: [0x11; 32],
+            checkpoint_ordinal: 7,
+        };
+        state
+            .request_records
+            .insert(b"req-1".to_vec(), active.clone());
+        state
+            .retired_requests
+            .insert(b"req-1".to_vec(), [0x22; 32]);
+
+        assert_eq!(
+            state.retire_request(b"req-1"),
+            Err(V2ApplyError::Invalid(
+                "v2 request identity is already retired"
+            ))
+        );
+        assert_eq!(state.request_records.get(b"req-1".as_slice()), Some(&active));
+        assert_eq!(
+            state.retired_requests.get(b"req-1".as_slice()),
+            Some(&[0x22; 32])
         );
     }
 
