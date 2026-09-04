@@ -4,10 +4,10 @@
 //! so short writes and durability failures can be tested deterministically
 //! before the abstraction is wired into the production `HotWal` handle.
 
+use crate::checkpoint_store::CheckpointStoreError;
 use crate::error_classification::{
     durability_indeterminate_error, recovery_required_error, DurabilityOperation,
 };
-use crate::checkpoint_store::CheckpointStoreError;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
