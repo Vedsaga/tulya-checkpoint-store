@@ -1604,3 +1604,396 @@ fn committed_maintenance_poisoning_reports_committed_authority(
     );
     Ok(())
 }
+
+
+#[cfg(feature = "fault-injection")]
+struct PruneFaultEnv {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(feature = "fault-injection")]
+impl PruneFaultEnv {
+    fn clear(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        Self { key, previous }
+    }
+
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+impl Drop for PruneFaultEnv {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+struct PruneFaultFixture {
+    temp: tempfile::TempDir,
+    store: CheckpointStore,
+    tx_c: Vec<u8>,
+    conflicting_c: Vec<u8>,
+}
+
+#[cfg(feature = "fault-injection")]
+fn prune_fault_fixture() -> Result<PruneFaultFixture, Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let config = CheckpointStoreConfig::default();
+    let mut store = CheckpointStore::open(temp.path(), config)?;
+
+    let tx_a = transaction_for_thread(0, 1, 0, 0, b"{}", "thread", "A", None);
+    store.append_encoded_transaction(&tx_a)?;
+    let tx_b =
+        transaction_for_thread(1, 2, 2, 1, b"{\"base\":true}", "thread", "B", Some("A"));
+    store.append_encoded_transaction(&tx_b)?;
+    let tx_c = transaction_for_thread(
+        2,
+        3,
+        15,
+        2,
+        b"{\"deleted\":true}",
+        "thread",
+        "C",
+        Some("B"),
+    );
+    store.append_encoded_transaction_with_request_id(b"request-c", &tx_c)?;
+    let tx_d = transaction_for_thread(
+        3,
+        4,
+        31,
+        3,
+        b"{\"sibling\":true}",
+        "thread",
+        "D",
+        Some("B"),
+    );
+    store.append_encoded_transaction(&tx_d)?;
+    store.seal_through(4)?;
+
+    let conflicting_c = transaction_for_thread(
+        2,
+        3,
+        15,
+        2,
+        b"{\"different\":true}",
+        "thread",
+        "C",
+        Some("B"),
+    );
+
+    Ok(PruneFaultFixture {
+        temp,
+        store,
+        tx_c,
+        conflicting_c,
+    })
+}
+
+#[cfg(feature = "fault-injection")]
+fn assert_no_generation_artifacts(
+    dir: &Path,
+    generation: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let needle = format!("g{generation:06}");
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .ok_or("generation artifact filename is not UTF-8")?;
+        assert!(
+            !name.contains(&needle),
+            "unexpected unreferenced generation artifact after reopen: {name}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "fault-injection")]
+fn assert_pruned_identity_and_request_stay_retired(
+    store: &mut CheckpointStore,
+    tx_c: &[u8],
+    conflicting_c: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert!(matches!(
+        store.read_checkpoint("thread", "C"),
+        Err(CheckpointStoreError::CheckpointDeleted)
+    ));
+    assert!(matches!(
+        store.append_encoded_transaction(tx_c),
+        Err(CheckpointStoreError::CheckpointDeleted)
+    ));
+    assert!(matches!(
+        store.append_encoded_transaction_with_request_id(b"request-c", tx_c),
+        Err(CheckpointStoreError::CheckpointDeleted)
+    ));
+    assert!(matches!(
+        store.append_encoded_transaction_with_request_id(b"request-c", conflicting_c),
+        Err(CheckpointStoreError::RequestIdConflict)
+    ));
+    Ok(())
+}
+
+#[cfg(feature = "fault-injection")]
+fn append_after_prune(store: &mut CheckpointStore) -> Result<(), Box<dyn std::error::Error>> {
+    let next = transaction_for_thread(
+        u32::try_from(store.version_count())?,
+        u32::try_from(store.checkpoint_count() + 1)?,
+        u64::try_from(store.state.arena_bytes.len())?,
+        u64::try_from(store.state.compact_nodes.len() / COMPACT_NODE_SIZE)?,
+        b"{\"post\":true}",
+        "thread",
+        "E",
+        Some("D"),
+    );
+    store.append_encoded_transaction(&next)?;
+    assert_eq!(
+        store.read_checkpoint("thread", "E")?,
+        b"{\"identity\":{\"post\":true},\"messages\":[]}"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "fault-injection")]
+fn run_prune_old_authority_fault(
+    fault: &str,
+    durability: Option<DurabilityOperation>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const PUBLICATION_FAULT_ENV: &str = "TULYA_CHECKPOINT_STORE_PUBLICATION_IO_FAULT";
+
+    let PruneFaultFixture {
+        temp,
+        mut store,
+        tx_c,
+        conflicting_c,
+    } = prune_fault_fixture()?;
+
+    let error = {
+        let _fault = PruneFaultEnv::set(PUBLICATION_FAULT_ENV, fault);
+        match store.delete_checkpoint_subtree("thread", "C") {
+            Ok(_) => return Err(format!("prune fault {fault} unexpectedly succeeded").into()),
+            Err(error) => error,
+        }
+    };
+
+    if let Some(operation) = durability {
+        assert_eq!(
+            error.failure_kind(),
+            crate::CheckpointStoreFailureKind::DurabilityIndeterminate
+        );
+        assert_eq!(
+            error
+                .durability_indeterminate()
+                .ok_or("missing prune durability context")?
+                .operation(),
+            operation
+        );
+    } else {
+        assert_eq!(
+            error.failure_kind(),
+            crate::CheckpointStoreFailureKind::RecoveryRequired
+        );
+        assert!(!error
+            .recovery_required()
+            .ok_or("missing pre-authority prune recovery context")?
+            .authority_committed());
+    }
+
+    assert_eq!(store.manifest.generation, 1);
+    assert_eq!(
+        store.read_checkpoint("thread", "C")?,
+        b"{\"identity\":{\"deleted\":true},\"messages\":[]}"
+    );
+    assert!(matches!(
+        store.append_encoded_transaction(&tx_c),
+        Err(error)
+            if error.failure_kind() == crate::CheckpointStoreFailureKind::RecoveryRequired
+    ));
+    drop(store);
+
+    let mut reopened = CheckpointStore::open(temp.path(), CheckpointStoreConfig::default())?;
+    assert_eq!(reopened.manifest.generation, 1);
+    assert_eq!(
+        reopened.read_checkpoint("thread", "C")?,
+        b"{\"identity\":{\"deleted\":true},\"messages\":[]}"
+    );
+    assert!(matches!(
+        reopened.append_encoded_transaction_with_request_id(b"request-c", &tx_c)?,
+        CheckpointStoreAppendOutcome::AlreadyCommitted
+    ));
+    assert_no_generation_artifacts(temp.path(), 2)?;
+    assert_eq!(reopened.verify_all()?.failures, 0);
+
+    reopened.delete_checkpoint_subtree("thread", "C")?;
+    assert_pruned_identity_and_request_stay_retired(&mut reopened, &tx_c, &conflicting_c)?;
+    drop(reopened);
+
+    let mut final_reopen = CheckpointStore::open(temp.path(), CheckpointStoreConfig::default())?;
+    assert_eq!(final_reopen.manifest.generation, 2);
+    assert_pruned_identity_and_request_stay_retired(&mut final_reopen, &tx_c, &conflicting_c)?;
+    assert_eq!(final_reopen.verify_all()?.failures, 0);
+    append_after_prune(&mut final_reopen)?;
+    Ok(())
+}
+
+#[cfg(feature = "fault-injection")]
+fn run_prune_new_authority_indeterminate_fault(
+    fault: &str,
+    operation: DurabilityOperation,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const PUBLICATION_FAULT_ENV: &str = "TULYA_CHECKPOINT_STORE_PUBLICATION_IO_FAULT";
+
+    let PruneFaultFixture {
+        temp,
+        mut store,
+        tx_c,
+        conflicting_c,
+    } = prune_fault_fixture()?;
+
+    let error = {
+        let _fault = PruneFaultEnv::set(PUBLICATION_FAULT_ENV, fault);
+        match store.delete_checkpoint_subtree("thread", "C") {
+            Ok(_) => return Err(format!("prune fault {fault} unexpectedly succeeded").into()),
+            Err(error) => error,
+        }
+    };
+    assert_eq!(
+        error.failure_kind(),
+        crate::CheckpointStoreFailureKind::DurabilityIndeterminate
+    );
+    assert_eq!(
+        error
+            .durability_indeterminate()
+            .ok_or("missing prune durability context")?
+            .operation(),
+        operation
+    );
+
+    // Publication returned an indeterminate error, so process-local deletion
+    // state is not published. Reopen is the authority resolver.
+    assert_eq!(store.manifest.generation, 1);
+    assert_eq!(
+        store.read_checkpoint("thread", "C")?,
+        b"{\"identity\":{\"deleted\":true},\"messages\":[]}"
+    );
+    drop(store);
+
+    let mut reopened = CheckpointStore::open(temp.path(), CheckpointStoreConfig::default())?;
+    assert_eq!(reopened.manifest.generation, 2);
+    assert_pruned_identity_and_request_stay_retired(&mut reopened, &tx_c, &conflicting_c)?;
+    assert_no_generation_artifacts(temp.path(), 1)?;
+    assert_eq!(reopened.verify_all()?.failures, 0);
+    append_after_prune(&mut reopened)?;
+    Ok(())
+}
+
+#[cfg(feature = "fault-injection")]
+fn run_prune_post_authority_reclaim_fault(
+    fault: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const PUBLICATION_FAULT_ENV: &str = "TULYA_CHECKPOINT_STORE_PUBLICATION_IO_FAULT";
+
+    let PruneFaultFixture {
+        temp,
+        mut store,
+        tx_c,
+        conflicting_c,
+    } = prune_fault_fixture()?;
+
+    let error = {
+        let _fault = PruneFaultEnv::set(PUBLICATION_FAULT_ENV, fault);
+        match store.delete_checkpoint_subtree("thread", "C") {
+            Ok(_) => return Err(format!("prune fault {fault} unexpectedly succeeded").into()),
+            Err(error) => error,
+        }
+    };
+
+    assert_eq!(
+        error.failure_kind(),
+        crate::CheckpointStoreFailureKind::RecoveryRequired
+    );
+    let context = error
+        .recovery_required()
+        .ok_or("missing committed prune recovery context")?;
+    assert!(context.authority_committed());
+    assert_eq!(context.path(), temp.path());
+
+    // Deletion authority is already reflected in process memory before
+    // reclamation starts.
+    assert_eq!(store.manifest.generation, 2);
+    assert!(matches!(
+        store.read_checkpoint("thread", "C"),
+        Err(CheckpointStoreError::CheckpointDeleted)
+    ));
+    assert!(matches!(
+        store.append_encoded_transaction(&tx_c),
+        Err(error)
+            if error.failure_kind() == crate::CheckpointStoreFailureKind::RecoveryRequired
+    ));
+    drop(store);
+
+    let mut reopened = CheckpointStore::open(temp.path(), CheckpointStoreConfig::default())?;
+    assert_eq!(reopened.manifest.generation, 2);
+    assert_pruned_identity_and_request_stay_retired(&mut reopened, &tx_c, &conflicting_c)?;
+    assert_no_generation_artifacts(temp.path(), 1)?;
+    assert_eq!(reopened.verify_all()?.failures, 0);
+    append_after_prune(&mut reopened)?;
+    Ok(())
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn live_prune_faults_preserve_tombstone_authority() -> Result<(), Box<dyn std::error::Error>> {
+    const PUBLICATION_FAULT_ENV: &str = "TULYA_CHECKPOINT_STORE_PUBLICATION_IO_FAULT";
+    const WAL_FAULT_ENV: &str = "TULYA_CHECKPOINT_STORE_WAL_IO_FAULT";
+
+    let _clean_publication = PruneFaultEnv::clear(PUBLICATION_FAULT_ENV);
+    let _clean_wal = PruneFaultEnv::clear(WAL_FAULT_ENV);
+
+    for fault in [
+        "segment-sync-eio-after",
+        "segment-rename-eio-before",
+        "segment-rename-eio-after",
+        "segment-dir-sync-eio-after",
+        "route-sync-eio-after",
+        "route-rename-eio-before",
+        "route-rename-eio-after",
+        "route-dir-sync-eio-after",
+        "manifest-sync-eio-after",
+    ] {
+        run_prune_old_authority_fault(fault, None)?;
+    }
+
+    run_prune_old_authority_fault(
+        "manifest-rename-eio-before",
+        Some(DurabilityOperation::Rename),
+    )?;
+    run_prune_new_authority_indeterminate_fault(
+        "manifest-rename-eio-after",
+        DurabilityOperation::Rename,
+    )?;
+    run_prune_new_authority_indeterminate_fault(
+        "manifest-dir-sync-eio-after",
+        DurabilityOperation::DirectorySync,
+    )?;
+
+    for fault in [
+        "prune-reclaim-delete-eio-before",
+        "prune-reclaim-delete-eio-after",
+        "prune-reclaim-dir-sync-eio-after",
+    ] {
+        run_prune_post_authority_reclaim_fault(fault)?;
+    }
+
+    Ok(())
+}
