@@ -85,8 +85,9 @@ impl CheckpointStore {
             }
         }
 
-        for tx in &txs {
-            apply_transaction(&mut state, tx)?;
+        for tx in txs {
+            let prepared = prepare_transaction_apply(&mut state, tx)?;
+            apply_prepared_transaction(&mut state, prepared);
         }
         let hot = HotWal::open_at(&hot_path, normalized_tail, config)?;
         let store = Self {
