@@ -1,6 +1,6 @@
 # Hot-WAL commit failure state machine
 
-Status: production-wired resilience contract for foreground hot-WAL commit publication. Live syscall fault injection remains a separate acceptance unit.
+Status: production-wired resilience contract for foreground hot-WAL commit publication. A live file-backed hot-WAL fault matrix is staged in `tests/hot_wal_faults.rs`; local verification is still required.
 
 ## DECISION
 
@@ -77,4 +77,4 @@ None. This changes runtime failure handling only. Format v1 bytes, Format-v2 sta
 
 `CheckpointStore` mutation entry points refuse append, seal, prune, reidentify, reclaim, or recycle work once the hot writer is recovery-required. Read-only checkpoint access remains available and reflects the last state published into the current process; callers that received `DurabilityIndeterminate` must reopen before treating that process-local view as authoritative.
 
-The next acceptance unit injects failures through the live file-backed path, including short/partial writes, ENOSPC, flush/`sync_data` failures, reserve-extension failure, and reopen normalization. Publication/manifest/rename/directory-sync fault semantics remain a separate durability unit.
+`docs/LIVE_HOT_WAL_FAULT_INJECTION.md` defines the staged live file-backed matrix for short/partial writes, ENOSPC, flush/`sync_data` failures, reserve-extension failure, writer poisoning, and reopen normalization. Publication/manifest/rename/directory-sync fault semantics remain a separate durability unit.
