@@ -124,3 +124,51 @@ pub(crate) fn injected_io_error() -> io::Error {
 pub(crate) fn injected_io_error() -> io::Error {
     io::Error::other("injected hot WAL I/O failure")
 }
+
+
+#[cfg(feature = "fault-injection")]
+pub(crate) const PUBLICATION_IO_FAULT_ENV: &str =
+    "TULYA_CHECKPOINT_STORE_PUBLICATION_IO_FAULT";
+
+#[cfg(feature = "fault-injection")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicationIoFault {
+    ManifestSyncEioAfter,
+    ManifestRenameEioBefore,
+    ManifestRenameEioAfter,
+    ManifestDirSyncEioAfter,
+    WalRecycleSyncEioAfter,
+    WalRecycleRenameEioBefore,
+    WalRecycleRenameEioAfter,
+    WalRecycleDirSyncEioAfter,
+}
+
+#[cfg(feature = "fault-injection")]
+pub(crate) fn configured_publication_io_fault() -> io::Result<Option<PublicationIoFault>> {
+    let Some(raw) = std::env::var_os(PUBLICATION_IO_FAULT_ENV) else {
+        return Ok(None);
+    };
+    let raw = raw.into_string().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "publication fault-injection value is not UTF-8",
+        )
+    })?;
+    let fault = match raw.as_str() {
+        "manifest-sync-eio-after" => PublicationIoFault::ManifestSyncEioAfter,
+        "manifest-rename-eio-before" => PublicationIoFault::ManifestRenameEioBefore,
+        "manifest-rename-eio-after" => PublicationIoFault::ManifestRenameEioAfter,
+        "manifest-dir-sync-eio-after" => PublicationIoFault::ManifestDirSyncEioAfter,
+        "wal-recycle-sync-eio-after" => PublicationIoFault::WalRecycleSyncEioAfter,
+        "wal-recycle-rename-eio-before" => PublicationIoFault::WalRecycleRenameEioBefore,
+        "wal-recycle-rename-eio-after" => PublicationIoFault::WalRecycleRenameEioAfter,
+        "wal-recycle-dir-sync-eio-after" => PublicationIoFault::WalRecycleDirSyncEioAfter,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unknown publication fault-injection value",
+            ));
+        }
+    };
+    Ok(Some(fault))
+}
