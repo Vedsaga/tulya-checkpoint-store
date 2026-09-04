@@ -68,8 +68,9 @@ pub fn fsck(dir: impl AsRef<Path>) -> Result<FsckReport, CheckpointStoreError> {
         })?
         .len();
     let hot = parse_hot_prefix(&hot_path, Geometry::from_manifest(&manifest)?)?;
-    for transaction in &hot.transactions {
-        apply_transaction(&mut state, transaction)?;
+    for transaction in hot.transactions {
+        let prepared = prepare_transaction_apply(&mut state, transaction)?;
+        apply_prepared_transaction(&mut state, prepared);
     }
     validate_materialized_state(&state)?;
 

@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileExt as PositionalFileExt, MetadataExt};
@@ -32,10 +32,16 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use xxhash_rust::xxh3::{xxh3_64, Xxh3};
 
+use crate::error_classification::{
+    durability_indeterminate_error, recovery_required_after_commit_error, recovery_required_error,
+    DurabilityOperation,
+};
+use crate::hot_wal_commit::{FileHotWalCommitIo, HotWalCommitter};
+
 mod storage_format;
 use storage_format::*;
 
-mod fault_injection;
+pub(crate) mod fault_injection;
 use fault_injection::*;
 
 mod fsck;
@@ -550,6 +556,7 @@ pub struct HotWal {
     file: File,
     logical_tail: u64,
     config: CheckpointStoreConfig,
+    committer: HotWalCommitter,
 }
 
 impl HotWal {
@@ -604,6 +611,7 @@ impl HotWal {
             file,
             logical_tail,
             config,
+            committer: HotWalCommitter::default(),
         })
     }
 
@@ -617,6 +625,7 @@ impl HotWal {
         &mut self,
         transaction: &[u8],
     ) -> Result<HotWalAppendReport, CheckpointStoreError> {
+        self.ensure_writable()?;
         let tx_len = u64::try_from(transaction.len())
             .map_err(|_| format_error("transaction length does not fit u64"))?;
         let required_tail = self
@@ -624,31 +633,37 @@ impl HotWal {
             .checked_add(tx_len)
             .ok_or_else(|| format_error("WAL logical tail overflow"))?;
         let current_capacity = self.file.metadata()?.len();
-        if required_tail > current_capacity {
+        let capacity_bytes = if required_tail > current_capacity {
             let new_capacity = round_capacity(required_tail, self.config.wal_segment_bytes)?;
-            preinitialize_range(
+            if let Err(error) = preinitialize_range(
                 &mut self.file,
                 current_capacity,
                 new_capacity,
                 self.config.preinit_chunk_bytes,
-            )?;
-            self.file.seek(SeekFrom::Start(self.logical_tail))?;
-        }
+            ) {
+                return Err(self.recovery_required_after_mutation(error));
+            }
+            if let Err(source) = self.file.seek(SeekFrom::Start(self.logical_tail)) {
+                return Err(self
+                    .committer
+                    .recovery_required_error(&self.path, Some(source)));
+            }
+            new_capacity
+        } else {
+            current_capacity
+        };
 
-        let write_started = Instant::now();
-        self.file.write_all(transaction)?;
-        self.file.flush()?;
-        let write_ns = write_started.elapsed().as_nanos();
-        let sync_started = Instant::now();
-        self.file.sync_data()?;
-        let sync_data_ns = sync_started.elapsed().as_nanos();
+        let timings = {
+            let mut io = FileHotWalCommitIo::new(&mut self.file)?;
+            self.committer.commit(&self.path, &mut io, transaction)?
+        };
         self.logical_tail = required_tail;
         Ok(HotWalAppendReport {
             transaction_bytes: tx_len,
             logical_tail_bytes: required_tail,
-            capacity_bytes: self.file.metadata()?.len(),
-            write_ns,
-            sync_data_ns,
+            capacity_bytes,
+            write_ns: timings.write_ns,
+            sync_data_ns: timings.sync_data_ns,
         })
     }
 
@@ -667,11 +682,68 @@ impl HotWal {
         Ok(self.file.metadata()?.len())
     }
 
+    fn ensure_writable(&self) -> Result<(), CheckpointStoreError> {
+        self.committer.ensure_writable(&self.path)
+    }
+
+    fn recovery_required_after_mutation(
+        &mut self,
+        error: CheckpointStoreError,
+    ) -> CheckpointStoreError {
+        match error {
+            CheckpointStoreError::Io(source) => self
+                .committer
+                .recovery_required_error(&self.path, Some(source)),
+            other => {
+                self.committer.mark_recovery_required();
+                other
+            }
+        }
+    }
+
+    fn recovery_required_after_committed_authority(
+        &mut self,
+        error: CheckpointStoreError,
+    ) -> CheckpointStoreError {
+        self.committer.mark_recovery_required();
+        let source = match error {
+            CheckpointStoreError::Io(source) => Some(source),
+            other => Some(io::Error::other(other.to_string())),
+        };
+        recovery_required_after_commit_error(&self.path, source)
+    }
+
     fn replace_after_recycle(&mut self, new_tail: u64) -> Result<(), CheckpointStoreError> {
-        self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        self.ensure_writable()?;
+        let mut file = match OpenOptions::new().read(true).write(true).open(&self.path) {
+            Ok(file) => file,
+            Err(source) => {
+                self.committer.mark_recovery_required();
+                return Err(recovery_required_after_commit_error(
+                    &self.path,
+                    Some(source),
+                ));
+            }
+        };
+        if let Err(source) = file.seek(SeekFrom::Start(new_tail)) {
+            self.committer.mark_recovery_required();
+            return Err(recovery_required_after_commit_error(
+                &self.path,
+                Some(source),
+            ));
+        }
+        self.file = file;
         self.logical_tail = new_tail;
-        self.file.seek(SeekFrom::Start(new_tail))?;
         Ok(())
+    }
+
+    fn poison(&mut self) {
+        self.committer.mark_recovery_required();
+    }
+
+    #[cfg(test)]
+    fn poison_for_test(&mut self) {
+        self.poison();
     }
 }
 
@@ -683,6 +755,7 @@ pub struct CheckpointStore {
     dir: PathBuf,
     config: CheckpointStoreConfig,
     manifest: Manifest,
+    store_id: StoreId,
     state: StoreState,
     _writer_lock: WriterLock,
     hot: HotWal,
@@ -841,7 +914,13 @@ fn preinitialize_range(
     if to <= from {
         return Ok(());
     }
+    #[cfg(feature = "fault-injection")]
+    let fault = configured_wal_io_fault()?;
     file.set_len(to)?;
+    #[cfg(feature = "fault-injection")]
+    if fault == Some(WalIoFault::ReserveEnospcAfterSetLen) {
+        return Err(injected_disk_full_error().into());
+    }
     file.seek(SeekFrom::Start(from))?;
     let zeros = vec![0u8; chunk_bytes];
     let mut cursor = from;
@@ -877,6 +956,9 @@ fn reclaim_unreferenced_generation_files(
     dir: &Path,
     manifest: &Manifest,
 ) -> Result<bool, CheckpointStoreError> {
+    #[cfg(feature = "fault-injection")]
+    let publication_fault = configured_publication_io_fault()?;
+
     let Some(_reclaim_guard) = ReaderReclaimGuard::try_acquire_exclusive(dir)? else {
         return Ok(false);
     };
@@ -902,12 +984,27 @@ fn reclaim_unreferenced_generation_files(
             || (name.starts_with(".route-g") && name.ends_with(".t3r.tmp"))
             || name == ".manifest.json.tmp";
         if generation_artifact && !referenced.contains(name) {
+            #[cfg(feature = "fault-injection")]
+            if publication_fault == Some(PublicationIoFault::PruneReclaimDeleteEioBefore) {
+                return Err(injected_io_error().into());
+            }
+
             fs::remove_file(path)?;
             removed = true;
+
+            #[cfg(feature = "fault-injection")]
+            if publication_fault == Some(PublicationIoFault::PruneReclaimDeleteEioAfter) {
+                return Err(injected_io_error().into());
+            }
         }
     }
     if removed {
         sync_dir(dir)?;
+
+        #[cfg(feature = "fault-injection")]
+        if publication_fault == Some(PublicationIoFault::PruneReclaimDirSyncEioAfter) {
+            return Err(injected_io_error().into());
+        }
     }
     Ok(true)
 }
@@ -1075,28 +1172,214 @@ fn tmp_path_for(path: &Path) -> Result<PathBuf, CheckpointStoreError> {
     Ok(parent.join(format!(".{name}.tmp")))
 }
 
-fn publish_existing_tmp(tmp: &Path, final_path: &Path) -> Result<(), CheckpointStoreError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicationRole {
+    Artifact,
+    ManifestAuthority,
+}
+
+#[cfg(feature = "fault-injection")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactPublicationFaultStage {
+    SyncAfter,
+    RenameBefore,
+    RenameAfter,
+    DirectorySyncAfter,
+}
+
+#[cfg(feature = "fault-injection")]
+fn artifact_publication_fault_matches(
+    final_path: &Path,
+    fault: Option<PublicationIoFault>,
+    stage: ArtifactPublicationFaultStage,
+) -> bool {
+    let Some(name) = final_path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let is_segment = name.starts_with("structured-g") && name.ends_with(".t3s");
+    let is_route = name.starts_with("route-g") && name.ends_with(".t3r");
+    matches!(
+        (is_segment, is_route, stage, fault),
+        (
+            true,
+            false,
+            ArtifactPublicationFaultStage::SyncAfter,
+            Some(PublicationIoFault::SegmentSyncEioAfter)
+        ) | (
+            true,
+            false,
+            ArtifactPublicationFaultStage::RenameBefore,
+            Some(PublicationIoFault::SegmentRenameEioBefore)
+        ) | (
+            true,
+            false,
+            ArtifactPublicationFaultStage::RenameAfter,
+            Some(PublicationIoFault::SegmentRenameEioAfter)
+        ) | (
+            true,
+            false,
+            ArtifactPublicationFaultStage::DirectorySyncAfter,
+            Some(PublicationIoFault::SegmentDirSyncEioAfter)
+        ) | (
+            false,
+            true,
+            ArtifactPublicationFaultStage::SyncAfter,
+            Some(PublicationIoFault::RouteSyncEioAfter)
+        ) | (
+            false,
+            true,
+            ArtifactPublicationFaultStage::RenameBefore,
+            Some(PublicationIoFault::RouteRenameEioBefore)
+        ) | (
+            false,
+            true,
+            ArtifactPublicationFaultStage::RenameAfter,
+            Some(PublicationIoFault::RouteRenameEioAfter)
+        ) | (
+            false,
+            true,
+            ArtifactPublicationFaultStage::DirectorySyncAfter,
+            Some(PublicationIoFault::RouteDirSyncEioAfter)
+        )
+    )
+}
+
+fn publish_existing_tmp_with_role(
+    tmp: &Path,
+    final_path: &Path,
+    role: PublicationRole,
+) -> Result<(), CheckpointStoreError> {
     if !tmp.exists() {
         return Err(format_error("staged temporary file is missing"));
     }
+    #[cfg(feature = "fault-injection")]
+    let publication_fault = configured_publication_io_fault()?;
+
     OpenOptions::new()
         .read(true)
         .write(true)
         .open(tmp)?
         .sync_all()?;
     maybe_file_crash(final_path, "sync");
-    fs::rename(tmp, final_path)?;
+
+    #[cfg(feature = "fault-injection")]
+    if role == PublicationRole::Artifact
+        && artifact_publication_fault_matches(
+            final_path,
+            publication_fault,
+            ArtifactPublicationFaultStage::SyncAfter,
+        )
+    {
+        return Err(injected_io_error().into());
+    }
+
+    #[cfg(feature = "fault-injection")]
+    if role == PublicationRole::ManifestAuthority
+        && publication_fault == Some(PublicationIoFault::ManifestSyncEioAfter)
+    {
+        return Err(injected_io_error().into());
+    }
+
+    #[cfg(feature = "fault-injection")]
+    if role == PublicationRole::Artifact
+        && artifact_publication_fault_matches(
+            final_path,
+            publication_fault,
+            ArtifactPublicationFaultStage::RenameBefore,
+        )
+    {
+        return Err(injected_io_error().into());
+    }
+
+    #[cfg(feature = "fault-injection")]
+    if role == PublicationRole::ManifestAuthority
+        && publication_fault == Some(PublicationIoFault::ManifestRenameEioBefore)
+    {
+        return Err(durability_indeterminate_error(
+            DurabilityOperation::Rename,
+            final_path,
+            injected_io_error(),
+        ));
+    }
+
+    if let Err(source) = fs::rename(tmp, final_path) {
+        return Err(if role == PublicationRole::ManifestAuthority {
+            durability_indeterminate_error(DurabilityOperation::Rename, final_path, source)
+        } else {
+            source.into()
+        });
+    }
     maybe_file_crash(final_path, "rename");
-    sync_dir(
-        final_path
-            .parent()
-            .ok_or_else(|| format_error("final path has no parent"))?,
-    )?;
+
+    #[cfg(feature = "fault-injection")]
+    if role == PublicationRole::Artifact
+        && artifact_publication_fault_matches(
+            final_path,
+            publication_fault,
+            ArtifactPublicationFaultStage::RenameAfter,
+        )
+    {
+        return Err(injected_io_error().into());
+    }
+
+    #[cfg(feature = "fault-injection")]
+    if role == PublicationRole::ManifestAuthority
+        && publication_fault == Some(PublicationIoFault::ManifestRenameEioAfter)
+    {
+        return Err(durability_indeterminate_error(
+            DurabilityOperation::Rename,
+            final_path,
+            injected_io_error(),
+        ));
+    }
+
+    let parent = final_path
+        .parent()
+        .ok_or_else(|| format_error("final path has no parent"))?;
+    if let Err(error) = sync_dir(parent) {
+        return Err(match (role, error) {
+            (PublicationRole::ManifestAuthority, CheckpointStoreError::Io(source)) => {
+                durability_indeterminate_error(DurabilityOperation::DirectorySync, parent, source)
+            }
+            (_, other) => other,
+        });
+    }
     maybe_file_crash(final_path, "dir-sync");
+
+    #[cfg(feature = "fault-injection")]
+    if role == PublicationRole::Artifact
+        && artifact_publication_fault_matches(
+            final_path,
+            publication_fault,
+            ArtifactPublicationFaultStage::DirectorySyncAfter,
+        )
+    {
+        return Err(injected_io_error().into());
+    }
+
+    #[cfg(feature = "fault-injection")]
+    if role == PublicationRole::ManifestAuthority
+        && publication_fault == Some(PublicationIoFault::ManifestDirSyncEioAfter)
+    {
+        return Err(durability_indeterminate_error(
+            DurabilityOperation::DirectorySync,
+            parent,
+            injected_io_error(),
+        ));
+    }
+
     Ok(())
 }
 
-fn staged_write_new(path: &Path, bytes: &[u8]) -> Result<(), CheckpointStoreError> {
+fn publish_existing_tmp(tmp: &Path, final_path: &Path) -> Result<(), CheckpointStoreError> {
+    publish_existing_tmp_with_role(tmp, final_path, PublicationRole::Artifact)
+}
+
+fn staged_write_with_role(
+    path: &Path,
+    bytes: &[u8],
+    role: PublicationRole,
+) -> Result<(), CheckpointStoreError> {
     let parent = path
         .parent()
         .ok_or_else(|| format_error("target path has no parent"))?;
@@ -1110,7 +1393,15 @@ fn staged_write_new(path: &Path, bytes: &[u8]) -> Result<(), CheckpointStoreErro
     file.flush()?;
     drop(file);
     maybe_file_crash(path, "write");
-    publish_existing_tmp(&tmp, path)
+    publish_existing_tmp_with_role(&tmp, path, role)
+}
+
+fn staged_write_new(path: &Path, bytes: &[u8]) -> Result<(), CheckpointStoreError> {
+    staged_write_with_role(path, bytes, PublicationRole::Artifact)
+}
+
+fn staged_write_manifest(path: &Path, bytes: &[u8]) -> Result<(), CheckpointStoreError> {
+    staged_write_with_role(path, bytes, PublicationRole::ManifestAuthority)
 }
 
 struct RecycleResult {
@@ -1124,6 +1415,9 @@ fn recycle_hot_file(
     logical_tail: u64,
     config: CheckpointStoreConfig,
 ) -> Result<RecycleResult, CheckpointStoreError> {
+    #[cfg(feature = "fault-injection")]
+    let publication_fault = configured_publication_io_fault()?;
+
     if source_offset > logical_tail {
         return Err(format_error(
             "WAL recycle source offset exceeds logical tail",
@@ -1158,16 +1452,39 @@ fn recycle_hot_file(
         config.preinit_chunk_bytes,
     )?;
     maybe_crash("after-wal-sync");
+
+    #[cfg(feature = "fault-injection")]
+    if publication_fault == Some(PublicationIoFault::WalRecycleSyncEioAfter) {
+        return Err(injected_io_error().into());
+    }
+
     let peak = tree_storage(dir)?;
     drop(output);
+
+    #[cfg(feature = "fault-injection")]
+    if publication_fault == Some(PublicationIoFault::WalRecycleRenameEioBefore) {
+        return Err(injected_io_error().into());
+    }
+
     fs::rename(&tmp, hot_path)?;
     maybe_crash("after-wal-rename");
-    sync_dir(
-        hot_path
-            .parent()
-            .ok_or_else(|| format_error("hot WAL path has no parent"))?,
-    )?;
+
+    #[cfg(feature = "fault-injection")]
+    if publication_fault == Some(PublicationIoFault::WalRecycleRenameEioAfter) {
+        return Err(injected_io_error().into());
+    }
+
+    let parent = hot_path
+        .parent()
+        .ok_or_else(|| format_error("hot WAL path has no parent"))?;
+    sync_dir(parent)?;
     maybe_crash("after-wal-dir-sync");
+
+    #[cfg(feature = "fault-injection")]
+    if publication_fault == Some(PublicationIoFault::WalRecycleDirSyncEioAfter) {
+        return Err(injected_io_error().into());
+    }
+
     Ok(RecycleResult { peak })
 }
 

@@ -1,4 +1,12 @@
 use super::*;
+use crate::persistent_sequence::{
+    LogicalLength, PersistentRoot, PersistentSequence, SequenceRange, SequenceRepresentation,
+};
+
+const MESSAGE_IDENTITY_NULL_PREFIX: &[u8] = b"{\"identity\":null,";
+const MESSAGE_CANONICAL_PREFIX: &[u8] = b"{\"identity\":null,\"messages\":[";
+const MESSAGE_CANONICAL_SUFFIX: &[u8] = b"]}";
+const LEGACY_V1_HASH_STREAM_CHUNK_BYTES: u64 = 64 * 1024;
 
 impl CheckpointStore {
     /// Opens or creates a checkpoint store and reconstructs its complete
@@ -22,6 +30,9 @@ impl CheckpointStore {
         let writer_lock = WriterLock::acquire(&dir)?;
         let manifest = load_manifest(&dir)?;
         let manifest = ensure_format_v1_manifest(&dir, manifest)?;
+        let store_id = manifest.store_id.ok_or_else(|| {
+            format_error("public-format manifest is missing persistent StoreId after normalization")
+        })?;
         let (mut state, lazy_base) = if config.recovery_mode == CheckpointStoreRecoveryMode::Lazy {
             let lazy = LazyCheckpointStore::open_for_writable_store(&dir)?;
             let state = state_from_lazy_reader(&dir, &manifest, &lazy)?;
@@ -74,14 +85,16 @@ impl CheckpointStore {
             }
         }
 
-        for tx in &txs {
-            apply_transaction(&mut state, tx)?;
+        for tx in txs {
+            let prepared = prepare_transaction_apply(&mut state, tx)?;
+            apply_prepared_transaction(&mut state, prepared);
         }
         let hot = HotWal::open_at(&hot_path, normalized_tail, config)?;
         let store = Self {
             dir,
             config,
             manifest,
+            store_id,
             state,
             _writer_lock: writer_lock,
             hot,
@@ -103,26 +116,106 @@ impl CheckpointStore {
         Ok(store)
     }
 
+    fn ensure_mutation_allowed(&self) -> Result<(), CheckpointStoreError> {
+        self.hot.ensure_writable()
+    }
+
+    fn pre_authority_artifact_failure(
+        &mut self,
+        path: &Path,
+        error: CheckpointStoreError,
+    ) -> CheckpointStoreError {
+        self.hot.poison();
+        let source = match error {
+            CheckpointStoreError::Io(source) => Some(source),
+            other => Some(io::Error::other(other.to_string())),
+        };
+        recovery_required_error(path, source)
+    }
+
+    fn publish_manifest_authority_bytes(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), CheckpointStoreError> {
+        let path = self.dir.join(MANIFEST_FILE);
+        match staged_write_manifest(&path, bytes) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if error.durability_indeterminate().is_some() {
+                    self.hot.poison();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn publish_manifest_authority(
+        &mut self,
+        next_manifest: &Manifest,
+    ) -> Result<(), CheckpointStoreError> {
+        let bytes = manifest_bytes(next_manifest)?;
+        self.publish_manifest_authority_bytes(&bytes)
+    }
+
+    fn publish_generation_manifest_authority_bytes(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), CheckpointStoreError> {
+        match self.publish_manifest_authority_bytes(bytes) {
+            Ok(()) => Ok(()),
+            Err(error) if error.durability_indeterminate().is_some() => Err(error),
+            Err(error) => {
+                let path = self.dir.join(MANIFEST_FILE);
+                Err(self.pre_authority_artifact_failure(&path, error))
+            }
+        }
+    }
+
+    pub(super) fn committed_maintenance<T>(
+        &mut self,
+        result: Result<T, CheckpointStoreError>,
+    ) -> Result<T, CheckpointStoreError> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => Err(self.hot.recovery_required_after_committed_authority(error)),
+        }
+    }
+
+    fn committed_maintenance_at<T>(
+        &mut self,
+        path: &Path,
+        result: Result<T, CheckpointStoreError>,
+    ) -> Result<T, CheckpointStoreError> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.hot.poison();
+                let source = match error {
+                    CheckpointStoreError::Io(source) => Some(source),
+                    other => Some(io::Error::other(other.to_string())),
+                };
+                Err(recovery_required_after_commit_error(path, source))
+            }
+        }
+    }
+
     /// Returns this store's persistent identity.
     #[must_use]
     pub fn store_id(&self) -> StoreId {
-        self.manifest
-            .store_id
-            .expect("public-format stores always have a persistent StoreId")
+        self.store_id
     }
 
     /// Assigns a new identity after a directory has been copied as an
     /// explicitly independent store. Checkpoints and request-ledger bytes are
     /// unchanged; this method does not create a branch or copy any files.
     pub fn reidentify_copied_store(&mut self) -> Result<StoreId, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         let store_id = StoreId::generate()?;
         let mut next_manifest = self.manifest.clone();
         next_manifest.store_id = Some(store_id);
-        staged_write_new(
-            &self.dir.join(MANIFEST_FILE),
-            &manifest_bytes(&next_manifest)?,
-        )?;
+        self.publish_manifest_authority(&next_manifest)?;
         self.manifest = next_manifest;
+        self.store_id = store_id;
         Ok(store_id)
     }
 
@@ -138,6 +231,7 @@ impl CheckpointStore {
         thread_id: &str,
         checkpoint_id: &str,
     ) -> Result<PruneReport, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         validate_checkpoint_identifier(thread_id, "thread id")?;
         validate_checkpoint_identifier(checkpoint_id, "checkpoint id")?;
         if self.hot.logical_tail() != 0 {
@@ -196,6 +290,7 @@ impl CheckpointStore {
         &mut self,
         deleted_keys: HashSet<(String, String)>,
     ) -> Result<PruneReport, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         if self.hot.logical_tail() != 0 {
             return Err(CheckpointStoreError::PruneRequiresSealedStore);
         }
@@ -224,10 +319,7 @@ impl CheckpointStore {
         let replacement =
             write_compacted_generation(&self.dir, generation, self.config, &compacted)?;
         let segment_final = self.dir.join(&replacement.finalized.meta.file);
-        publish_existing_tmp(&replacement.finalized.tmp_path, &segment_final)?;
-
         let route_path = self.dir.join(&replacement.route_meta.file);
-        staged_write_new(&route_path, &replacement.route_bytes)?;
         let next_manifest = Manifest {
             generation,
             sealed_end_wal_bytes: 0,
@@ -258,29 +350,47 @@ impl CheckpointStore {
                 })
                 .collect(),
         };
-        staged_write_new(
-            &self.dir.join(MANIFEST_FILE),
-            &manifest_bytes(&next_manifest)?,
-        )?;
-        let coexistence = tree_storage(&self.dir)?;
+        let deleted_checkpoint_count = u64::try_from(deleted_keys.len())
+            .map_err(|_| format_error("deleted checkpoint count overflow"))?;
+        let retained_checkpoint_count = u64::try_from(compacted.state.checkpoints.len())
+            .map_err(|_| format_error("retained checkpoint count overflow"))?;
+        let rewritten_bytes = replacement
+            .finalized
+            .meta
+            .segment_file_bytes
+            .checked_add(replacement.route_meta.route_file_bytes)
+            .ok_or_else(|| format_error("prune rewritten byte count overflow"))?;
+        let next_manifest_bytes = manifest_bytes(&next_manifest)?;
 
+        if let Err(error) = publish_existing_tmp(&replacement.finalized.tmp_path, &segment_final) {
+            return Err(self.pre_authority_artifact_failure(&segment_final, error));
+        }
+        if let Err(error) = staged_write_new(&route_path, &replacement.route_bytes) {
+            return Err(self.pre_authority_artifact_failure(&route_path, error));
+        }
+        let store_dir = self.dir.clone();
+        let coexistence = match tree_storage(&store_dir) {
+            Ok(storage) => storage,
+            Err(error) => {
+                return Err(self.pre_authority_artifact_failure(&store_dir, error));
+            }
+        };
+
+        self.publish_generation_manifest_authority_bytes(&next_manifest_bytes)?;
         self.manifest = next_manifest;
         self.state = compacted.state;
         self.range_sizes.borrow_mut().clear();
-        reclaim_unreferenced_generation_files(&self.dir, &self.manifest)?;
-        let reclaimed = tree_storage(&self.dir)?;
+
+        let store_dir = self.dir.clone();
+        let reclaim_result = reclaim_unreferenced_generation_files(&store_dir, &self.manifest);
+        self.committed_maintenance_at(&store_dir, reclaim_result)?;
+        let reclaimed_result = tree_storage(&store_dir);
+        let reclaimed = self.committed_maintenance_at(&store_dir, reclaimed_result)?;
         Ok(PruneReport {
             generation,
-            deleted_checkpoint_count: u64::try_from(deleted_keys.len())
-                .map_err(|_| format_error("deleted checkpoint count overflow"))?,
-            retained_checkpoint_count: u64::try_from(self.state.checkpoints.len())
-                .map_err(|_| format_error("retained checkpoint count overflow"))?,
-            rewritten_bytes: replacement
-                .finalized
-                .meta
-                .segment_file_bytes
-                .checked_add(replacement.route_meta.route_file_bytes)
-                .ok_or_else(|| format_error("prune rewritten byte count overflow"))?,
+            deleted_checkpoint_count,
+            retained_checkpoint_count,
+            rewritten_bytes,
             before,
             coexistence,
             reclaimed,
@@ -291,6 +401,7 @@ impl CheckpointStore {
     /// active. If a reader is still active, this call is safe and leaves the
     /// obsolete files for a later drain.
     pub fn reclaim_deferred_generations(&self) -> Result<StoreStorage, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         reclaim_unreferenced_generation_files(&self.dir, &self.manifest)?;
         tree_storage(&self.dir)
     }
@@ -307,6 +418,7 @@ impl CheckpointStore {
         &mut self,
         transaction: &[u8],
     ) -> Result<HotWalAppendReport, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         let requestless = parse_transaction_unchecked(transaction, 0)?;
         reject_deleted_checkpoint(&self.state, &requestless)?;
         let geometry = Geometry::from_state(&self.state)?;
@@ -334,6 +446,7 @@ impl CheckpointStore {
         parent_checkpoint_id: Option<&str>,
         identity: &[u8],
     ) -> Result<HotWalAppendReport, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         let geometry = self.state.geometry()?;
         let transaction = encode_single_identity_transaction(
             &geometry,
@@ -356,11 +469,13 @@ impl CheckpointStore {
     /// once; a child checkpoint adds one leaf plus one binary node regardless
     /// of the parent's logical message-history length.
     ///
-    /// The store reconstructs the selected parent before encoding the new
-    /// checkpoint and derives the canonical state length/hash itself. This
-    /// favors a strict, self-validating first integration over an unchecked
-    /// caller-supplied digest. The caller may batch multiple newly appended
-    /// message values into one checkpoint, but the batch must not be empty.
+    /// Format v1 persists a whole-canonical-state XXH3-64 value. This path
+    /// therefore still scans the selected parent's canonical bytes to preserve
+    /// released v1 hash semantics, but it no longer materializes the complete
+    /// parent in one temporary vector. Child length comes from persisted parent
+    /// metadata and legacy hashing is fed through bounded range chunks. A
+    /// writable Format-v2 commitment is still required to remove the O(parent)
+    /// read/hash work itself.
     ///
     /// # Errors
     ///
@@ -375,6 +490,7 @@ impl CheckpointStore {
         parent_checkpoint_id: Option<&str>,
         messages: &[Value],
     ) -> Result<HotWalAppendReport, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         if messages.is_empty() {
             return Err(format_error("message checkpoint delta is empty"));
         }
@@ -415,8 +531,15 @@ impl CheckpointStore {
 
         if parent.is_none() {
             if let Some(first) = self.state.checkpoints.first() {
-                let first_state = self.read_checkpoint(&first.thread_id, &first.checkpoint_id)?;
-                if !first_state.starts_with(b"{\"identity\":null,") {
+                let prefix_len = u64::try_from(MESSAGE_IDENTITY_NULL_PREFIX.len())
+                    .map_err(|_| format_error("message identity prefix length exceeds u64"))?;
+                let prefix = self.read_checkpoint_range(
+                    &first.thread_id,
+                    &first.checkpoint_id,
+                    0,
+                    prefix_len,
+                )?;
+                if prefix != MESSAGE_IDENTITY_NULL_PREFIX {
                     return Err(format_error(
                         "message checkpoints cannot reuse a non-null identity root",
                     ));
@@ -424,34 +547,12 @@ impl CheckpointStore {
             }
         }
 
-        let mut canonical = if let Some((info, _, _)) = parent.as_ref() {
-            let mut prior = self.read_checkpoint(thread_id, &info.checkpoint_id)?;
-            if !prior.starts_with(b"{\"identity\":null,\"messages\":[") || !prior.ends_with(b"]}") {
-                return Err(format_error(
-                    "parent canonical state is not the append-only message schema",
-                ));
-            }
-            prior.truncate(
-                prior
-                    .len()
-                    .checked_sub(2)
-                    .ok_or_else(|| format_error("parent canonical state is truncated"))?,
-            );
-            prior.push(b',');
-            prior.extend_from_slice(&message_body);
-            prior.extend_from_slice(b"]}");
-            prior
-        } else {
-            let mut root = Vec::new();
-            root.extend_from_slice(b"{\"identity\":null,\"messages\":[");
-            root.extend_from_slice(&message_body);
-            root.extend_from_slice(b"]}");
-            root
-        };
-        let canonical_state_len = u64::try_from(canonical.len())
-            .map_err(|_| format_error("canonical message state length exceeds u64"))?;
-        let canonical_state_hash = xxh3_64(&canonical);
-        canonical.clear();
+        let (canonical_state_len, canonical_state_hash) =
+            if let Some((info, _, _)) = parent.as_ref() {
+                self.legacy_v1_message_child_metadata(info, &message_body)?
+            } else {
+                Self::legacy_v1_message_root_metadata(&message_body)?
+            };
 
         let geometry = self.state.geometry()?;
         let transaction = encode_message_append_transaction(
@@ -469,6 +570,88 @@ impl CheckpointStore {
             canonical_state_hash,
         )?;
         self.append_encoded_transaction(&transaction)
+    }
+
+    fn legacy_v1_message_root_metadata(
+        message_body: &[u8],
+    ) -> Result<(u64, u64), CheckpointStoreError> {
+        let prefix_len = u64::try_from(MESSAGE_CANONICAL_PREFIX.len())
+            .map_err(|_| format_error("message canonical prefix length exceeds u64"))?;
+        let message_len = u64::try_from(message_body.len())
+            .map_err(|_| format_error("message canonical body length exceeds u64"))?;
+        let suffix_len = u64::try_from(MESSAGE_CANONICAL_SUFFIX.len())
+            .map_err(|_| format_error("message canonical suffix length exceeds u64"))?;
+        let canonical_state_len = prefix_len
+            .checked_add(message_len)
+            .and_then(|length| length.checked_add(suffix_len))
+            .ok_or_else(|| format_error("canonical message state length exceeds u64"))?;
+        let mut hasher = Xxh3::new();
+        hasher.update(MESSAGE_CANONICAL_PREFIX);
+        hasher.update(message_body);
+        hasher.update(MESSAGE_CANONICAL_SUFFIX);
+        Ok((canonical_state_len, hasher.digest()))
+    }
+
+    fn legacy_v1_message_child_metadata(
+        &self,
+        parent: &CheckpointInfo,
+        message_body: &[u8],
+    ) -> Result<(u64, u64), CheckpointStoreError> {
+        let prefix_len = u64::try_from(MESSAGE_CANONICAL_PREFIX.len())
+            .map_err(|_| format_error("message canonical prefix length exceeds u64"))?;
+        let suffix_len = u64::try_from(MESSAGE_CANONICAL_SUFFIX.len())
+            .map_err(|_| format_error("message canonical suffix length exceeds u64"))?;
+        let framing_len = prefix_len
+            .checked_add(suffix_len)
+            .ok_or_else(|| format_error("message canonical framing length overflow"))?;
+        if parent.logical_state_len < framing_len {
+            return Err(format_error(
+                "parent canonical state is shorter than the append-only message framing",
+            ));
+        }
+
+        let prefix =
+            self.read_checkpoint_range(&parent.thread_id, &parent.checkpoint_id, 0, prefix_len)?;
+        let parent_without_suffix_len = parent
+            .logical_state_len
+            .checked_sub(suffix_len)
+            .ok_or_else(|| format_error("parent canonical message suffix underflow"))?;
+        let suffix = self.read_checkpoint_range(
+            &parent.thread_id,
+            &parent.checkpoint_id,
+            parent_without_suffix_len,
+            suffix_len,
+        )?;
+        if prefix != MESSAGE_CANONICAL_PREFIX || suffix != MESSAGE_CANONICAL_SUFFIX {
+            return Err(format_error(
+                "parent canonical state is not the append-only message schema",
+            ));
+        }
+
+        let message_len = u64::try_from(message_body.len())
+            .map_err(|_| format_error("message canonical body length exceeds u64"))?;
+        let canonical_state_len = parent
+            .logical_state_len
+            .checked_add(1)
+            .and_then(|length| length.checked_add(message_len))
+            .ok_or_else(|| format_error("canonical message state length exceeds u64"))?;
+
+        let mut hasher = Xxh3::new();
+        self.stream_checkpoint_range(
+            &parent.thread_id,
+            &parent.checkpoint_id,
+            0,
+            parent_without_suffix_len,
+            LEGACY_V1_HASH_STREAM_CHUNK_BYTES,
+            &mut |chunk| {
+                hasher.update(chunk);
+                Ok(())
+            },
+        )?;
+        hasher.update(b",");
+        hasher.update(message_body);
+        hasher.update(MESSAGE_CANONICAL_SUFFIX);
+        Ok((canonical_state_len, hasher.digest()))
     }
 
     #[allow(dead_code)] // Reserved for a future zero-copy repository adapter feature.
@@ -566,6 +749,7 @@ impl CheckpointStore {
         canonical_state_len: u64,
         canonical_state_hash: u64,
     ) -> Result<HotWalAppendReport, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         let geometry = self.state.geometry()?;
         let transaction = encode_identity_leaf_transaction(
             &geometry,
@@ -592,6 +776,7 @@ impl CheckpointStore {
         canonical_state_hash: u64,
         policy: BoundedWalLifecyclePolicy,
     ) -> Result<BoundedWalAppendReport, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         let geometry = self.state.geometry()?;
         let transaction = encode_identity_leaf_transaction(
             &geometry,
@@ -631,6 +816,7 @@ impl CheckpointStore {
         identity: &[u8],
         policy: BoundedWalLifecyclePolicy,
     ) -> Result<BoundedWalAppendReport, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         let geometry = self.state.geometry()?;
         let transaction = encode_single_identity_transaction(
             &geometry,
@@ -655,6 +841,7 @@ impl CheckpointStore {
         transaction: &[u8],
         policy: BoundedWalLifecyclePolicy,
     ) -> Result<BoundedWalAppendReport, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         policy.validate()?;
         let transaction_bytes = u64::try_from(transaction.len())
             .map_err(|_| format_error("bounded WAL transaction length exceeds u64"))?;
@@ -702,6 +889,7 @@ impl CheckpointStore {
         request_id: &[u8],
         transaction: &[u8],
     ) -> Result<CheckpointStoreAppendOutcome, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         validate_request_id(request_id)?;
         let requestless = parse_transaction_unchecked(transaction, 0)?;
         if requestless.request_id.is_some() {
@@ -735,10 +923,11 @@ impl CheckpointStore {
         transaction: &[u8],
         tx: ParsedTransaction,
     ) -> Result<HotWalAppendReport, CheckpointStoreError> {
-        validate_transaction_against_state(&self.state, &tx)?;
+        self.ensure_mutation_allowed()?;
+        let prepared = prepare_transaction_apply(&mut self.state, tx)?;
         let report = self.hot.append(transaction)?;
         maybe_crash("after-hot-sync-before-memory-publication");
-        apply_transaction(&mut self.state, &tx)?;
+        apply_prepared_transaction(&mut self.state, prepared);
         Ok(report)
     }
 
@@ -755,6 +944,7 @@ impl CheckpointStore {
         &mut self,
         checkpoint_count: u64,
     ) -> Result<SealReport, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         if checkpoint_count <= self.manifest.checkpoint_count {
             return Err(format_error(
                 "seal target must advance checkpoint authority",
@@ -828,14 +1018,10 @@ impl CheckpointStore {
             version_end,
         )?;
         let segment_final = self.dir.join(&finalized.meta.file);
-        maybe_crash("after-segment-write");
-        publish_existing_tmp(&finalized.tmp_path, &segment_final)?;
-
         let (route_bytes, route_hash) =
             build_route_file(generation, &new_threads, &new_checkpoints, &new_requests)?;
         let route_name = format!("route-g{generation:06}.t3r");
         let route_path = self.dir.join(&route_name);
-        staged_write_new(&route_path, &route_bytes)?;
         let route_meta = RouteMeta {
             generation,
             file: route_name,
@@ -864,30 +1050,53 @@ impl CheckpointStore {
             deleted_checkpoints: self.manifest.deleted_checkpoints.clone(),
             retired_requests: self.manifest.retired_requests.clone(),
         };
-        staged_write_new(
-            &self.dir.join(MANIFEST_FILE),
-            &manifest_bytes(&next_manifest)?,
-        )?;
-        let coexistence = tree_storage(&self.dir)?;
-        let recycle = recycle_hot_file(
+        let suffix_len = parsed.logical_tail.saturating_sub(source_offset);
+        let next_manifest_bytes = manifest_bytes(&next_manifest)?;
+
+        maybe_crash("after-segment-write");
+        if let Err(error) = publish_existing_tmp(&finalized.tmp_path, &segment_final) {
+            return Err(self.pre_authority_artifact_failure(&segment_final, error));
+        }
+        if let Err(error) = staged_write_new(&route_path, &route_bytes) {
+            return Err(self.pre_authority_artifact_failure(&route_path, error));
+        }
+        let store_dir = self.dir.clone();
+        let coexistence = match tree_storage(&store_dir) {
+            Ok(storage) => storage,
+            Err(error) => {
+                return Err(self.pre_authority_artifact_failure(&store_dir, error));
+            }
+        };
+
+        self.publish_generation_manifest_authority_bytes(&next_manifest_bytes)?;
+        self.manifest = next_manifest;
+
+        let recycle_result = recycle_hot_file(
             &self.dir,
             &hot_path,
             source_offset,
             parsed.logical_tail,
             self.config,
-        )?;
-        let suffix_len = parsed.logical_tail.saturating_sub(source_offset);
+        );
+        let recycle = self.committed_maintenance(recycle_result)?;
         self.hot.replace_after_recycle(suffix_len)?;
-        self.manifest = next_manifest;
-        if let Some(lazy) = &self.lazy_base {
-            *lazy.borrow_mut() = LazyCheckpointStore::open_for_writable_store(&self.dir)?;
-            self.state.base_geometry = Some(Geometry::from_manifest(&self.manifest)?);
+
+        if self.lazy_base.is_some() {
+            let refreshed_result = LazyCheckpointStore::open_for_writable_store(&self.dir);
+            let refreshed = self.committed_maintenance(refreshed_result)?;
+            let geometry_result = Geometry::from_manifest(&self.manifest);
+            let base_geometry = self.committed_maintenance(geometry_result)?;
+            if let Some(lazy) = &self.lazy_base {
+                *lazy.borrow_mut() = refreshed;
+            }
+            self.state.base_geometry = Some(base_geometry);
             self.state.arena_bytes.clear();
             self.state.compact_nodes.clear();
             self.state.wide_nodes.clear();
         }
         self.range_sizes.borrow_mut().clear();
-        let reclaimed = tree_storage(&self.dir)?;
+        let reclaimed_result = tree_storage(&self.dir);
+        let reclaimed = self.committed_maintenance(reclaimed_result)?;
         Ok(SealReport {
             generation,
             checkpoint_count,
@@ -1053,11 +1262,14 @@ impl CheckpointStore {
         if length == 0 {
             return Ok(Vec::new());
         }
-        let root = self.version_root_for_read(checkpoint.identity_version)?;
+        let root_node = self.version_root_for_read(checkpoint.identity_version)?;
+        let root = PersistentRoot::legacy_v1(root_node, LogicalLength::new(identity_len));
+        let range = SequenceRange::new(LogicalLength::new(offset), LogicalLength::new(length))
+            .ok_or_else(|| format_error("identity range end overflow"))?;
         let output_len =
             usize::try_from(length).map_err(|_| format_error("identity range exceeds usize"))?;
         let mut output = Vec::with_capacity(output_len);
-        self.append_root_range_with_known_size(root, identity_len, offset, length, &mut output)?;
+        LegacyV1Sequence { store: self }.read_range(root, range, &mut output)?;
         if output.len() != output_len {
             return Err(format_error("identity range produced unexpected length"));
         }
@@ -1269,50 +1481,27 @@ impl CheckpointStore {
         end: u64,
         output: &mut Vec<u8>,
     ) -> Result<(), CheckpointStoreError> {
-        let identity_root = self.version_root_for_read(checkpoint.identity_version)?;
-        let identity_len = self.root_term_size(identity_root)?;
+        let identity_root = self.persistent_root_for_read(checkpoint.identity_version)?;
         let messages_root = checkpoint
             .messages_version
-            .map(|version| self.version_root_for_read(version))
+            .map(|version| self.persistent_root_for_read(version))
             .transpose()?;
-        let messages_len = messages_root
-            .map(|root| self.root_term_size(root))
-            .transpose()?
-            .unwrap_or(0);
         let result_root = checkpoint
             .result_version
-            .map(|version| self.version_root_for_read(version))
-            .transpose()?;
-        let result_len = result_root
-            .map(|root| self.root_term_size(root))
+            .map(|version| self.persistent_root_for_read(version))
             .transpose()?;
 
         let mut cursor = 0u64;
         cursor = self.append_static_range(b"{\"identity\":", cursor, start, end, output)?;
-        cursor = self.append_root_segment_range(
-            identity_root,
-            identity_len,
-            cursor,
-            start,
-            end,
-            output,
-        )?;
+        cursor = self.append_root_segment_range(identity_root, cursor, start, end, output)?;
         cursor = self.append_static_range(b",\"messages\":[", cursor, start, end, output)?;
         if let Some(root) = messages_root {
-            cursor =
-                self.append_root_segment_range(root, messages_len, cursor, start, end, output)?;
+            cursor = self.append_root_segment_range(root, cursor, start, end, output)?;
         }
         cursor = self.append_static_range(b"]", cursor, start, end, output)?;
         if let Some(root) = result_root {
             cursor = self.append_static_range(b",\"result\":", cursor, start, end, output)?;
-            cursor = self.append_root_segment_range(
-                root,
-                result_len.unwrap_or(0),
-                cursor,
-                start,
-                end,
-                output,
-            )?;
+            cursor = self.append_root_segment_range(root, cursor, start, end, output)?;
         }
         cursor = self.append_static_range(b"}", cursor, start, end, output)?;
         if cursor != checkpoint.logical_state_len {
@@ -1354,25 +1543,26 @@ impl CheckpointStore {
 
     fn append_root_segment_range(
         &self,
-        root: u64,
-        root_len: u64,
+        root: PersistentRoot,
         segment_start: u64,
         request_start: u64,
         request_end: u64,
         output: &mut Vec<u8>,
     ) -> Result<u64, CheckpointStoreError> {
+        let sequence = LegacyV1Sequence { store: self };
+        let root_len = sequence.logical_len(root)?.get();
         let segment_end = segment_start
             .checked_add(root_len)
             .ok_or_else(|| format_error("canonical root segment end overflow"))?;
         let overlap_start = request_start.max(segment_start);
         let overlap_end = request_end.min(segment_end);
         if overlap_start < overlap_end {
-            self.append_root_range(
-                root,
-                overlap_start - segment_start,
-                overlap_end - overlap_start,
-                output,
-            )?;
+            let range = SequenceRange::new(
+                LogicalLength::new(overlap_start - segment_start),
+                LogicalLength::new(overlap_end - overlap_start),
+            )
+            .ok_or_else(|| format_error("checkpoint root range end overflow"))?;
+            sequence.read_range(root, range, output)?;
         }
         Ok(segment_end)
     }
@@ -1384,6 +1574,15 @@ impl CheckpointStore {
             .copied()
             .flatten()
             .ok_or_else(|| format_error("version has no root"))
+    }
+
+    fn persistent_root_for_read(
+        &self,
+        version: u32,
+    ) -> Result<PersistentRoot, CheckpointStoreError> {
+        let node_id = self.version_root_for_read(version)?;
+        let logical_len = LogicalLength::new(self.root_term_size(node_id)?);
+        Ok(PersistentRoot::legacy_v1(node_id, logical_len))
     }
 
     fn decode_node_for_read(&self, node_id: u64) -> Result<DecodedNode, CheckpointStoreError> {
@@ -1419,17 +1618,6 @@ impl CheckpointStore {
         }
         cache[index] = Some(total);
         Ok(total)
-    }
-
-    fn append_root_range(
-        &self,
-        root: u64,
-        offset: u64,
-        length: u64,
-        output: &mut Vec<u8>,
-    ) -> Result<(), CheckpointStoreError> {
-        let root_len = self.root_term_size(root)?;
-        self.append_root_range_with_known_size(root, root_len, offset, length, output)
     }
 
     fn append_root_range_with_known_size(
@@ -1580,5 +1768,48 @@ impl CheckpointStore {
     #[must_use]
     pub fn checkpoints(&self) -> &[CheckpointInfo] {
         &self.state.checkpoints
+    }
+}
+
+struct LegacyV1Sequence<'a> {
+    store: &'a CheckpointStore,
+}
+
+impl LegacyV1Sequence<'_> {
+    fn validate_root(&self, root: PersistentRoot) -> Result<(), CheckpointStoreError> {
+        if root.representation() != SequenceRepresentation::LegacyV1 {
+            return Err(format_error(
+                "legacy v1 sequence adapter received an incompatible root",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl PersistentSequence for LegacyV1Sequence<'_> {
+    type Error = CheckpointStoreError;
+
+    fn logical_len(&self, root: PersistentRoot) -> Result<LogicalLength, Self::Error> {
+        self.validate_root(root)?;
+        Ok(root.logical_len())
+    }
+
+    fn read_range(
+        &self,
+        root: PersistentRoot,
+        range: SequenceRange,
+        output: &mut Vec<u8>,
+    ) -> Result<(), Self::Error> {
+        self.validate_root(root)?;
+        if range.end().get() > root.logical_len().get() {
+            return Err(format_error("checkpoint root range outside root"));
+        }
+        self.store.append_root_range_with_known_size(
+            root.node_id(),
+            root.logical_len().get(),
+            range.offset().get(),
+            range.length().get(),
+            output,
+        )
     }
 }
