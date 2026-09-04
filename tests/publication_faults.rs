@@ -160,8 +160,9 @@ fn live_manifest_and_recycle_faults_recover_exact_authority() -> Result<(), Box<
     let _clean_wal = EnvGuard::clear(WAL_IO_FAULT_ENV);
 
     // The manifest temporary file was really synced, but authority was never
-    // renamed into place. This is a definite old-authority failure and does
-    // not poison the writer.
+    // renamed into place. Logical authority is definitely old; however the
+    // segment/route finals already exist, so the writer must reopen before
+    // reusing the generation name.
     {
         let TwoCheckpointStore {
             temp,
@@ -173,19 +174,22 @@ fn live_manifest_and_recycle_faults_recover_exact_authority() -> Result<(), Box<
             let _fault = EnvGuard::set(PUBLICATION_IO_FAULT_ENV, "manifest-sync-eio-after");
             expect_error(store.seal_through(1))?
         };
-        assert_eq!(error.failure_kind(), CheckpointStoreFailureKind::Io);
+        assert_eq!(
+            error.failure_kind(),
+            CheckpointStoreFailureKind::RecoveryRequired
+        );
         assert!(error.durability_indeterminate().is_none());
-        assert!(error.recovery_required().is_none());
+        assert!(!error
+            .recovery_required()
+            .ok_or("missing pre-authority manifest recovery context")?
+            .authority_committed());
         assert_eq!(store.sealed_checkpoint_count(), 0);
-
-        store.append_checkpoint("thread", "cp-3", 3, Some("cp-2"), b"{\"value\":3}")?;
+        assert_blocked(&mut store)?;
         drop(store);
 
-        let reopened = CheckpointStore::open(temp.path(), CheckpointStoreConfig::default())?;
-        assert_eq!(reopened.sealed_checkpoint_count(), 0);
+        let mut reopened = assert_reopened(&temp, 0, &first, &second)?;
+        reopened.append_checkpoint("thread", "cp-3", 3, Some("cp-2"), b"{\"value\":3}")?;
         assert_eq!(reopened.checkpoint_count(), 3);
-        assert_eq!(reopened.read_checkpoint("thread", "cp-1")?, first);
-        assert_eq!(reopened.read_checkpoint("thread", "cp-2")?, second);
         assert_eq!(reopened.verify_all()?.failures, 0);
     }
 
