@@ -657,6 +657,7 @@ impl CheckpointStore {
         canonical_state_len: u64,
         canonical_state_hash: u64,
     ) -> Result<HotWalAppendReport, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         let geometry = self.state.geometry()?;
         let transaction = encode_identity_leaf_transaction(
             &geometry,
@@ -723,6 +724,7 @@ impl CheckpointStore {
         identity: &[u8],
         policy: BoundedWalLifecyclePolicy,
     ) -> Result<BoundedWalAppendReport, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
         let geometry = self.state.geometry()?;
         let transaction = encode_single_identity_transaction(
             &geometry,
