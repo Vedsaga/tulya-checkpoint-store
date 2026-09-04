@@ -133,13 +133,12 @@ impl CheckpointStore {
         recovery_required_error(path, source)
     }
 
-    fn publish_manifest_authority(
+    fn publish_manifest_authority_bytes(
         &mut self,
-        next_manifest: &Manifest,
+        bytes: &[u8],
     ) -> Result<(), CheckpointStoreError> {
         let path = self.dir.join(MANIFEST_FILE);
-        let bytes = manifest_bytes(next_manifest)?;
-        match staged_write_manifest(&path, &bytes) {
+        match staged_write_manifest(&path, bytes) {
             Ok(()) => Ok(()),
             Err(error) => {
                 if error.durability_indeterminate().is_some() {
@@ -150,11 +149,19 @@ impl CheckpointStore {
         }
     }
 
-    fn publish_generation_manifest_authority(
+    fn publish_manifest_authority(
         &mut self,
         next_manifest: &Manifest,
     ) -> Result<(), CheckpointStoreError> {
-        match self.publish_manifest_authority(next_manifest) {
+        let bytes = manifest_bytes(next_manifest)?;
+        self.publish_manifest_authority_bytes(&bytes)
+    }
+
+    fn publish_generation_manifest_authority_bytes(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), CheckpointStoreError> {
+        match self.publish_manifest_authority_bytes(bytes) {
             Ok(()) => Ok(()),
             Err(error) if error.durability_indeterminate().is_some() => Err(error),
             Err(error) => {
@@ -353,6 +360,7 @@ impl CheckpointStore {
             .segment_file_bytes
             .checked_add(replacement.route_meta.route_file_bytes)
             .ok_or_else(|| format_error("prune rewritten byte count overflow"))?;
+        let next_manifest_bytes = manifest_bytes(&next_manifest)?;
 
         if let Err(error) = publish_existing_tmp(&replacement.finalized.tmp_path, &segment_final) {
             return Err(self.pre_authority_artifact_failure(&segment_final, error));
@@ -368,7 +376,7 @@ impl CheckpointStore {
             }
         };
 
-        self.publish_generation_manifest_authority(&next_manifest)?;
+        self.publish_generation_manifest_authority_bytes(&next_manifest_bytes)?;
         self.manifest = next_manifest;
         self.state = compacted.state;
         self.range_sizes.borrow_mut().clear();
@@ -1043,6 +1051,7 @@ impl CheckpointStore {
             retired_requests: self.manifest.retired_requests.clone(),
         };
         let suffix_len = parsed.logical_tail.saturating_sub(source_offset);
+        let next_manifest_bytes = manifest_bytes(&next_manifest)?;
 
         maybe_crash("after-segment-write");
         if let Err(error) = publish_existing_tmp(&finalized.tmp_path, &segment_final) {
@@ -1059,7 +1068,7 @@ impl CheckpointStore {
             }
         };
 
-        self.publish_generation_manifest_authority(&next_manifest)?;
+        self.publish_generation_manifest_authority_bytes(&next_manifest_bytes)?;
         self.manifest = next_manifest;
 
         let recycle_result = recycle_hot_file(
