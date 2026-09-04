@@ -1189,11 +1189,7 @@ fn publish_existing_tmp_with_role(
     if let Err(error) = sync_dir(parent) {
         return Err(match (role, error) {
             (PublicationRole::ManifestAuthority, CheckpointStoreError::Io(source)) => {
-                durability_indeterminate_error(
-                    DurabilityOperation::DirectorySync,
-                    parent,
-                    source,
-                )
+                durability_indeterminate_error(DurabilityOperation::DirectorySync, parent, source)
             }
             (_, other) => other,
         });
