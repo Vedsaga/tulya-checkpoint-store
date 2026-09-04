@@ -111,7 +111,10 @@ fn run_case(fault: &str, expected_prefix: &str) -> Result<(), Box<dyn Error>> {
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or("recovery artifact path has no UTF-8 filename")?;
-    assert!(name.starts_with(expected_prefix), "unexpected artifact path: {name}");
+    assert!(
+        name.starts_with(expected_prefix),
+        "unexpected artifact path: {name}"
+    );
 
     assert_eq!(store.sealed_checkpoint_count(), 0);
     assert_eq!(store.read_checkpoint("thread", "cp-1")?, first);
