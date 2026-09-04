@@ -1,7 +1,10 @@
 # Live immutable segment/route fault injection
 
-Status: staged production-resilience evidence. Local Rust 1.80 verification is
-required before this unit is accepted.
+Status: accepted seal-path immutable-artifact resilience evidence. Rust 1.80
+formatting and strict feature-enabled Clippy passed; the eight-case live
+segment/route matrix passed, the manifest/recycle matrix remained green, the
+full library suite remained 109/109, and the existing crash matrix remained
+green. The prune/deletion matrix is tracked separately.
 
 ## DECISION
 
