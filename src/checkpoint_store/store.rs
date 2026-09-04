@@ -990,33 +990,38 @@ impl CheckpointStore {
             deleted_checkpoints: self.manifest.deleted_checkpoints.clone(),
             retired_requests: self.manifest.retired_requests.clone(),
         };
-        staged_write_new(
-            &self.dir.join(MANIFEST_FILE),
-            &manifest_bytes(&next_manifest)?,
-        )?;
+        let suffix_len = parsed.logical_tail.saturating_sub(source_offset);
         let coexistence = tree_storage(&self.dir)?;
-        let recycle = match recycle_hot_file(
+
+        self.publish_manifest_authority(&next_manifest)?;
+        self.manifest = next_manifest;
+
+        let recycle_result = recycle_hot_file(
             &self.dir,
             &hot_path,
             source_offset,
             parsed.logical_tail,
             self.config,
-        ) {
-            Ok(recycle) => recycle,
-            Err(error) => return Err(self.hot.recovery_required_after_mutation(error)),
-        };
-        let suffix_len = parsed.logical_tail.saturating_sub(source_offset);
+        );
+        let recycle = self.committed_maintenance(recycle_result)?;
         self.hot.replace_after_recycle(suffix_len)?;
-        self.manifest = next_manifest;
-        if let Some(lazy) = &self.lazy_base {
-            *lazy.borrow_mut() = LazyCheckpointStore::open_for_writable_store(&self.dir)?;
-            self.state.base_geometry = Some(Geometry::from_manifest(&self.manifest)?);
+
+        if self.lazy_base.is_some() {
+            let refreshed_result = LazyCheckpointStore::open_for_writable_store(&self.dir);
+            let refreshed = self.committed_maintenance(refreshed_result)?;
+            let geometry_result = Geometry::from_manifest(&self.manifest);
+            let base_geometry = self.committed_maintenance(geometry_result)?;
+            if let Some(lazy) = &self.lazy_base {
+                *lazy.borrow_mut() = refreshed;
+            }
+            self.state.base_geometry = Some(base_geometry);
             self.state.arena_bytes.clear();
             self.state.compact_nodes.clear();
             self.state.wide_nodes.clear();
         }
         self.range_sizes.borrow_mut().clear();
-        let reclaimed = tree_storage(&self.dir)?;
+        let reclaimed_result = tree_storage(&self.dir);
+        let reclaimed = self.committed_maintenance(reclaimed_result)?;
         Ok(SealReport {
             generation,
             checkpoint_count,
