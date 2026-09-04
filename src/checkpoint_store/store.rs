@@ -120,6 +120,33 @@ impl CheckpointStore {
         self.hot.ensure_writable()
     }
 
+    fn publish_manifest_authority(
+        &mut self,
+        next_manifest: &Manifest,
+    ) -> Result<(), CheckpointStoreError> {
+        let path = self.dir.join(MANIFEST_FILE);
+        let bytes = manifest_bytes(next_manifest)?;
+        match staged_write_manifest(&path, &bytes) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if error.durability_indeterminate().is_some() {
+                    self.hot.poison();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn committed_maintenance<T>(
+        &mut self,
+        result: Result<T, CheckpointStoreError>,
+    ) -> Result<T, CheckpointStoreError> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => Err(self.hot.recovery_required_after_committed_authority(error)),
+        }
+    }
+
     /// Returns this store's persistent identity.
     #[must_use]
     pub fn store_id(&self) -> StoreId {
