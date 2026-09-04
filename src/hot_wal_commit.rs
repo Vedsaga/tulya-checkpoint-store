@@ -359,7 +359,10 @@ mod tests {
         io.fail_write_after = Some(0);
 
         let error = committer.commit(&path, &mut io, b"record").unwrap_err();
-        assert_eq!(error.failure_kind(), CheckpointStoreFailureKind::Io);
+        assert_eq!(
+            error.failure_kind(),
+            CheckpointStoreFailureKind::Capacity
+        );
         assert!(!committer.requires_recovery());
 
         io.fail_write_after = None;
