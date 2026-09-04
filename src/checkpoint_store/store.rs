@@ -322,9 +322,7 @@ impl CheckpointStore {
             .checked_add(replacement.route_meta.route_file_bytes)
             .ok_or_else(|| format_error("prune rewritten byte count overflow"))?;
 
-        if let Err(error) =
-            publish_existing_tmp(&replacement.finalized.tmp_path, &segment_final)
-        {
+        if let Err(error) = publish_existing_tmp(&replacement.finalized.tmp_path, &segment_final) {
             return Err(self.pre_authority_artifact_failure(&segment_final, error));
         }
         if let Err(error) = staged_write_new(&route_path, &replacement.route_bytes) {
