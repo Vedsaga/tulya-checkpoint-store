@@ -373,10 +373,7 @@ mod tests {
     #[test]
     fn allocation_reserve_failure_is_classified_as_capacity() {
         let error = capacity_error("allocation reserve failed before WAL commit");
-        assert_eq!(
-            error.failure_kind(),
-            CheckpointStoreFailureKind::Capacity
-        );
+        assert_eq!(error.failure_kind(), CheckpointStoreFailureKind::Capacity);
     }
 
     #[test]
