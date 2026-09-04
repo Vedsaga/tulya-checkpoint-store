@@ -1256,7 +1256,9 @@ fn publish_existing_tmp_with_role(
     }
 
     #[cfg(feature = "fault-injection")]
-    if publication_fault == Some(PublicationIoFault::ManifestSyncEioAfter) {
+    if role == PublicationRole::ManifestAuthority
+        && publication_fault == Some(PublicationIoFault::ManifestSyncEioAfter)
+    {
         return Err(injected_io_error().into());
     }
 
@@ -1272,7 +1274,9 @@ fn publish_existing_tmp_with_role(
     }
 
     #[cfg(feature = "fault-injection")]
-    if publication_fault == Some(PublicationIoFault::ManifestRenameEioBefore) {
+    if role == PublicationRole::ManifestAuthority
+        && publication_fault == Some(PublicationIoFault::ManifestRenameEioBefore)
+    {
         return Err(durability_indeterminate_error(
             DurabilityOperation::Rename,
             final_path,
@@ -1301,7 +1305,9 @@ fn publish_existing_tmp_with_role(
     }
 
     #[cfg(feature = "fault-injection")]
-    if publication_fault == Some(PublicationIoFault::ManifestRenameEioAfter) {
+    if role == PublicationRole::ManifestAuthority
+        && publication_fault == Some(PublicationIoFault::ManifestRenameEioAfter)
+    {
         return Err(durability_indeterminate_error(
             DurabilityOperation::Rename,
             final_path,
@@ -1334,7 +1340,9 @@ fn publish_existing_tmp_with_role(
     }
 
     #[cfg(feature = "fault-injection")]
-    if publication_fault == Some(PublicationIoFault::ManifestDirSyncEioAfter) {
+    if role == PublicationRole::ManifestAuthority
+        && publication_fault == Some(PublicationIoFault::ManifestDirSyncEioAfter)
+    {
         return Err(durability_indeterminate_error(
             DurabilityOperation::DirectorySync,
             parent,
