@@ -56,7 +56,11 @@ fn canonical(identity: &[u8]) -> Vec<u8> {
 
 fn hot_prefix(path: &Path, length: usize) -> Result<Vec<u8>, Box<dyn Error>> {
     let bytes = fs::read(path.join("hot.wal"))?;
-    Ok(bytes.get(..length.min(bytes.len())).unwrap_or(&bytes).to_vec())
+    let end = length.min(bytes.len());
+    let prefix = bytes
+        .get(..end)
+        .ok_or("hot WAL prefix range is outside file bytes")?;
+    Ok(prefix.to_vec())
 }
 
 fn small_reserve_config() -> CheckpointStoreConfig {
