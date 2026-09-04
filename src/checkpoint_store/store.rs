@@ -832,10 +832,10 @@ impl CheckpointStore {
         tx: ParsedTransaction,
     ) -> Result<HotWalAppendReport, CheckpointStoreError> {
         self.ensure_mutation_allowed()?;
-        validate_transaction_against_state(&self.state, &tx)?;
+        let prepared = prepare_transaction_apply(&mut self.state, tx)?;
         let report = self.hot.append(transaction)?;
         maybe_crash("after-hot-sync-before-memory-publication");
-        apply_transaction(&mut self.state, &tx)?;
+        apply_prepared_transaction(&mut self.state, prepared);
         Ok(report)
     }
 
