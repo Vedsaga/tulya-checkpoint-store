@@ -1605,7 +1605,6 @@ fn committed_maintenance_poisoning_reports_committed_authority(
     Ok(())
 }
 
-
 #[cfg(feature = "fault-injection")]
 struct PruneFaultEnv {
     key: &'static str,
@@ -1653,30 +1652,11 @@ fn prune_fault_fixture() -> Result<PruneFaultFixture, Box<dyn std::error::Error>
 
     let tx_a = transaction_for_thread(0, 1, 0, 0, b"{}", "thread", "A", None);
     store.append_encoded_transaction(&tx_a)?;
-    let tx_b =
-        transaction_for_thread(1, 2, 2, 1, b"{\"base\":true}", "thread", "B", Some("A"));
+    let tx_b = transaction_for_thread(1, 2, 2, 1, b"{\"base\":true}", "thread", "B", Some("A"));
     store.append_encoded_transaction(&tx_b)?;
-    let tx_c = transaction_for_thread(
-        2,
-        3,
-        15,
-        2,
-        b"{\"deleted\":true}",
-        "thread",
-        "C",
-        Some("B"),
-    );
+    let tx_c = transaction_for_thread(2, 3, 15, 2, b"{\"deleted\":true}", "thread", "C", Some("B"));
     store.append_encoded_transaction_with_request_id(b"request-c", &tx_c)?;
-    let tx_d = transaction_for_thread(
-        3,
-        4,
-        31,
-        3,
-        b"{\"sibling\":true}",
-        "thread",
-        "D",
-        Some("B"),
-    );
+    let tx_d = transaction_for_thread(3, 4, 31, 3, b"{\"sibling\":true}", "thread", "D", Some("B"));
     store.append_encoded_transaction(&tx_d)?;
     store.seal_through(4)?;
 
@@ -1907,9 +1887,7 @@ fn run_prune_new_authority_indeterminate_fault(
 }
 
 #[cfg(feature = "fault-injection")]
-fn run_prune_post_authority_reclaim_fault(
-    fault: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn run_prune_post_authority_reclaim_fault(fault: &str) -> Result<(), Box<dyn std::error::Error>> {
     const PUBLICATION_FAULT_ENV: &str = "TULYA_CHECKPOINT_STORE_PUBLICATION_IO_FAULT";
 
     let PruneFaultFixture {
