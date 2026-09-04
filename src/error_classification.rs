@@ -270,7 +270,9 @@ pub(crate) fn recovery_required_error(
     path: &Path,
     source: Option<io::Error>,
 ) -> CheckpointStoreError {
-    let kind = source.as_ref().map_or(io::ErrorKind::Other, io::Error::kind);
+    let kind = source
+        .as_ref()
+        .map_or(io::ErrorKind::Other, io::Error::kind);
     let context = RecoveryRequired::new(path.to_path_buf(), source);
     CheckpointStoreError::Io(io::Error::new(kind, context))
 }
@@ -344,7 +346,10 @@ mod tests {
         );
         let context = error.recovery_required().unwrap();
         assert_eq!(context.path(), Path::new("/tmp/hot.wal"));
-        assert_eq!(context.source_error().and_then(io::Error::raw_os_error), Some(5));
+        assert_eq!(
+            context.source_error().and_then(io::Error::raw_os_error),
+            Some(5)
+        );
 
         let poisoned = recovery_required_error(Path::new("/tmp/hot.wal"), None);
         assert_eq!(
