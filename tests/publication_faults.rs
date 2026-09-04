@@ -67,8 +67,14 @@ fn assert_blocked(store: &mut CheckpointStore) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn open_two_checkpoint_store(
-) -> Result<(tempfile::TempDir, CheckpointStore, Vec<u8>, Vec<u8>), Box<dyn Error>> {
+struct TwoCheckpointStore {
+    temp: tempfile::TempDir,
+    store: CheckpointStore,
+    first: Vec<u8>,
+    second: Vec<u8>,
+}
+
+fn open_two_checkpoint_store() -> Result<TwoCheckpointStore, Box<dyn Error>> {
     let temp = tempfile::tempdir()?;
     let mut store = CheckpointStore::open(temp.path(), CheckpointStoreConfig::default())?;
     store.append_checkpoint("thread", "cp-1", 1, None, b"{\"value\":1}")?;
@@ -81,7 +87,12 @@ fn open_two_checkpoint_store(
     )?;
     let first = store.read_checkpoint("thread", "cp-1")?;
     let second = store.read_checkpoint("thread", "cp-2")?;
-    Ok((temp, store, first, second))
+    Ok(TwoCheckpointStore {
+        temp,
+        store,
+        first,
+        second,
+    })
 }
 
 fn assert_reopened(
@@ -115,7 +126,12 @@ fn assert_indeterminate(
 }
 
 fn run_post_commit_recycle_case(fault: &str) -> Result<(), Box<dyn Error>> {
-    let (temp, mut store, first, second) = open_two_checkpoint_store()?;
+    let TwoCheckpointStore {
+        temp,
+        mut store,
+        first,
+        second,
+    } = open_two_checkpoint_store()?;
 
     let error = {
         let _fault = EnvGuard::set(PUBLICATION_IO_FAULT_ENV, fault);
@@ -153,7 +169,12 @@ fn live_manifest_and_recycle_faults_recover_exact_authority() -> Result<(), Box<
     // renamed into place. This is a definite old-authority failure and does
     // not poison the writer.
     {
-        let (temp, mut store, first, second) = open_two_checkpoint_store()?;
+        let TwoCheckpointStore {
+            temp,
+            mut store,
+            first,
+            second,
+        } = open_two_checkpoint_store()?;
         let error = {
             let _fault = EnvGuard::set(PUBLICATION_IO_FAULT_ENV, "manifest-sync-eio-after");
             expect_error(store.seal_through(1))?
@@ -183,7 +204,12 @@ fn live_manifest_and_recycle_faults_recover_exact_authority() -> Result<(), Box<
     // Failure reported before the manifest rename: the caller receives an
     // indeterminate result and must reopen. Reopen resolves to old authority.
     {
-        let (temp, mut store, first, second) = open_two_checkpoint_store()?;
+        let TwoCheckpointStore {
+            temp,
+            mut store,
+            first,
+            second,
+        } = open_two_checkpoint_store()?;
         let error = {
             let _fault = EnvGuard::set(
                 PUBLICATION_IO_FAULT_ENV,
@@ -204,7 +230,12 @@ fn live_manifest_and_recycle_faults_recover_exact_authority() -> Result<(), Box<
     // Failure reported after the real rename but before directory durability:
     // process-local state stays unresolved, while reopen sees new authority.
     {
-        let (temp, mut store, first, second) = open_two_checkpoint_store()?;
+        let TwoCheckpointStore {
+            temp,
+            mut store,
+            first,
+            second,
+        } = open_two_checkpoint_store()?;
         let error = {
             let _fault = EnvGuard::set(
                 PUBLICATION_IO_FAULT_ENV,
@@ -225,7 +256,12 @@ fn live_manifest_and_recycle_faults_recover_exact_authority() -> Result<(), Box<
     // Directory sync succeeds on the real filesystem and the injected error is
     // then surfaced as indeterminate. Reopen must observe new authority.
     {
-        let (temp, mut store, first, second) = open_two_checkpoint_store()?;
+        let TwoCheckpointStore {
+            temp,
+            mut store,
+            first,
+            second,
+        } = open_two_checkpoint_store()?;
         let error = {
             let _fault = EnvGuard::set(
                 PUBLICATION_IO_FAULT_ENV,
