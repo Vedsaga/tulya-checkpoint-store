@@ -147,6 +147,9 @@ pub(crate) enum PublicationIoFault {
     WalRecycleRenameEioBefore,
     WalRecycleRenameEioAfter,
     WalRecycleDirSyncEioAfter,
+    PruneReclaimDeleteEioBefore,
+    PruneReclaimDeleteEioAfter,
+    PruneReclaimDirSyncEioAfter,
 }
 
 #[cfg(feature = "fault-injection")]
@@ -177,6 +180,9 @@ pub(crate) fn configured_publication_io_fault() -> io::Result<Option<Publication
         "wal-recycle-rename-eio-before" => PublicationIoFault::WalRecycleRenameEioBefore,
         "wal-recycle-rename-eio-after" => PublicationIoFault::WalRecycleRenameEioAfter,
         "wal-recycle-dir-sync-eio-after" => PublicationIoFault::WalRecycleDirSyncEioAfter,
+        "prune-reclaim-delete-eio-before" => PublicationIoFault::PruneReclaimDeleteEioBefore,
+        "prune-reclaim-delete-eio-after" => PublicationIoFault::PruneReclaimDeleteEioAfter,
+        "prune-reclaim-dir-sync-eio-after" => PublicationIoFault::PruneReclaimDirSyncEioAfter,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
