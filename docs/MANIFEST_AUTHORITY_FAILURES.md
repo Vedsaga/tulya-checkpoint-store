@@ -68,10 +68,11 @@ not at the end of all maintenance.
 
 Before manifest authority:
 
+- validation, encoding, allocation, route construction, manifest construction, and manifest serialization are completed before the first named immutable artifact is published;
 - segment/route construction failure before named publication: definite failure, writer remains usable unless the underlying path separately poisoned it;
-- segment/route named publication failure: logical authority remains old, but the writer returns pre-authority `RecoveryRequired` because an orphan final/tmp artifact may require reopen cleanup before the generation name is reused;
-- manifest byte write/flush/tmp-file sync failure: old authority remains;
-- validation/encoding/allocation failure: old authority remains.
+- once a segment/route final or temporary generation artifact may exist, any later definite pre-authority failure returns `RecoveryRequired` with `authority_committed() == false`, because reopen cleanup is required before that generation name is reused;
+- this includes segment/route named publication failures and generation-manifest write/flush/tmp-file-sync failures;
+- manifest rename or parent-directory-sync uncertainty remains a separate `DurabilityIndeterminate` authority case.
 
 At manifest authority:
 
@@ -100,10 +101,12 @@ post-commit error to learn that the logical operation was already committed.
 
 ```text
 prepare immutable generation
+prepare route bytes + route metadata
+prepare next manifest + serialized manifest bytes
 publish segment
 publish route
-compute fallible report inputs that do not require recycle
-publish manifest authority
+collect coexistence accounting
+publish prepared manifest authority
 update self.manifest                 <-- logical commit reflected in process
 recycle WAL
 reopen recycled WAL
@@ -112,13 +115,20 @@ collect final storage accounting
 return SealReport
 ```
 
+Any failure after named immutable publication begins but before manifest
+authority requires reopen if authority is still definitely old, because orphan
+generation files may need normalization.
+
 ### Prune
 
 ```text
 build replacement live generation
-publish replacement segment + route
+prepare next manifest + serialized manifest bytes
 precompute fallible report counts
-publish manifest authority
+publish replacement segment
+publish replacement route
+collect coexistence accounting
+publish prepared manifest authority
 update self.manifest + self.state    <-- deletion authority reflected in process
 reclaim obsolete generations
 collect final storage accounting
