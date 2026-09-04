@@ -199,6 +199,9 @@ impl CheckpointStoreError {
             Self::Io(error) if embedded_recovery_required(error).is_some() => {
                 CheckpointStoreFailureKind::RecoveryRequired
             }
+            Self::Io(error) if error.kind() == io::ErrorKind::OutOfMemory => {
+                CheckpointStoreFailureKind::Capacity
+            }
             Self::Io(_) => CheckpointStoreFailureKind::Io,
             Self::Json(error) => match error.classify() {
                 JsonCategory::Io => CheckpointStoreFailureKind::Io,
@@ -250,6 +253,10 @@ fn embedded_recovery_required(error: &io::Error) -> Option<&RecoveryRequired> {
     error
         .get_ref()
         .and_then(|source| source.downcast_ref::<RecoveryRequired>())
+}
+
+pub(crate) fn capacity_error(message: &'static str) -> CheckpointStoreError {
+    CheckpointStoreError::Io(io::Error::new(io::ErrorKind::OutOfMemory, message))
 }
 
 /// Wraps an I/O failure whose commit outcome cannot safely be treated as a
@@ -361,6 +368,15 @@ mod tests {
             .unwrap()
             .source_error()
             .is_none());
+    }
+
+    #[test]
+    fn allocation_reserve_failure_is_classified_as_capacity() {
+        let error = capacity_error("allocation reserve failed before WAL commit");
+        assert_eq!(
+            error.failure_kind(),
+            CheckpointStoreFailureKind::Capacity
+        );
     }
 
     #[test]
