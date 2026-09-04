@@ -1495,7 +1495,10 @@ fn lazy_checkpoint_range_reads_above_payload_fast_path_cap(
 fn recovery_required_writer_blocks_mutations_but_keeps_reads_available(
 ) -> Result<(), Box<dyn std::error::Error>> {
     fn assert_recovery_required<T>(result: Result<T, CheckpointStoreError>) {
-        let error = result.expect_err("poisoned writer mutation must fail");
+        let error = match result {
+            Ok(_) => panic!("poisoned writer mutation must fail"),
+            Err(error) => error,
+        };
         assert_eq!(
             error.failure_kind(),
             crate::CheckpointStoreFailureKind::RecoveryRequired
