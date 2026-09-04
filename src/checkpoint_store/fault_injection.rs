@@ -33,3 +33,99 @@ pub(super) fn maybe_file_crash(path: &Path, stage: &str) {
         maybe_crash(&format!("after-{kind}-{stage}"));
     }
 }
+
+
+pub(crate) const WAL_IO_FAULT_ENV: &str = "TULYA_CHECKPOINT_STORE_WAL_IO_FAULT";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalIoFault {
+    ShortWrite(usize),
+    WriteEnospcAfter(usize),
+    FlushEioAfter,
+    SyncEioAfter,
+    ReserveEnospcAfterSetLen,
+}
+
+#[cfg(feature = "fault-injection")]
+pub(crate) fn configured_wal_io_fault() -> io::Result<Option<WalIoFault>> {
+    let Some(raw) = std::env::var_os(WAL_IO_FAULT_ENV) else {
+        return Ok(None);
+    };
+    let raw = raw.into_string().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "hot WAL fault-injection value is not UTF-8",
+        )
+    })?;
+    let fault = if let Some(value) = raw.strip_prefix("short-write=") {
+        let limit = parse_fault_usize(value, "short-write")?;
+        if limit == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "short-write fault limit must be positive",
+            ));
+        }
+        WalIoFault::ShortWrite(limit)
+    } else if let Some(value) = raw.strip_prefix("write-enospc-after=") {
+        WalIoFault::WriteEnospcAfter(parse_fault_usize(value, "write-enospc-after")?)
+    } else {
+        match raw.as_str() {
+            "flush-eio-after" => WalIoFault::FlushEioAfter,
+            "sync-eio-after" => WalIoFault::SyncEioAfter,
+            "reserve-enospc-after-set-len" => WalIoFault::ReserveEnospcAfterSetLen,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unknown hot WAL fault-injection value",
+                ));
+            }
+        }
+    };
+    Ok(Some(fault))
+}
+
+#[cfg(not(feature = "fault-injection"))]
+#[inline]
+pub(crate) fn configured_wal_io_fault() -> io::Result<Option<WalIoFault>> {
+    Ok(None)
+}
+
+#[cfg(feature = "fault-injection")]
+fn parse_fault_usize(value: &str, label: &str) -> io::Result<usize> {
+    value.parse::<usize>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid {label} hot WAL fault-injection limit"),
+        )
+    })
+}
+
+#[cfg(unix)]
+pub(crate) fn injected_disk_full_error() -> io::Error {
+    io::Error::from_raw_os_error(28)
+}
+
+#[cfg(windows)]
+pub(crate) fn injected_disk_full_error() -> io::Error {
+    io::Error::from_raw_os_error(112)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn injected_disk_full_error() -> io::Error {
+    io::Error::other("injected hot WAL storage-full failure")
+}
+
+#[cfg(unix)]
+pub(crate) fn injected_io_error() -> io::Error {
+    io::Error::from_raw_os_error(5)
+}
+
+#[cfg(windows)]
+pub(crate) fn injected_io_error() -> io::Error {
+    io::Error::from_raw_os_error(1117)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn injected_io_error() -> io::Error {
+    io::Error::other("injected hot WAL I/O failure")
+}
