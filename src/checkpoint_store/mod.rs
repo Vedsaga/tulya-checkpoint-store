@@ -32,6 +32,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use xxhash_rust::xxh3::{xxh3_64, Xxh3};
 
+use crate::hot_wal_commit::{FileHotWalCommitIo, HotWalCommitter};
+
 mod storage_format;
 use storage_format::*;
 
@@ -550,6 +552,7 @@ pub struct HotWal {
     file: File,
     logical_tail: u64,
     config: CheckpointStoreConfig,
+    committer: HotWalCommitter,
 }
 
 impl HotWal {
@@ -604,6 +607,7 @@ impl HotWal {
             file,
             logical_tail,
             config,
+            committer: HotWalCommitter::default(),
         })
     }
 
@@ -617,6 +621,7 @@ impl HotWal {
         &mut self,
         transaction: &[u8],
     ) -> Result<HotWalAppendReport, CheckpointStoreError> {
+        self.ensure_writable()?;
         let tx_len = u64::try_from(transaction.len())
             .map_err(|_| format_error("transaction length does not fit u64"))?;
         let required_tail = self
@@ -624,31 +629,39 @@ impl HotWal {
             .checked_add(tx_len)
             .ok_or_else(|| format_error("WAL logical tail overflow"))?;
         let current_capacity = self.file.metadata()?.len();
-        if required_tail > current_capacity {
+        let capacity_bytes = if required_tail > current_capacity {
             let new_capacity = round_capacity(required_tail, self.config.wal_segment_bytes)?;
-            preinitialize_range(
+            if let Err(error) = preinitialize_range(
                 &mut self.file,
                 current_capacity,
                 new_capacity,
                 self.config.preinit_chunk_bytes,
-            )?;
-            self.file.seek(SeekFrom::Start(self.logical_tail))?;
-        }
+            ) {
+                return Err(self.recovery_required_after_mutation(error));
+            }
+            if let Err(source) = self.file.seek(SeekFrom::Start(self.logical_tail)) {
+                return Err(
+                    self.committer
+                        .recovery_required_error(&self.path, Some(source)),
+                );
+            }
+            new_capacity
+        } else {
+            current_capacity
+        };
 
-        let write_started = Instant::now();
-        self.file.write_all(transaction)?;
-        self.file.flush()?;
-        let write_ns = write_started.elapsed().as_nanos();
-        let sync_started = Instant::now();
-        self.file.sync_data()?;
-        let sync_data_ns = sync_started.elapsed().as_nanos();
+        let timings = {
+            let mut io = FileHotWalCommitIo::new(&mut self.file);
+            self.committer
+                .commit(&self.path, &mut io, transaction)?
+        };
         self.logical_tail = required_tail;
         Ok(HotWalAppendReport {
             transaction_bytes: tx_len,
             logical_tail_bytes: required_tail,
-            capacity_bytes: self.file.metadata()?.len(),
-            write_ns,
-            sync_data_ns,
+            capacity_bytes,
+            write_ns: timings.write_ns,
+            sync_data_ns: timings.sync_data_ns,
         })
     }
 
@@ -667,11 +680,50 @@ impl HotWal {
         Ok(self.file.metadata()?.len())
     }
 
+    fn ensure_writable(&self) -> Result<(), CheckpointStoreError> {
+        self.committer.ensure_writable(&self.path)
+    }
+
+    fn recovery_required_after_mutation(
+        &mut self,
+        error: CheckpointStoreError,
+    ) -> CheckpointStoreError {
+        match error {
+            CheckpointStoreError::Io(source) => self
+                .committer
+                .recovery_required_error(&self.path, Some(source)),
+            other => {
+                self.committer.mark_recovery_required();
+                other
+            }
+        }
+    }
+
     fn replace_after_recycle(&mut self, new_tail: u64) -> Result<(), CheckpointStoreError> {
-        self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        self.ensure_writable()?;
+        let mut file = match OpenOptions::new().read(true).write(true).open(&self.path) {
+            Ok(file) => file,
+            Err(source) => {
+                return Err(
+                    self.committer
+                        .recovery_required_error(&self.path, Some(source)),
+                );
+            }
+        };
+        if let Err(source) = file.seek(SeekFrom::Start(new_tail)) {
+            return Err(
+                self.committer
+                    .recovery_required_error(&self.path, Some(source)),
+            );
+        }
+        self.file = file;
         self.logical_tail = new_tail;
-        self.file.seek(SeekFrom::Start(new_tail))?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn poison_for_test(&mut self) {
+        self.committer.mark_recovery_required();
     }
 }
 
