@@ -16,7 +16,7 @@ The crate therefore exposes a stable, non-exhaustive `CheckpointStoreFailureKind
 - `Deleted`: the exact identity is a durable tombstone. It must not be resurrected.
 - `Stale`: the requested live identity no longer exists or the caller's reference is stale.
 - `LockBusy`: another owner holds the required exclusive resource. No storage corruption is implied.
-- `Capacity`: a configured, representable, allocation, or bounded resource limit was exceeded before commit authority changed. Fallible pre-commit container reservations use this class rather than panicking or masquerading as format corruption.
+- `Capacity`: a configured, representable, allocation, storage-full, or bounded resource limit was exceeded before commit authority changed. Fallible pre-commit container reservations and definite pre-write ENOSPC use this class rather than panicking, masquerading as format corruption, or collapsing into generic I/O.
 - `Io`: an I/O operation definitely failed and is not classified as an indeterminate commit outcome.
 - `DurabilityIndeterminate`: complete authoritative commit bytes may already have become durable although the caller did not receive success. The writer must not continue normal writes; reopen/recovery plus request identity resolves the result.
 - `RecoveryRequired`: mutable WAL bytes may have changed without a complete acknowledged commit, or the handle is already poisoned by such a failure. No further mutation is permitted on that handle until reopen/recovery normalizes authority.
@@ -47,6 +47,7 @@ Existing semantic variants map directly where meaning is already unambiguous:
 - writer/reclaim lock conflicts -> `LockBusy`
 - prune lifecycle errors -> `Precondition`
 - `Io` carrying `ErrorKind::OutOfMemory` from an explicit pre-commit allocation reservation -> `Capacity`
+- definite platform storage-full/ENOSPC I/O before WAL mutation -> `Capacity`
 - other ordinary `Io` -> `Io`
 - typed durability context embedded in `Io` -> `DurabilityIndeterminate`
 - typed poisoned-writer context embedded in `Io` -> `RecoveryRequired`
@@ -76,7 +77,7 @@ Requestless writes cannot in general be resolved safely after an indeterminate d
 - `failure_kind()` classifies existing unambiguous variants without string parsing,
 - malformed JSON is corruption by `serde_json` category rather than message text,
 - embedded durability-indeterminate and recovery-required errors retain typed context,
-- explicit allocation-reserve failure is classified as `Capacity`,
+- explicit allocation-reserve failure and definite pre-write ENOSPC are classified as `Capacity`,
 - an ordinary I/O error is not accidentally promoted to either class,
 - the existing no-panic/no-unsafe Clippy gate remains green.
 
