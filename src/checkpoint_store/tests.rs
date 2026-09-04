@@ -1489,3 +1489,42 @@ fn lazy_checkpoint_range_reads_above_payload_fast_path_cap(
     assert_eq!(store.verify_all()?.failures, 0);
     Ok(())
 }
+
+
+#[test]
+fn recovery_required_writer_blocks_mutations_but_keeps_reads_available(
+) -> Result<(), Box<dyn std::error::Error>> {
+    fn assert_recovery_required<T>(result: Result<T, CheckpointStoreError>) {
+        let error = result.expect_err("poisoned writer mutation must fail");
+        assert_eq!(
+            error.failure_kind(),
+            crate::CheckpointStoreFailureKind::RecoveryRequired
+        );
+    }
+
+    let temp = tempfile::tempdir()?;
+    let config = CheckpointStoreConfig::default();
+    let mut store = CheckpointStore::open(temp.path(), config)?;
+    store.append_checkpoint("thread", "cp-1", 1, None, b"{}")?;
+    store.seal_through(1)?;
+    let expected = store.read_checkpoint("thread", "cp-1")?;
+    let store_id = store.store_id();
+
+    store.hot.poison_for_test();
+
+    assert_recovery_required(store.append_checkpoint(
+        "thread",
+        "cp-2",
+        2,
+        Some("cp-1"),
+        b"{\"next\":true}",
+    ));
+    assert_recovery_required(store.seal_through(2));
+    assert_recovery_required(store.delete_checkpoint_subtree("thread", "cp-1"));
+    assert_recovery_required(store.reidentify_copied_store());
+    assert_recovery_required(store.reclaim_deferred_generations());
+
+    assert_eq!(store.store_id(), store_id);
+    assert_eq!(store.read_checkpoint("thread", "cp-1")?, expected);
+    Ok(())
+}
