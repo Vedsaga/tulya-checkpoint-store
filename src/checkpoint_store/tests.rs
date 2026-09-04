@@ -1571,7 +1571,7 @@ fn committed_maintenance_poisoning_reports_committed_authority(
     store.append_checkpoint("thread", "cp-1", 1, None, b"{}")?;
 
     let error = match store.committed_maintenance::<()>(Err(
-        io::Error::new(io::ErrorKind::Other, "post-commit maintenance failure").into(),
+        io::Error::other("post-commit maintenance failure").into(),
     )) {
         Ok(()) => return Err("post-commit maintenance unexpectedly succeeded".into()),
         Err(error) => error,
