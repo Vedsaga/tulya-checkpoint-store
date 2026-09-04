@@ -78,13 +78,7 @@ fn open_two_checkpoint_store() -> Result<TwoCheckpointStore, Box<dyn Error>> {
     let temp = tempfile::tempdir()?;
     let mut store = CheckpointStore::open(temp.path(), CheckpointStoreConfig::default())?;
     store.append_checkpoint("thread", "cp-1", 1, None, b"{\"value\":1}")?;
-    store.append_checkpoint(
-        "thread",
-        "cp-2",
-        2,
-        Some("cp-1"),
-        b"{\"value\":2}",
-    )?;
+    store.append_checkpoint("thread", "cp-2", 2, Some("cp-1"), b"{\"value\":2}")?;
     let first = store.read_checkpoint("thread", "cp-1")?;
     let second = store.read_checkpoint("thread", "cp-2")?;
     Ok(TwoCheckpointStore {
@@ -184,13 +178,7 @@ fn live_manifest_and_recycle_faults_recover_exact_authority() -> Result<(), Box<
         assert!(error.recovery_required().is_none());
         assert_eq!(store.sealed_checkpoint_count(), 0);
 
-        store.append_checkpoint(
-            "thread",
-            "cp-3",
-            3,
-            Some("cp-2"),
-            b"{\"value\":3}",
-        )?;
+        store.append_checkpoint("thread", "cp-3", 3, Some("cp-2"), b"{\"value\":3}")?;
         drop(store);
 
         let reopened = CheckpointStore::open(temp.path(), CheckpointStoreConfig::default())?;
@@ -211,10 +199,7 @@ fn live_manifest_and_recycle_faults_recover_exact_authority() -> Result<(), Box<
             second,
         } = open_two_checkpoint_store()?;
         let error = {
-            let _fault = EnvGuard::set(
-                PUBLICATION_IO_FAULT_ENV,
-                "manifest-rename-eio-before",
-            );
+            let _fault = EnvGuard::set(PUBLICATION_IO_FAULT_ENV, "manifest-rename-eio-before");
             expect_error(store.seal_through(1))?
         };
         assert_indeterminate(&error, DurabilityOperation::Rename)?;
@@ -237,10 +222,7 @@ fn live_manifest_and_recycle_faults_recover_exact_authority() -> Result<(), Box<
             second,
         } = open_two_checkpoint_store()?;
         let error = {
-            let _fault = EnvGuard::set(
-                PUBLICATION_IO_FAULT_ENV,
-                "manifest-rename-eio-after",
-            );
+            let _fault = EnvGuard::set(PUBLICATION_IO_FAULT_ENV, "manifest-rename-eio-after");
             expect_error(store.seal_through(1))?
         };
         assert_indeterminate(&error, DurabilityOperation::Rename)?;
@@ -263,10 +245,7 @@ fn live_manifest_and_recycle_faults_recover_exact_authority() -> Result<(), Box<
             second,
         } = open_two_checkpoint_store()?;
         let error = {
-            let _fault = EnvGuard::set(
-                PUBLICATION_IO_FAULT_ENV,
-                "manifest-dir-sync-eio-after",
-            );
+            let _fault = EnvGuard::set(PUBLICATION_IO_FAULT_ENV, "manifest-dir-sync-eio-after");
             expect_error(store.seal_through(1))?
         };
         assert_indeterminate(&error, DurabilityOperation::DirectorySync)?;
