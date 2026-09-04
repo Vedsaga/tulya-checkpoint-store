@@ -543,6 +543,8 @@ mod tests {
             encode_v2_commit(V2WalGeometry::default(), &transaction, Some(b"req-1")).unwrap();
         apply_v2_commit(&mut state, &encoded).unwrap();
         state.retire_request(b"req-1").unwrap();
+        assert!(!state.request_records.contains_key(b"req-1".as_slice()));
+        assert_eq!(state.retired_requests.get(b"req-1".as_slice()), Some(&digest));
         assert_eq!(
             state.classify_request(b"req-1", digest),
             Ok(V2RequestStatus::Retired)
