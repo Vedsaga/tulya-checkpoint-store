@@ -37,7 +37,7 @@ use crate::hot_wal_commit::{FileHotWalCommitIo, HotWalCommitter};
 mod storage_format;
 use storage_format::*;
 
-mod fault_injection;
+pub(crate) mod fault_injection;
 use fault_injection::*;
 
 mod fsck;
@@ -650,7 +650,7 @@ impl HotWal {
         };
 
         let timings = {
-            let mut io = FileHotWalCommitIo::new(&mut self.file);
+            let mut io = FileHotWalCommitIo::new(&mut self.file)?;
             self.committer.commit(&self.path, &mut io, transaction)?
         };
         self.logical_tail = required_tail;
@@ -890,7 +890,11 @@ fn preinitialize_range(
     if to <= from {
         return Ok(());
     }
+    let fault = configured_wal_io_fault()?;
     file.set_len(to)?;
+    if fault == Some(WalIoFault::ReserveEnospcAfterSetLen) {
+        return Err(injected_disk_full_error().into());
+    }
     file.seek(SeekFrom::Start(from))?;
     let zeros = vec![0u8; chunk_bytes];
     let mut cursor = from;
