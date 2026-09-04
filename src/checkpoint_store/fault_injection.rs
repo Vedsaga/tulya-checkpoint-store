@@ -35,8 +35,10 @@ pub(super) fn maybe_file_crash(path: &Path, stage: &str) {
 }
 
 
+#[cfg(feature = "fault-injection")]
 pub(crate) const WAL_IO_FAULT_ENV: &str = "TULYA_CHECKPOINT_STORE_WAL_IO_FAULT";
 
+#[cfg(feature = "fault-injection")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WalIoFault {
     ShortWrite(usize),
@@ -84,12 +86,6 @@ pub(crate) fn configured_wal_io_fault() -> io::Result<Option<WalIoFault>> {
     Ok(Some(fault))
 }
 
-#[cfg(not(feature = "fault-injection"))]
-#[inline]
-pub(crate) fn configured_wal_io_fault() -> io::Result<Option<WalIoFault>> {
-    Ok(None)
-}
-
 #[cfg(feature = "fault-injection")]
 fn parse_fault_usize(value: &str, label: &str) -> io::Result<usize> {
     value.parse::<usize>().map_err(|_| {
@@ -100,32 +96,32 @@ fn parse_fault_usize(value: &str, label: &str) -> io::Result<usize> {
     })
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "fault-injection", unix))]
 pub(crate) fn injected_disk_full_error() -> io::Error {
     io::Error::from_raw_os_error(28)
 }
 
-#[cfg(windows)]
+#[cfg(all(feature = "fault-injection", windows))]
 pub(crate) fn injected_disk_full_error() -> io::Error {
     io::Error::from_raw_os_error(112)
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(all(feature = "fault-injection", not(any(unix, windows))))]
 pub(crate) fn injected_disk_full_error() -> io::Error {
     io::Error::other("injected hot WAL storage-full failure")
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "fault-injection", unix))]
 pub(crate) fn injected_io_error() -> io::Error {
     io::Error::from_raw_os_error(5)
 }
 
-#[cfg(windows)]
+#[cfg(all(feature = "fault-injection", windows))]
 pub(crate) fn injected_io_error() -> io::Error {
     io::Error::from_raw_os_error(1117)
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(all(feature = "fault-injection", not(any(unix, windows))))]
 pub(crate) fn injected_io_error() -> io::Error {
     io::Error::other("injected hot WAL I/O failure")
 }
