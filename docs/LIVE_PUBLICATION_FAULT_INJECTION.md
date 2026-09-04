@@ -1,7 +1,9 @@
 # Live manifest and WAL-recycle fault injection
 
-Status: staged production-resilience evidence. Local Rust 1.80 verification is
-required before this unit is accepted.
+Status: accepted manifest/WAL-recycle resilience evidence. Strict feature-enabled
+Clippy passed, the live publication matrix passed, error classification passed
+8/8, Rust 1.80 formatting passed, and the full library suite passed 109/109.
+Immutable segment/route publication faults are tracked separately.
 
 ## DECISION
 
@@ -11,7 +13,7 @@ The existing `fault-injection` feature now includes a publication-I/O channel:
 TULYA_CHECKPOINT_STORE_PUBLICATION_IO_FAULT
 ```
 
-Supported cases are:
+This document covers these accepted cases:
 
 ```text
 manifest-sync-eio-after
@@ -23,6 +25,9 @@ wal-recycle-rename-eio-before
 wal-recycle-rename-eio-after
 wal-recycle-dir-sync-eio-after
 ```
+
+The same feature-gated channel also carries segment/route cases documented in
+`docs/LIVE_IMMUTABLE_ARTIFACT_FAULT_INJECTION.md`.
 
 All publication fault parsing and state compile only with the
 `fault-injection` Cargo feature.
