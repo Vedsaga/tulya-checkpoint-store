@@ -150,6 +150,20 @@ impl CheckpointStore {
         }
     }
 
+    fn publish_generation_manifest_authority(
+        &mut self,
+        next_manifest: &Manifest,
+    ) -> Result<(), CheckpointStoreError> {
+        match self.publish_manifest_authority(next_manifest) {
+            Ok(()) => Ok(()),
+            Err(error) if error.durability_indeterminate().is_some() => Err(error),
+            Err(error) => {
+                let path = self.dir.join(MANIFEST_FILE);
+                Err(self.pre_authority_artifact_failure(&path, error))
+            }
+        }
+    }
+
     pub(super) fn committed_maintenance<T>(
         &mut self,
         result: Result<T, CheckpointStoreError>,
@@ -354,7 +368,7 @@ impl CheckpointStore {
             }
         };
 
-        self.publish_manifest_authority(&next_manifest)?;
+        self.publish_generation_manifest_authority(&next_manifest)?;
         self.manifest = next_manifest;
         self.state = compacted.state;
         self.range_sizes.borrow_mut().clear();
@@ -1045,7 +1059,7 @@ impl CheckpointStore {
             }
         };
 
-        self.publish_manifest_authority(&next_manifest)?;
+        self.publish_generation_manifest_authority(&next_manifest)?;
         self.manifest = next_manifest;
 
         let recycle_result = recycle_hot_file(
