@@ -1,4 +1,5 @@
 use super::*;
+use crate::error_classification::capacity_error;
 
 pub(super) fn read_u32(data: &[u8], offset: usize) -> Result<u32, CheckpointStoreError> {
     let end = offset
@@ -1281,6 +1282,30 @@ pub(super) fn validate_new_nodes(
     Ok(())
 }
 
+fn try_clone_string(
+    value: &str,
+    message: &'static str,
+) -> Result<String, CheckpointStoreError> {
+    let mut output = String::new();
+    output
+        .try_reserve_exact(value.len())
+        .map_err(|_| capacity_error(message))?;
+    output.push_str(value);
+    Ok(output)
+}
+
+fn try_clone_bytes(
+    value: &[u8],
+    message: &'static str,
+) -> Result<Vec<u8>, CheckpointStoreError> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(value.len())
+        .map_err(|_| capacity_error(message))?;
+    output.extend_from_slice(value);
+    Ok(output)
+}
+
 pub(super) struct PreparedTransactionApply {
     tx: ParsedTransaction,
     new_thread: Option<(String, String, u32)>,
@@ -1314,31 +1339,31 @@ pub(super) fn prepare_transaction_apply(
     state
         .arena_bytes
         .try_reserve(tx.bytes.len())
-        .map_err(|_| format_error("arena allocation reserve failed before WAL commit"))?;
+        .map_err(|_| capacity_error("arena allocation reserve failed before WAL commit"))?;
     state
         .compact_nodes
         .try_reserve(tx.compact_nodes.len())
-        .map_err(|_| format_error("compact-node allocation reserve failed before WAL commit"))?;
+        .map_err(|_| capacity_error("compact-node allocation reserve failed before WAL commit"))?;
     state
         .wide_nodes
         .try_reserve(tx.wide_nodes.len())
-        .map_err(|_| format_error("wide-node allocation reserve failed before WAL commit"))?;
+        .map_err(|_| capacity_error("wide-node allocation reserve failed before WAL commit"))?;
     state
         .versions
         .try_reserve(tx.roots.len())
-        .map_err(|_| format_error("version allocation reserve failed before WAL commit"))?;
+        .map_err(|_| capacity_error("version allocation reserve failed before WAL commit"))?;
     state
         .parents
         .try_reserve(tx.parents.len())
-        .map_err(|_| format_error("version-parent allocation reserve failed before WAL commit"))?;
+        .map_err(|_| capacity_error("version-parent allocation reserve failed before WAL commit"))?;
     state
         .checkpoints
         .try_reserve(1)
-        .map_err(|_| format_error("checkpoint allocation reserve failed before WAL commit"))?;
+        .map_err(|_| capacity_error("checkpoint allocation reserve failed before WAL commit"))?;
     state
         .checkpoint_ordinals
         .try_reserve(1)
-        .map_err(|_| format_error("checkpoint-index allocation reserve failed before WAL commit"))?;
+        .map_err(|_| capacity_error("checkpoint-index allocation reserve failed before WAL commit"))?;
 
     let new_thread = if state
         .thread_ordinals
@@ -1351,31 +1376,49 @@ pub(super) fn prepare_transaction_apply(
         state
             .threads
             .try_reserve(1)
-            .map_err(|_| format_error("thread allocation reserve failed before WAL commit"))?;
+            .map_err(|_| capacity_error("thread allocation reserve failed before WAL commit"))?;
         state
             .thread_ordinals
             .try_reserve(1)
-            .map_err(|_| format_error("thread-index allocation reserve failed before WAL commit"))?;
+            .map_err(|_| capacity_error("thread-index allocation reserve failed before WAL commit"))?;
         Some((
-            tx.checkpoint.thread_id.clone(),
-            tx.checkpoint.thread_id.clone(),
+            try_clone_string(
+                &tx.checkpoint.thread_id,
+                "thread-index key allocation failed before WAL commit",
+            )?,
+            try_clone_string(
+                &tx.checkpoint.thread_id,
+                "thread value allocation failed before WAL commit",
+            )?,
             ordinal,
         ))
     };
 
     let checkpoint_key = (
-        tx.checkpoint.thread_id.clone(),
-        tx.checkpoint.checkpoint_id.clone(),
+        try_clone_string(
+            &tx.checkpoint.thread_id,
+            "checkpoint-index thread allocation failed before WAL commit",
+        )?,
+        try_clone_string(
+            &tx.checkpoint.checkpoint_id,
+            "checkpoint-index id allocation failed before WAL commit",
+        )?,
     );
     let request_record = if let Some(request_id) = tx.request_id.as_ref() {
         state
             .request_records
             .try_reserve(1)
-            .map_err(|_| format_error("request-index allocation reserve failed before WAL commit"))?;
+            .map_err(|_| capacity_error("request-index allocation reserve failed before WAL commit"))?;
         Some((
-            request_id.clone(),
+            try_clone_bytes(
+                request_id,
+                "request-index key allocation failed before WAL commit",
+            )?,
             RequestRecord {
-                key: request_id.clone(),
+                key: try_clone_bytes(
+                    request_id,
+                    "request-record key allocation failed before WAL commit",
+                )?,
                 operation_digest: tx.operation_digest,
                 checkpoint_ordinal: tx.checkpoint.ordinal,
             },
@@ -1429,15 +1472,6 @@ pub(super) fn apply_prepared_transaction(
         let _ = state.request_records.insert(request_id, record);
     }
     state.checkpoints.push(checkpoint);
-}
-
-pub(super) fn apply_transaction(
-    state: &mut StoreState,
-    tx: &ParsedTransaction,
-) -> Result<(), CheckpointStoreError> {
-    let prepared = prepare_transaction_apply(state, tx.clone())?;
-    apply_prepared_transaction(state, prepared);
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
