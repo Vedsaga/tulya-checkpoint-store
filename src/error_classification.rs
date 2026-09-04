@@ -136,11 +136,16 @@ impl Error for DurabilityIndeterminate {
 pub struct RecoveryRequired {
     path: PathBuf,
     source: Option<io::Error>,
+    authority_committed: bool,
 }
 
 impl RecoveryRequired {
-    fn new(path: PathBuf, source: Option<io::Error>) -> Self {
-        Self { path, source }
+    fn new(path: PathBuf, source: Option<io::Error>, authority_committed: bool) -> Self {
+        Self {
+            path,
+            source,
+            authority_committed,
+        }
     }
 
     /// Returns the WAL/filesystem object that must be recovered before reuse.
@@ -155,16 +160,35 @@ impl RecoveryRequired {
     pub fn source_error(&self) -> Option<&io::Error> {
         self.source.as_ref()
     }
+
+    /// Returns true when durable manifest authority is already known to contain
+    /// the requested logical operation even though this writer must reopen
+    /// before further mutation.
+    #[must_use]
+    pub const fn authority_committed(&self) -> bool {
+        self.authority_committed
+    }
 }
 
 impl fmt::Display for RecoveryRequired {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.source {
+            Some(source) if self.authority_committed => write!(
+                formatter,
+                "writer requires reopen/recovery for {} after committed authority and I/O failure: {}",
+                self.path.display(),
+                source
+            ),
             Some(source) => write!(
                 formatter,
                 "writer requires reopen/recovery for {} after I/O failure: {}",
                 self.path.display(),
                 source
+            ),
+            None if self.authority_committed => write!(
+                formatter,
+                "writer requires reopen/recovery for {} after committed authority",
+                self.path.display()
             ),
             None => write!(
                 formatter,
@@ -300,7 +324,20 @@ pub(crate) fn recovery_required_error(
     let kind = source
         .as_ref()
         .map_or(io::ErrorKind::Other, io::Error::kind);
-    let context = RecoveryRequired::new(path.to_path_buf(), source);
+    let context = RecoveryRequired::new(path.to_path_buf(), source, false);
+    CheckpointStoreError::Io(io::Error::new(kind, context))
+}
+
+/// Wraps a post-authority failure. The requested logical manifest transition is
+/// already known durable, but the current writer must reopen before mutation.
+pub(crate) fn recovery_required_after_commit_error(
+    path: &Path,
+    source: Option<io::Error>,
+) -> CheckpointStoreError {
+    let kind = source
+        .as_ref()
+        .map_or(io::ErrorKind::Other, io::Error::kind);
+    let context = RecoveryRequired::new(path.to_path_buf(), source, true);
     CheckpointStoreError::Io(io::Error::new(kind, context))
 }
 
@@ -377,6 +414,7 @@ mod tests {
             context.source_error().and_then(io::Error::raw_os_error),
             Some(5)
         );
+        assert!(!context.authority_committed());
 
         let poisoned = recovery_required_error(Path::new("/tmp/hot.wal"), None);
         assert_eq!(
@@ -388,6 +426,24 @@ mod tests {
             .unwrap()
             .source_error()
             .is_none());
+    }
+
+    #[test]
+    fn post_commit_recovery_context_marks_authority_committed() {
+        let error = recovery_required_after_commit_error(
+            Path::new("/tmp/structured-segment-manifest.json"),
+            Some(io::Error::from_raw_os_error(5)),
+        );
+        assert_eq!(
+            error.failure_kind(),
+            CheckpointStoreFailureKind::RecoveryRequired
+        );
+        let context = error.recovery_required().unwrap();
+        assert!(context.authority_committed());
+        assert_eq!(
+            context.source_error().and_then(io::Error::raw_os_error),
+            Some(5)
+        );
     }
 
     #[test]
