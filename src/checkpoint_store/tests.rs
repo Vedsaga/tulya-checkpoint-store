@@ -1561,3 +1561,46 @@ fn prepared_transaction_apply_does_not_publish_before_commit(
     );
     Ok(())
 }
+
+
+#[test]
+fn committed_maintenance_poisoning_reports_committed_authority(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let mut store = CheckpointStore::open(temp.path(), CheckpointStoreConfig::default())?;
+    store.append_checkpoint("thread", "cp-1", 1, None, b"{}")?;
+
+    let error = match store.committed_maintenance::<()>(Err(
+        io::Error::new(io::ErrorKind::Other, "post-commit maintenance failure").into(),
+    )) {
+        Ok(()) => return Err("post-commit maintenance unexpectedly succeeded".into()),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error.failure_kind(),
+        crate::CheckpointStoreFailureKind::RecoveryRequired
+    );
+    let context = error
+        .recovery_required()
+        .ok_or("missing recovery-required context")?;
+    assert!(context.authority_committed());
+
+    let blocked = match store.append_checkpoint("thread", "cp-2", 2, Some("cp-1"), b"{}") {
+        Ok(_) => return Err("poisoned writer unexpectedly accepted a mutation".into()),
+        Err(error) => error,
+    };
+    assert_eq!(
+        blocked.failure_kind(),
+        crate::CheckpointStoreFailureKind::RecoveryRequired
+    );
+    assert!(!blocked
+        .recovery_required()
+        .ok_or("missing poisoned-writer context")?
+        .authority_committed());
+    assert_eq!(
+        store.read_checkpoint("thread", "cp-1")?,
+        b"{\"identity\":{},\"messages\":[]}"
+    );
+    Ok(())
+}
