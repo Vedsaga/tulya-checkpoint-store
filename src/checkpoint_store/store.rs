@@ -280,16 +280,7 @@ impl CheckpointStore {
         let replacement =
             write_compacted_generation(&self.dir, generation, self.config, &compacted)?;
         let segment_final = self.dir.join(&replacement.finalized.meta.file);
-        if let Err(error) =
-            publish_existing_tmp(&replacement.finalized.tmp_path, &segment_final)
-        {
-            return Err(self.pre_authority_artifact_failure(&segment_final, error));
-        }
-
         let route_path = self.dir.join(&replacement.route_meta.file);
-        if let Err(error) = staged_write_new(&route_path, &replacement.route_bytes) {
-            return Err(self.pre_authority_artifact_failure(&route_path, error));
-        }
         let next_manifest = Manifest {
             generation,
             sealed_end_wal_bytes: 0,
@@ -330,7 +321,21 @@ impl CheckpointStore {
             .segment_file_bytes
             .checked_add(replacement.route_meta.route_file_bytes)
             .ok_or_else(|| format_error("prune rewritten byte count overflow"))?;
-        let coexistence = tree_storage(&self.dir)?;
+
+        if let Err(error) =
+            publish_existing_tmp(&replacement.finalized.tmp_path, &segment_final)
+        {
+            return Err(self.pre_authority_artifact_failure(&segment_final, error));
+        }
+        if let Err(error) = staged_write_new(&route_path, &replacement.route_bytes) {
+            return Err(self.pre_authority_artifact_failure(&route_path, error));
+        }
+        let coexistence = match tree_storage(&self.dir) {
+            Ok(storage) => storage,
+            Err(error) => {
+                return Err(self.pre_authority_artifact_failure(&self.dir.clone(), error));
+            }
+        };
 
         self.publish_manifest_authority(&next_manifest)?;
         self.manifest = next_manifest;
@@ -973,18 +978,10 @@ impl CheckpointStore {
             version_end,
         )?;
         let segment_final = self.dir.join(&finalized.meta.file);
-        maybe_crash("after-segment-write");
-        if let Err(error) = publish_existing_tmp(&finalized.tmp_path, &segment_final) {
-            return Err(self.pre_authority_artifact_failure(&segment_final, error));
-        }
-
         let (route_bytes, route_hash) =
             build_route_file(generation, &new_threads, &new_checkpoints, &new_requests)?;
         let route_name = format!("route-g{generation:06}.t3r");
         let route_path = self.dir.join(&route_name);
-        if let Err(error) = staged_write_new(&route_path, &route_bytes) {
-            return Err(self.pre_authority_artifact_failure(&route_path, error));
-        }
         let route_meta = RouteMeta {
             generation,
             file: route_name,
@@ -1014,7 +1011,20 @@ impl CheckpointStore {
             retired_requests: self.manifest.retired_requests.clone(),
         };
         let suffix_len = parsed.logical_tail.saturating_sub(source_offset);
-        let coexistence = tree_storage(&self.dir)?;
+
+        maybe_crash("after-segment-write");
+        if let Err(error) = publish_existing_tmp(&finalized.tmp_path, &segment_final) {
+            return Err(self.pre_authority_artifact_failure(&segment_final, error));
+        }
+        if let Err(error) = staged_write_new(&route_path, &route_bytes) {
+            return Err(self.pre_authority_artifact_failure(&route_path, error));
+        }
+        let coexistence = match tree_storage(&self.dir) {
+            Ok(storage) => storage,
+            Err(error) => {
+                return Err(self.pre_authority_artifact_failure(&self.dir.clone(), error));
+            }
+        };
 
         self.publish_manifest_authority(&next_manifest)?;
         self.manifest = next_manifest;
