@@ -1562,7 +1562,6 @@ fn prepared_transaction_apply_does_not_publish_before_commit(
     Ok(())
 }
 
-
 #[test]
 fn committed_maintenance_poisoning_reports_committed_authority(
 ) -> Result<(), Box<dyn std::error::Error>> {
