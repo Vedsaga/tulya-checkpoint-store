@@ -330,10 +330,11 @@ impl CheckpointStore {
         if let Err(error) = staged_write_new(&route_path, &replacement.route_bytes) {
             return Err(self.pre_authority_artifact_failure(&route_path, error));
         }
-        let coexistence = match tree_storage(&self.dir) {
+        let store_dir = self.dir.clone();
+        let coexistence = match tree_storage(&store_dir) {
             Ok(storage) => storage,
             Err(error) => {
-                return Err(self.pre_authority_artifact_failure(&self.dir.clone(), error));
+                return Err(self.pre_authority_artifact_failure(&store_dir, error));
             }
         };
 
@@ -1019,10 +1020,11 @@ impl CheckpointStore {
         if let Err(error) = staged_write_new(&route_path, &route_bytes) {
             return Err(self.pre_authority_artifact_failure(&route_path, error));
         }
-        let coexistence = match tree_storage(&self.dir) {
+        let store_dir = self.dir.clone();
+        let coexistence = match tree_storage(&store_dir) {
             Ok(storage) => storage,
             Err(error) => {
-                return Err(self.pre_authority_artifact_failure(&self.dir.clone(), error));
+                return Err(self.pre_authority_artifact_failure(&store_dir, error));
             }
         };
 
