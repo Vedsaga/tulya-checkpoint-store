@@ -1569,9 +1569,10 @@ fn committed_maintenance_poisoning_reports_committed_authority(
     let mut store = CheckpointStore::open(temp.path(), CheckpointStoreConfig::default())?;
     store.append_checkpoint("thread", "cp-1", 1, None, b"{}")?;
 
-    let error = match store.committed_maintenance::<()>(Err(
-        io::Error::other("post-commit maintenance failure").into(),
-    )) {
+    let error = match store
+        .committed_maintenance::<()>(Err(
+            io::Error::other("post-commit maintenance failure").into()
+        )) {
         Ok(()) => return Err("post-commit maintenance unexpectedly succeeded".into()),
         Err(error) => error,
     };
