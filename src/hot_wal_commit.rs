@@ -7,7 +7,7 @@
 use crate::error_classification::{
     durability_indeterminate_error, recovery_required_error, DurabilityOperation,
 };
-use crate::CheckpointStoreError;
+use crate::checkpoint_store::CheckpointStoreError;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
@@ -76,9 +76,7 @@ impl HotWalCommitter {
         io: &mut dyn HotWalCommitIo,
         record: &[u8],
     ) -> Result<HotWalCommitTimings, CheckpointStoreError> {
-        if self.recovery_required {
-            return Err(recovery_required_error(path, None));
-        }
+        self.ensure_writable(path)?;
         if record.is_empty() {
             return Err(CheckpointStoreError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -152,6 +150,27 @@ impl HotWalCommitter {
         })
     }
 
+    pub(crate) fn ensure_writable(&self, path: &Path) -> Result<(), CheckpointStoreError> {
+        if self.recovery_required {
+            Err(recovery_required_error(path, None))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn mark_recovery_required(&mut self) {
+        self.recovery_required = true;
+    }
+
+    pub(crate) fn recovery_required_error(
+        &mut self,
+        path: &Path,
+        source: Option<io::Error>,
+    ) -> CheckpointStoreError {
+        self.recovery_required = true;
+        recovery_required_error(path, source)
+    }
+
     fn write_failure(
         &mut self,
         path: &Path,
@@ -161,8 +180,7 @@ impl HotWalCommitter {
         if bytes_written == 0 {
             return Err(CheckpointStoreError::Io(source));
         }
-        self.recovery_required = true;
-        Err(recovery_required_error(path, Some(source)))
+        Err(self.recovery_required_error(path, Some(source)))
     }
 
     #[cfg(test)]
