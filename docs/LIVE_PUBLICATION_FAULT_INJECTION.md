@@ -1,12 +1,10 @@
 # Live manifest and WAL-recycle fault injection
 
-Status: accepted manifest rename/directory-sync and WAL-recycle evidence, with a
-staged portability hardening for generation-manifest tmp-sync failure. The
-previous strict feature-enabled Clippy, live publication matrix, error
-classification 8/8, Rust 1.80 formatting, and full library 109/109 evidence
-remain valid for the accepted cases; the revised tmp-sync recovery requirement
-must pass the current prune/deletion gate before this document returns to fully
-accepted status.
+Status: accepted manifest/WAL-recycle resilience evidence, including the
+generation-manifest tmp-sync portability hardening. Strict feature-enabled
+Clippy passed; the live publication matrix remained green under the revised
+reopen requirement, and the subsequent prune/deletion gate passed both normal
+109/109 and feature-enabled 110/110 library suites plus the crash matrix.
 
 ## DECISION
 
