@@ -4,6 +4,12 @@ This document is the release contract for taking `tulya-checkpoint-store` from
 its current research/alpha state to a production-quality embedded LangGraph
 checkpointer.
 
+For the implementation sequence that an engineering agent should execute to reach
+the benchmark/user/Hacker News gate, use
+`docs/HN_LAUNCH_EXECUTION_HANDOFF.md`. This document remains the broader release
+contract; the handoff document is the operational work order for the next
+milestone.
+
 It is intentionally stricter than "the tests pass" or "the benchmark looks
 good." Storage software earns trust through explicit semantics, bounded work,
 failure testing, compatibility, independent review, and reproducible evidence.
