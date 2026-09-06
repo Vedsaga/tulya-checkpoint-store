@@ -1,7 +1,10 @@
 # Live prune/deletion/reclaim fault injection
 
-Status: staged production-resilience evidence. Local Rust 1.80 verification is
-required before this unit is accepted.
+Status: accepted Format-v1 prune/deletion/reclaim resilience evidence. Rust 1.80
+formatting and strict feature-enabled Clippy passed; the 15-position live prune
+matrix passed, both publication matrices remained green, the normal library
+suite passed 109/109, the feature-enabled library suite passed 110/110, and the
+existing crash matrix remained green.
 
 ## DECISION
 
