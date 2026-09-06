@@ -18,58 +18,179 @@ the end of this document is satisfied for a named platform/filesystem scope.
 
 ---
 
+## 0. Live audited status — 2026-09-06
+
+This section is the current implementation audit. The detailed sections below
+remain the acceptance contract. A detailed checkbox stays unchecked until the
+requirement is true on the shipping path; partial/reference implementations are
+recorded here rather than being treated as complete.
+
+Status meanings:
+
+- DONE — implemented and evidenced on the path intended to ship.
+- PARTIAL — substantial implementation exists, but shipping integration, scale
+  evidence, CI coverage, or the LangGraph surface is incomplete.
+- BLOCKED — required for the next release gate and currently prevents it.
+- DEFER — useful later, but not required to launch the first usable community
+  alpha.
+
+### Immediate target
+
+The next release target is narrower than "production-ready":
+
+> HN/community-alpha ready: a user can install Tulya from a wheel, use it as the
+> authoritative LangGraph checkpointer without another saver or CLI subprocess,
+> pass official base conformance, survive restart/branch/pending-write
+> scenarios, and reproduce benchmark claims on the final shipping format.
+
+Current verdict: **NOT YET HN-READY**.
+
+The hard launch blockers are:
+
+1. current branch CI is red and required branch protection is absent;
+2. the balanced/local sequence implementation is staged but is not the
+   CheckpointStore shipping path;
+3. there is no PyO3/maturin wheel;
+4. there is no authoritative TulyaSaver; the integration remains a shadow
+   around another saver;
+5. Tulya itself does not implement LangGraph pending writes/base conformance;
+6. performance evidence has not been rerun through the final release format and
+   installed primary saver.
+
+### Pre-release format reset decision
+
+There are no supported users/stores to preserve and 0.1.0 is still unreleased.
+Therefore the current prototype Format v1 is not a compatibility constraint.
+
+Project decision for the first public release:
+
+- discard the existing left-deep/whole-state-hash prototype Format v1 as a
+  release format;
+- finish the staged balanced design currently called v2 and promote it to
+  **release Format v1**;
+- delete migration work whose only purpose was prototype-v1 to staged-v2
+  compatibility;
+- regenerate the golden fixture and benchmark evidence from release Format v1;
+- once the first public release is cut, release Format v1 becomes immutable and
+  future incompatible changes require Format v2 plus an upgrade/migration
+  policy.
+
+Do not mechanically rename every internal V2 symbol before integration is
+stable. First make that design the only writable/readable production path; do
+the naming cleanup before the release-format fixture is frozen.
+
+### Audited workstream ledger
+
+| Section | Workstream | Status | Current evidence / gap |
+| --- | --- | --- | --- |
+| 5 | CI/repository baseline | **BLOCKED** | MSRV and packaged-artifact work exist, but current head 9f5224b is red on Clippy and the branch is unprotected. |
+| 6 | Remove whole-parent append work | **PARTIAL** | Prototype append no longer materializes the whole parent in one Vec, but still streams/hashes O(parent) bytes. |
+| 7 | Balanced persistent sequence | **PARTIAL** | Persistent AVL, stored lengths/commitments, range, snapshot, recovery and compaction modules exist, but are not the shipping store. |
+| 8 | Range-read locality | **PARTIAL** | Range APIs and staged balanced navigation exist; final-format 10 MiB to 1 GiB locality curves are missing. |
+| 9 | Open/recovery scaling | **PARTIAL** | Lazy sealed reader and recovery logic exist; final-format 100k/1m open-time and RSS evidence is missing. |
+| 10 | Format strategy | **DECIDED / IMPLEMENTATION PENDING** | Prototype v1 will be discarded; staged balanced format becomes first release Format v1. |
+| 11 | Live I/O failures | **PARTIAL** | Short-write, ENOSPC, flush/sync and publication fault tests exist; final-format/pending-write/full maintenance matrix and required CI are incomplete. |
+| 12 | Disk-full/maintenance | **PARTIAL** | Foreground WAL ENOSPC and publication cases exist; full near-full seal/delete/compaction/backup campaign is pending. |
+| 13 | Corruption/fuzzing | **PARTIAL** | Fail-closed validation, fsck and conformance work exists; cargo-fuzz and long randomized state-machine campaigns are missing. |
+| 14 | Backup/restore | **DEFER for HN alpha; BLOCKED for production** | No supported backup/restore operation or release drill exists yet. |
+| 15 | Concurrency/process model | **PARTIAL** | Rust process locking and single-writer scope exist; final in-process Python saver concurrency/cancellation behavior is untested. |
+| 16 | Python package/wheel | **BLOCKED** | No PyO3/maturin package or installed wheel; shadow integration shells out to the CLI. |
+| 17 | LangGraph storage model | **PARTIAL** | Shadow adapter demonstrates serializer/message mapping, but no authoritative checkpoint/pending-write schema is implemented in Tulya. |
+| 18 | put_writes | **BLOCKED** | Shadow saver delegates pending writes to the primary saver. |
+| 19 | Base saver capabilities | **BLOCKED** | get_tuple, list, delete_thread and related operations are delegated to the primary saver. |
+| 20 | Official conformance | **BLOCKED** | Official checkpoint conformance is not run against a Tulya primary saver. |
+| 21 | Durability beyond conformance | **BLOCKED after primary saver** | Storage-level crash evidence is strong; Python/LangGraph acknowledgement and retry tests do not exercise Tulya as authority. |
+| 22 | Real graph matrix | **PARTIAL** | Sync/async shadow smoke and sibling/reopen scenarios exist; primary-saver interrupt/resume, pending-write, namespace and arbitrary-channel matrix is pending. |
+| 23 | Extended LangGraph capabilities | **DEFER** | Do not block first launch on copy/prune/delete-for-runs/DeltaChannel-specific optimization. |
+| 24 | Compatibility matrix | **BLOCKED** | Integration is pinned to langgraph 1.2.10 / Python 3.12; min/current/latest-canary coverage is pending. |
+| 25 | Performance evidence | **PARTIAL** | Strong pinned OpenHands/SQLite/Git evidence exists for the prototype path; final release format + primary saver rerun is required. |
+| 26 | Delete/GC/compaction | **PARTIAL** | Rust subtree deletion, tombstones, reclaim and substantial compaction work exist; LangGraph delete_thread integration and final-format evidence remain. |
+| 27 | Security | **PARTIAL** | forbid(unsafe_code), strict linting and SECURITY.md exist; dependency audits, parser fuzzing and FFI/wheel review remain. |
+| 28 | Observability | **PARTIAL** | Evaluator stats/Prometheus exist; final embedded/Python-facing diagnostics are incomplete. |
+| 29 | Platform/filesystem qualification | **NOT STARTED** | Evidence is Linux/filesystem-specific but no explicit supported release matrix exists. |
+| 30 | Supply chain/release | **PARTIAL** | Crate packaging is exercised; wheel artifacts, branch protection, audits and installed-wheel tests remain. |
+| 31 | Independent validation | **DEFER for HN alpha; REQUIRED for production** | No independent review, reproduction or external primary-saver pilot yet. |
+| 32 | Target CI layout | **PARTIAL** | Rust, shadow-LangGraph and packaged-crate jobs exist; wheel/conformance/durability/security/fault jobs are missing. |
+| 33 | Release evidence dossier | **PARTIAL** | Benchmark evidence exists; no release-scoped conformance/locality/wheel/platform dossier yet. |
+
+### Economically ordered remaining work for HN/community alpha
+
+Order by expected user value divided by engineering cost, while respecting
+dependencies:
+
+1. **Fix CI and freeze the release target.** Resolve the current Clippy failures,
+   require green checks, and stop expanding prototype-v1 work.
+2. **Promote the staged balanced design to the only release Format v1 path.**
+   Wire it into CheckpointStore, remove O(parent) append work, remove the legacy
+   left-deep writer, and freeze exact authority/recovery semantics.
+3. **Add locality instrumentation immediately around that integration.** Prove
+   10 MiB / 100 MiB / 1 GiB parent plus fixed 1 KiB append does not scale
+   linearly in bytes read, writes, CPU, or temporary RSS.
+4. **Build the PyO3/maturin wheel.** Users must not need Rust or a subprocess.
+5. **Implement one exact authoritative LangGraph schema and TulyaSaver.**
+   Correct opaque serializer round-trip is mandatory; message/delta locality is
+   an optimization.
+6. **Implement pending writes and the five base capabilities.**
+7. **Make official conformance plus graph durability required CI.** Include
+   interrupt/resume, sibling branch after reopen, pending-write recovery,
+   acknowledgement to immediate kill to reopen, delete/reopen, sync and async.
+8. **Run the final benchmark campaign through the installed wheel and primary
+   saver.** Compare against current strong LangGraph comparators with equal
+   durability semantics and publish storage, p50/p95/p99, RSS, reopen and losses.
+9. **Cut the HN/community-alpha release.** It may say "usable experimental
+   LangGraph checkpointer"; it must not say production-ready or formally
+   verified Rust.
+
+---
+
 ## 1. Current baseline
 
-Baseline audited while writing this plan:
+Audit snapshot: 2026-09-06.
 
-- repository head: `8cc5928569016a1baddc991beb91a4f830d0db9a`;
-- public format: `tulya-checkpoint-store`, `format_version = 1`;
-- embedded Rust, single writer;
-- hot WAL + immutable sealed generations + manifest authority;
-- process-locking, reopen/recovery, idempotent request identities;
-- exact historical reconstruction and sibling branches;
-- range-read API and lazy sealed reader;
-- read-only `fsck`, verification, reclaim, and subtree pruning;
-- deterministic 32-case process-crash matrix on the tested Linux/filesystem
-  stack;
-- benchmark harness with exact reconstruction checks and multiple comparators;
-- LangGraph **shadow** adapter only; the primary saver remains authoritative;
-- the shadow adapter shells out to a CLI process for Tulya operations;
-- current LangGraph integration is pinned to `langgraph==1.2.10` and Python
-  3.12 in CI.
+- audited branch head: 9f5224b9d65362a3470fa11459ff3b9bf794edac;
+- current PR/branch CI run 34025084799 is red: langgraph and
+  packaged-artifact pass, while rust stops at two Clippy -D warnings failures
+  before the normal Rust tests/crash matrix execute on that head;
+- main and feat/production-readiness are currently unprotected;
+- Rust MSRV is explicit at 1.80;
+- crate root uses forbid(unsafe_code);
+- embedded single-writer store, process lock, hot WAL, immutable sealed
+  generations, manifest authority, exact historical reads, range reads, lazy
+  reopen, fsck, reclaim and subtree deletion exist;
+- deterministic 32-case process-crash seal/publication campaign exists;
+- substantial live file-backed fault injection exists for hot WAL and
+  publication paths, including short write, ENOSPC, flush/sync, rename and
+  directory-sync outcomes;
+- benchmark harness and pinned public OpenHands evidence exist with exact
+  reconstruction checks and multiple comparators;
+- the prototype writable Format v1 remains the public CheckpointStore path and
+  still performs O(parent) read/hash work for message append;
+- a much larger balanced persistent-sequence implementation is staged under the
+  current V2 modules, including AVL operations, commitments, transaction,
+  commit, recovery, snapshot, publication, compaction and conformance vectors,
+  but it is not yet the shipping CheckpointStore;
+- LangGraph integration is still a shadow BaseCheckpointSaver around another
+  authoritative saver and invokes Tulya through a CLI subprocess;
+- get_tuple, list, put_writes, delete_thread and optional LangGraph capabilities
+  are delegated to the primary saver;
+- no PyO3/maturin wheel exists;
+- no official LangGraph checkpoint conformance job exists;
+- integration remains pinned to langgraph 1.2.10 and Python 3.12.
 
-Known architectural gaps at this baseline:
+The original plan treated prototype Format v1 as compatibility-frozen. That is
+superseded by the pre-release format reset in Section 0: the staged balanced
+design becomes the first released Format v1, and prototype migration support is
+not required.
 
-1. `append_messages_checkpoint` reconstructs the complete parent canonical
-   state to derive its length/hash. A tiny append to a very large parent can
-   therefore perform work proportional to the complete parent.
-2. Repeated message appends build a left-deep binary history rather than a
-   balanced persistent sequence. Range APIs exist, but a logarithmic/local
-   complexity guarantee is not established.
-3. Tulya is not a primary `BaseCheckpointSaver`: checkpoint reads, pending
-   writes, list/delete semantics, arbitrary channels, DeltaChannel behavior,
-   and other LangGraph operations are still delegated to another saver.
-4. There is no PyO3/maturin Python package or wheel; the integration launches a
-   subprocess per mirrored checkpoint.
-5. Official LangGraph checkpoint conformance is not in CI.
-6. Live I/O error injection (`ENOSPC`, short write, `EIO`, failed sync, failed
-   rename/directory sync) is not yet a complete production matrix.
-7. Fuzzing, supported-platform durability evidence, backup/restore, migration
-   testing for a future format, and independent review are not complete.
-8. At the time this plan was written, the latest GitHub Actions run on `main`
-   was red and its jobs failed before executing workflow steps. Restore a green
-   required CI baseline before interpreting later results.
+Upstream snapshot used by this audit remains:
 
-Upstream LangGraph snapshot checked on 2026-09-02:
+- langgraph: 1.2.11;
+- langgraph-checkpoint: 4.2.0;
+- langgraph-checkpoint-conformance: 0.0.2;
+- advertised Python range: 3.10-3.13.
 
-- `langgraph` source version: `1.2.11`;
-- `langgraph-checkpoint` source version: `4.2.0`;
-- `langgraph-checkpoint-conformance` source version: `0.0.2`;
-- LangGraph/checkpoint packages require Python `>=3.10`; the LangGraph source
-  advertises Python 3.10, 3.11, 3.12, and 3.13.
-
-These upstream versions are a snapshot, not a permanent compatibility promise.
-Re-check upstream before each release.
+Re-check upstream versions when the primary saver/conformance work begins and
+again before release.
 
 ---
 
@@ -173,28 +294,58 @@ references a deleted checkpoint.
 
 ## 4. Release levels
 
-### Level 0 — research alpha (current class)
+### Level 0 — research/shadow alpha (current class)
 
-Useful for evaluation and shadow deployment. No production recommendation.
+Useful for storage evaluation and shadow deployment. Tulya is not the
+authoritative LangGraph saver.
 
-### Level 1 — LangGraph community alpha
+### Level 1 — HN/community alpha: usable LangGraph checkpointer
 
-Safe to publish as an experimental primary saver and ask the community to try
-it. Requires full **base** LangGraph conformance, direct Python/Rust binding,
-correct pending writes, arbitrary-channel correctness, restart testing, and a
-green CI matrix.
+This is the next target.
+
+Safe to publish on Hacker News and ask LangGraph users to install/use Tulya as
+an experimental primary saver. Requires:
+
+- first released balanced/local Format v1 wired into CheckpointStore;
+- no O(parent) foreground append on the optimized local-change path;
+- direct Python/Rust wheel, no CLI subprocess;
+- real authoritative TulyaSaver;
+- correct opaque arbitrary-channel serialization;
+- correct pending writes;
+- all required base LangGraph capabilities;
+- official base conformance;
+- restart/branch/pending-write graph durability tests;
+- green required CI;
+- benchmark evidence rerun through the installed wheel and authoritative saver.
+
+This level may still tell users to keep backups and may omit optional
+DeltaChannel/copy/prune/delete-for-runs capabilities.
+
+Allowed claim:
+
+> **Tulya is an experimental, installable LangGraph checkpoint saver that passes
+> the documented base compatibility and durability gates for the tested
+> single-host/single-writer scope.**
+
+Not allowed at Level 1: "production-ready", "battle-tested", "formally verified
+Rust", or universal benchmark claims.
 
 ### Level 2 — production candidate
 
-All community-alpha gates plus locality redesign, large/deep-history tests,
-I/O fault injection, fuzzing, migration/format discipline, backup/restore,
-platform-specific durability testing, and current strong comparator benchmarks.
+Everything in Level 1 plus large/deep-history evidence, comprehensive I/O and
+maintenance fault campaigns, fuzzing, backup/restore, supported platform
+qualification, security/supply-chain hardening, and production-scale benchmark
+evidence.
+
+Because the prototype format is being discarded before the first release,
+prototype-v1 migration is not a Level-2 requirement. Migration becomes a
+requirement only after a released format must evolve incompatibly.
 
 ### Level 3 — production-ready for the documented scope
 
-All production-candidate gates plus independent review/reproduction, release
-supply-chain checks, operational docs, and at least one external real-world
-pilot whose data can be independently verified/restored.
+Everything in Level 2 plus independent review/reproduction, operational docs,
+release evidence, and at least one external real-world primary-saver pilot with
+successful backup/restore/reopen evidence.
 
 Do not silently weaken a lower-level gate to reach a higher label.
 
@@ -279,8 +430,11 @@ not mathematically support it. Choose a sound design:
   computed outside the latency-critical append path; or
 - another explicitly specified construction.
 
-If this changes Format v1 semantics, introduce Format v2; do not reinterpret
-existing v1 bytes.
+For the first public release there is no legacy-format compatibility
+constraint. The staged balanced format is the candidate release Format v1.
+Do not spend engineering time preserving or migrating the prototype left-deep
+format. After the first release, incompatible evolution must use a new format
+version and an explicit upgrade policy.
 
 ### Acceptance test
 
@@ -439,28 +593,49 @@ rather than accepting unbounded Python/Rust heap growth.
 
 ---
 
-## 10. Format compatibility and migration
+## 10. First-release format freeze (prototype reset)
 
-Format v1 already has a compatibility promise. Preserve it.
+The old prototype Format v1 is intentionally not a release compatibility
+promise. There are no supported users/stores to preserve and the first crate
+release is still unreleased.
 
-- [ ] Never change the meaning/layout of released v1 bytes silently.
-- [ ] Keep `tests/fixtures/format-v1` immutable.
-- [ ] If balanced nodes/new commitments require incompatible bytes, create
-      public Format v2.
-- [ ] Unknown major format/version must fail closed with an actionable error.
-- [ ] Add a committed golden v2 fixture.
-- [ ] Implement `v1 -> v2` migration if v2 becomes the writable format.
-- [ ] Migration must be crash safe: after a crash, either the old valid store or
-      the fully migrated valid store remains authoritative.
-- [ ] Verify every checkpoint before and after migration byte-for-byte through
-      public reads.
-- [ ] Test migration with branches, pending LangGraph writes, deleted records,
-      hot suffix, fully sealed store, and large histories.
-- [ ] Document downgrade behavior. Never let an older writer reinterpret newer
-      format bytes.
+The staged balanced format currently called v2 becomes the first released
+**Format v1** after it is wired into CheckpointStore.
 
-A production release must include a format-compatibility matrix in its release
-evidence.
+Required before the HN/community-alpha release:
+
+- [ ] remove the prototype left-deep writer from the shipping path;
+- [ ] make the balanced persistent sequence the only normal writable path;
+- [ ] make open/recovery/fsck understand the release Format v1 authority model;
+- [ ] persist subtree lengths and the commitment needed for local append and
+      range navigation;
+- [ ] fail closed on unknown major version/features and malformed lengths,
+      roots, commitments and records;
+- [ ] add a committed golden release Format v1 fixture only after the format is
+      frozen;
+- [ ] add byte-level/conformance vectors for release-format records that matter
+      to cross-language/refinement claims;
+- [ ] rerun crash, I/O fault, reopen, deletion/compaction and benchmark evidence
+      against the release format;
+- [ ] delete or clearly quarantine prototype-v1 fixtures/docs so they cannot be
+      confused with the released contract;
+- [ ] clean up V2 naming before declaring the release-format contract frozen,
+      unless the internal implementation-generation naming is intentionally
+      documented.
+
+Not required before the first release:
+
+- prototype-v1 to release-v1 migration;
+- downgrade support to the prototype format;
+- byte compatibility with prototype stores.
+
+After the first public release, release Format v1 becomes immutable. Thereafter
+incompatible layout/meaning changes require Format v2, old release fixtures
+remain immutable, unknown versions fail closed, and any required migration must
+be crash safe.
+
+This reset is a one-time advantage of having zero supported users. Do not spend
+it by freezing the prototype format prematurely.
 
 ---
 
@@ -1379,7 +1554,7 @@ A mature workflow should contain logically separate required jobs.
 fmt
 clippy -D warnings
 unit/integration tests
-format-v1/v2 golden fixtures
+release Format-v1 golden fixture
 state-machine/property tests
 process crash matrix
 live I/O fault matrix
@@ -1461,7 +1636,7 @@ benchmarks/evidence/releases/v0.X.Y/
 ├── deep_history.json
 ├── benchmark_comparators.json
 ├── backup_restore.json
-├── format_compatibility.json
+├── format_contract.json
 └── platform_matrix.json
 ```
 
@@ -1471,141 +1646,211 @@ A marketing/README number must point to a reproducible evidence record.
 
 # PART E — IMPLEMENTATION ORDER
 
-## 34. Recommended PR sequence
+## 34. Recommended implementation sequence — economic priority
 
-Do this in dependency order; do not polish an API around an execution path we
-already know must change.
+This sequence is optimized for reaching a credible HN/community-alpha release,
+not for maximizing internal completeness before users exist.
 
-### PR 0 — CI baseline
+### P0 — Make the repository trustworthy
 
-- restore green GitHub Actions;
-- protect `main`/require checks;
-- add this production-readiness doc to release discipline.
+- fix the current Clippy failures;
+- get all current Rust tests and crash matrix running on branch head;
+- protect main and require the release jobs;
+- stop adding prototype-v1 features.
 
-### PR 1 — failing locality instrumentation
+Why first: tiny cost, removes uncertainty from every later change.
+
+### P1 — Promote the staged balanced store to release Format v1
+
+- wire the persistent AVL/sequence implementation into CheckpointStore;
+- make persisted subtree lengths/commitments authoritative;
+- eliminate the legacy left-deep writable path;
+- eliminate O(parent) whole-state hashing from local append;
+- integrate hot WAL, sealing, recovery, snapshot, deletion and compaction;
+- keep one shipping format path;
+- freeze the golden release-v1 fixture after end-to-end integration.
+
+Why second: every Python API and benchmark would otherwise be built around a
+path already known to be discarded.
+
+### P2 — Prove storage locality before product polishing
 
 - add bytes-read/bytes-written/nodes-touched counters;
-- add 10 MiB/100 MiB/1 GiB + 1 KiB append benchmark;
-- demonstrate the current O(parent) behavior so the regression is measurable.
+- run 10 MiB, 100 MiB and 1 GiB parent plus fixed 1 KiB append;
+- assert non-linear-in-parent-size work;
+- add deep-history structural tests and representative reopen/range evidence.
 
-### PR 2 — `PersistentSequence` abstraction
+Exit criterion: the release format has a defensible reason to exist, not merely
+a smaller disk footprint.
 
-- isolate append/range/length/stream interfaces from checkpoint metadata;
-- no format change yet unless necessary.
+### P3 — Ship the Python binding
 
-### PR 3 — balanced persistent sequence
+- create langgraph-checkpoint-tulya;
+- PyO3/maturin direct in-process binding;
+- clean wheel install without a Rust toolchain;
+- Python 3.10-3.13 for platforms actually advertised;
+- keep the Rust/FFI surface minimal.
 
-- subtree byte lengths;
-- bounded depth invariant tests;
-- branch and range-read tests.
+### P4 — Implement the authoritative LangGraph schema and TulyaSaver
 
-### PR 4 — remove parent reconstruction from append
+- exact checkpoint key/config/parent/namespace model;
+- metadata;
+- opaque typed channel values through the configured LangGraph serializer;
+- optimized append representation only where semantics permit it;
+- durable request identity and retry conflict detection.
 
-- derive child metadata without reading full parent;
-- choose a sound structural/content commitment;
-- make 1 GiB + 1 KiB locality test pass.
+Rule: optimization may fall back; correctness may not.
 
-### PR 5 — format decision
+### P5 — Implement the mandatory base saver surface
 
-- if v1 can remain valid, add compatibility tests;
-- otherwise freeze v1, add v2 + golden fixture + atomic migration.
+- put/aput;
+- put_writes/aput_writes;
+- get_tuple/aget_tuple;
+- list/alist;
+- delete_thread/adelete_thread;
+- pending-write restart idempotency;
+- stale-operation protection after delete.
 
-### PR 6 — Python package / PyO3 binding
+### P6 — Official conformance and real graph durability
 
-- `langgraph-checkpoint-tulya` package;
-- direct in-process Rust binding;
-- sync/async wrapper;
-- wheel smoke.
-
-### PR 7 — exact LangGraph checkpoint schema
-
-- checkpoint key/metadata/parents/namespaces;
-- typed opaque channel-value storage;
-- serializer round trips;
-- reuse unchanged channel versions.
-
-### PR 8 — primary base saver reads/writes
-
-- `put/aput`;
-- `get_tuple/aget_tuple`;
-- `list/alist`.
-
-### PR 9 — pending writes + delete
-
-- `put_writes/aput_writes` including restart idempotency;
-- `delete_thread/adelete_thread`;
-- stale-write-after-delete protection.
-
-### PR 10 — official conformance
-
-- add `langgraph-checkpoint-conformance`;
-- require `passed_all_base()`;
-- require `passed_all()` for every advertised/detected extended capability;
-- test supported LangGraph/Python matrix.
-
-### PR 11 — graph-level durability suite
-
-- real StateGraph sync/async;
+- add langgraph-checkpoint-conformance;
+- require all base tests;
+- only advertise optional capabilities that also pass;
+- sync and async StateGraph;
 - interrupt/resume;
-- partial-superstep pending writes;
-- time travel/fork;
-- namespaces/subgraphs;
-- Python-level kill/reopen.
+- failed superstep with preserved pending writes;
+- historical time travel/fork/sibling branches;
+- namespace/subgraph cases;
+- acknowledged write to immediate process kill to reopen;
+- delete to reopen.
 
-### PR 12 — live I/O fault matrix
+Exit criterion: Tulya is a real LangGraph saver, not a storage demo.
 
-- ENOSPC/short write/EIO/sync/rename/dirsync;
-- indeterminate outcome + safe retry semantics;
-- apply to foreground and maintenance.
+### P7 — Final benchmark campaign
 
-### PR 13 — fuzz/security hardening
+Run benchmarks through the installed wheel and authoritative TulyaSaver, not
+through the shadow adapter or a lower-level CLI-only path.
 
-- cargo-fuzz + random state-machine tests;
+Required headline evidence:
+
+- exact reconstruction before/after reopen;
+- current LangGraph SQLite and SQLite/DeltaChannel comparator;
+- Postgres where deployment semantics are honestly comparable;
+- storage bytes;
+- append p50/p95/p99;
+- historical read p50/p95/p99;
+- 4 KiB range-read p50/p95/p99;
+- reopen time;
+- peak RSS/CPU;
+- 1 GiB parent plus 1 KiB append locality curve;
+- durability policy for every arm;
+- losses/regressions, not only wins.
+
+Do not carry forward the existing 12.38x headline automatically. The final
+LangGraph schema and release format may change the result; publish the new
+truth.
+
+### P8 — HN/community-alpha release hardening
+
+- installed-wheel CI matrix;
+- base conformance artifact archived;
 - dependency audits;
-- parser/path/decompression limits.
+- clear single-host/single-writer/local-filesystem scope;
+- minimal offline backup/restore guidance strongly preferred;
+- README quickstart using TulyaSaver directly;
+- benchmark reproduction command;
+- known limitations and unsupported optional capabilities;
+- release artifact from the exact green commit.
 
-### PR 14 — backup/restore and migration operations
+At this point publishing on Hacker News and actively approaching users is
+reasonable.
 
-- supported backup command/API;
-- destructive restore drill;
-- migration crash matrix if Format v2 exists.
+### Deferred until after first users unless cheap
 
-### PR 15 — production evidence
+- optimized DeltaChannel-specific history;
+- copy_thread, delete_for_runs and prune;
+- broad filesystem/platform support;
+- full Rust/Lean mechanical refinement;
+- independent external review/reproduction;
+- full production backup automation;
+- power-cut/device-level experiments.
 
-- independent second workload;
-- strong current LangGraph comparators;
-- supported filesystem/platform runs;
-- external review/reproduction.
-
-Extended LangGraph `copy_thread`, `delete_for_runs`, `prune`, and optimized
-`delta_channel_history` can be implemented after base conformance, but any one
-that is advertised must pass upstream tests. The extra-mile target is full
-conformance without compromising DeltaChannel correctness.
+These become mandatory as the project moves from community alpha to production
+candidate/production-ready.
 
 ---
 
 # PART F — DEFINITIONS OF DONE
 
-## 35. Community-alpha gate
+## 35. HN/community-alpha gate — usable LangGraph checkpointer
 
-All must be true:
+Every item below is a hard blocker for the requested Hacker News launch
+position.
 
-- [ ] green required CI on `main`;
-- [ ] direct `pip install` wheel, no Rust toolchain/CLI subprocess required;
-- [ ] real primary `TulyaSaver`, no authoritative SQLite/Postgres shadow;
-- [ ] arbitrary channel values round-trip through LangGraph serializer;
-- [ ] `put`, `put_writes`, `get_tuple`, `list`, `delete_thread` implemented by
+### Repository and artifact
+
+- [ ] green required CI on the exact release commit;
+- [ ] protected main with required release checks;
+- [ ] direct pip-installable wheel;
+- [ ] normal Python users need neither a Rust toolchain nor a Tulya CLI
+      subprocess;
+- [ ] installed-wheel smoke runs in a clean environment.
+
+### Release Format v1
+
+- [ ] staged balanced persistent sequence is the actual CheckpointStore
+      writer/reader;
+- [ ] prototype left-deep writable format is removed/quarantined;
+- [ ] local append does not read/hash the entire unchanged parent;
+- [ ] release-v1 golden fixture is frozen;
+- [ ] restart/seal/recovery/fsck work on the release format;
+- [ ] branch history and retained historical roots remain exact.
+
+### LangGraph correctness
+
+- [ ] real primary TulyaSaver, no authoritative SQLite/Postgres/InMemory shadow;
+- [ ] arbitrary channel values round-trip through the configured LangGraph
+      serializer;
+- [ ] put, put_writes, get_tuple, list and delete_thread are implemented by
       Tulya;
-- [ ] sync + async graph execution;
+- [ ] sync and async methods/graph execution;
 - [ ] official LangGraph base conformance passes;
-- [ ] all advertised optional capabilities pass official tests;
-- [ ] restart/branch continuation;
-- [ ] pending-write failure/resume;
-- [ ] acknowledgement -> kill -> reopen tests;
-- [ ] clear single-writer/local-filesystem alpha scope;
-- [ ] README still says experimental/alpha and recommends backups.
+- [ ] every optional capability that is advertised passes its official tests;
+- [ ] pending-write failure/resume does not duplicate completed work;
+- [ ] restart/branch/time-travel continuation;
+- [ ] acknowledgement to immediate kill to reopen;
+- [ ] namespace/subgraph and arbitrary non-message channel cases;
+- [ ] delete to reopen and stale operations cannot resurrect deleted history.
 
-At this point it is reasonable to approach the LangGraph community for testers.
+### Benchmark/evidence
+
+- [ ] 10 MiB/100 MiB/1 GiB plus 1 KiB locality curve on release Format v1;
+- [ ] benchmark rerun through installed TulyaSaver;
+- [ ] current strong LangGraph comparators use clearly documented equivalent
+      durability semantics;
+- [ ] exact reconstruction verified before and after reopen for every
+      claim-bearing arm;
+- [ ] storage, p50/p95/p99 append/read, reopen, RSS and CPU reported;
+- [ ] benchmark losses/qualifications published;
+- [ ] machine-readable evidence archived for the release commit.
+
+### Claim boundary
+
+- [ ] README says experimental/community alpha, not production-ready;
+- [ ] single-host/single-writer/local-filesystem scope is explicit;
+- [ ] unsupported optional LangGraph capabilities are listed;
+- [ ] users are told to retain backups until the later production gate;
+- [ ] Lean wording says reference model/design correspondence unless a real
+      Rust refinement proof exists.
+
+When all items above are green it is reasonable to say:
+
+> **Tulya is a usable experimental LangGraph checkpointer: installable from a
+> wheel, authoritative rather than shadow, passing the documented base
+> conformance and restart/durability tests, with reproducible benchmark evidence
+> for release Format v1.**
+
+That is the intended Hacker News launch level.
 
 ---
 
@@ -1620,7 +1865,7 @@ Everything in community alpha plus:
 - [ ] live I/O failure matrix;
 - [ ] maintenance/ENOSPC crash safety;
 - [ ] fuzz/property testing campaign;
-- [ ] format compatibility + migration tests if applicable;
+- [ ] release Format-v1 fail-closed compatibility/golden-fixture tests; future migration tests only if a released incompatible Format v2 exists;
 - [ ] backup/restore drill;
 - [ ] supported platform/filesystem matrix;
 - [ ] current DeltaChannel/Postgres/SQLite comparator rerun;
@@ -1668,7 +1913,7 @@ change:
 2. add/fail a test before changing the implementation where practical;
 3. rerun official LangGraph conformance;
 4. rerun the relevant crash/I/O/migration/locality matrix;
-5. preserve old format fixtures;
+5. preserve every released format fixture; prototype fixtures discarded before v0.1 are not compatibility contracts;
 6. update release evidence;
 7. report regressions and losses, not only improvements.
 
