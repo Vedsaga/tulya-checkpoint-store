@@ -1,5 +1,8 @@
 use super::*;
-use crate::persistent_history::{HistoryError, PersistentHistoryStore, Version};
+use crate::persistent_history::{
+    durable_log::{recover_history_store, DurableError, DurableHistoryLog},
+    CommitOutcome, HistoryError, PersistentHistoryStore, Version,
+};
 use crate::persistent_sequence::{
     LogicalLength, PersistentRoot, PersistentSequence, SequenceRange, SequenceRepresentation,
 };
@@ -8,6 +11,11 @@ const MESSAGE_IDENTITY_NULL_PREFIX: &[u8] = b"{\"identity\":null,";
 const MESSAGE_CANONICAL_PREFIX: &[u8] = b"{\"identity\":null,\"messages\":[";
 const MESSAGE_CANONICAL_SUFFIX: &[u8] = b"]}";
 const LEGACY_V1_HASH_STREAM_CHUNK_BYTES: u64 = 64 * 1024;
+
+/// Candidate history hot-log filename. Additive to the legacy file set and
+/// invisible to legacy reclaim; adapter identity maps stay memory-only until
+/// a later slice persists them.
+const HISTORY_WAL_FILE: &str = "history.wal";
 
 impl CheckpointStore {
     /// Opens or creates a checkpoint store and reconstructs its complete
@@ -91,6 +99,18 @@ impl CheckpointStore {
             apply_prepared_transaction(&mut state, prepared);
         }
         let hot = HotWal::open_at(&hot_path, normalized_tail, config)?;
+        // Candidate history authority replays independently of the legacy
+        // state above. Adapter identity maps stay memory-only (a later slice
+        // persists them); the generic history itself must reopen exactly. A
+        // corrupt candidate log fails the whole open closed: delete
+        // history.wal to return to legacy-only use.
+        let mut history = PersistentHistoryStore::new();
+        let history_wal_path = dir.join(HISTORY_WAL_FILE);
+        if history_wal_path.exists() {
+            let mut history_log = DurableHistoryLog::open(&history_wal_path)?;
+            let history_bytes = history_log.read_all()?;
+            history = recover_history_store(&history_bytes).map_err(Self::history_error)?;
+        }
         let store = Self {
             dir,
             config,
@@ -101,7 +121,7 @@ impl CheckpointStore {
             hot,
             lazy_base,
             range_sizes: RefCell::new(Vec::new()),
-            history: PersistentHistoryStore::new(),
+            history,
             history_ids: HashMap::new(),
             history_versions: HashMap::new(),
         };
@@ -578,19 +598,21 @@ impl CheckpointStore {
 
     /// Candidate release-path append through the generic history core.
     ///
-    /// Staged P1.2: proves the `CheckpointStore -> PersistentHistoryStore ->
-    /// BalancedSequence` dependency chain on real store handles. Checkpoint
-    /// thread maps to generic history, checkpoint id maps to generic version,
-    /// and the message payload commits as opaque bytes with no whole-parent
-    /// XXH3 reconstruction. The legacy state remains authoritative; durability
-    /// (request ledger, seal, tombstones) arrives in later slices.
+    /// Durability authority belongs to the generic history core alone: this
+    /// writes only the candidate history log, never a legacy transaction.
+    /// Checkpoint thread maps to generic history, checkpoint id maps to
+    /// generic version, and the message payload commits as opaque bytes with
+    /// no whole-parent XXH3 reconstruction. The legacy state remains
+    /// authoritative for legacy operations; seal and tombstones arrive in
+    /// later slices.
     ///
     /// # Errors
     ///
     /// Returns an error for empty identifiers, duplicate checkpoint identity
-    /// within a thread, unknown parent identity, or an empty payload.
+    /// within a thread, unknown parent identity, an empty payload, or any
+    /// durability outcome including indeterminate barriers.
     ///
-    /// Staged P1.2 candidate path: durability wiring in P1.3+ makes this
+    /// Staged P1.3 candidate path: seal/reopen integration in P1.4+ makes this
     /// live; remove the allowance then.
     #[allow(dead_code)]
     pub(crate) fn append_candidate_message(
@@ -613,7 +635,11 @@ impl CheckpointStore {
         let history = match self.history_ids.get(thread_id) {
             Some(id) => *id,
             None => {
-                let id = self.history.create_history().map_err(Self::history_error)?;
+                let mut history_log = DurableHistoryLog::open(&self.dir.join(HISTORY_WAL_FILE))?;
+                let id = self
+                    .history
+                    .create_history_durable(&mut history_log)
+                    .map_err(|error| Self::durable_history_error(&self.dir, error))?;
                 self.history_ids.insert(thread_id.to_owned(), id);
                 id
             }
@@ -626,10 +652,19 @@ impl CheckpointStore {
                     .ok_or(CheckpointStoreError::CheckpointNotFound)
             })
             .transpose()?;
+        let mut history_log = DurableHistoryLog::open(&self.dir.join(HISTORY_WAL_FILE))?;
         let version = self
             .history
-            .commit(history, parent, payload)
-            .map_err(Self::history_error)?;
+            .commit_durable(&mut history_log, history, parent, payload, None)
+            .map_err(|error| Self::durable_history_error(&self.dir, error))?;
+        let version = match version {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                return Err(format_error(
+                    "requestless candidate commit unexpectedly replayed",
+                ));
+            }
+        };
         self.history_versions.insert(key, version.id());
         Ok(version)
     }
@@ -682,6 +717,16 @@ impl CheckpointStore {
     #[allow(dead_code)]
     fn history_error(error: HistoryError) -> CheckpointStoreError {
         format_error(error.to_string())
+    }
+
+    fn durable_history_error(path: &Path, error: DurableError) -> CheckpointStoreError {
+        match error {
+            DurableError::Rejected(history) => Self::history_error(history),
+            DurableError::Indeterminate { operation, source } => {
+                durability_indeterminate_error(operation, path, source)
+            }
+            DurableError::RecoveryRequired => recovery_required_error(path, None),
+        }
     }
 
     fn legacy_v1_message_root_metadata(

@@ -2068,3 +2068,46 @@ fn candidate_history_path_chains_store_to_core_to_sequence(
     assert!((after.nodes_inspected - mid.nodes_inspected) <= 32);
     Ok(())
 }
+
+#[test]
+fn candidate_durable_history_survives_reopen_without_legacy_write(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let config = CheckpointStoreConfig {
+        wal_segment_bytes: 1024 * 1024,
+        preinit_chunk_bytes: 64 * 1024,
+        sealed_block_size: 4096,
+        zstd_level: 1,
+        recovery_mode: CheckpointStoreRecoveryMode::ReusePayload,
+    };
+    let mut store = CheckpointStore::open(temp.path(), config)?;
+    store.append_candidate_message("thread-a", "cp-1", None, b"hello")?;
+    store.append_candidate_message("thread-a", "cp-2", Some("cp-1"), b" world")?;
+    // Legacy authority is untouched by candidate writes: no legacy hot WAL
+    // bytes beyond the reserve, and legacy reads see nothing.
+    assert!(store.read_checkpoint("thread-a", "cp-1").is_err());
+    drop(store);
+
+    // Candidate files coexist with (and never disturb) the legacy store.
+    assert!(temp.path().join("history.wal").exists());
+    let reopened = CheckpointStore::open(temp.path(), config)?;
+    let history = reopened.history_store();
+    let first = history.lookup_version(crate::persistent_history::VersionId::new(0))?;
+    let second = history.lookup_version(crate::persistent_history::VersionId::new(1))?;
+    assert_eq!(second.parent(), Some(first.id()));
+    let mut output = Vec::new();
+    history.read(first, 0, 5, &mut output)?;
+    assert_eq!(output, b"hello");
+    output.clear();
+    history.read(second, 0, 11, &mut output)?;
+    assert_eq!(output, b"hello world");
+    history.verify(first)?;
+    history.verify(second)?;
+    // Adapter maps are memory-only in P1.3 (persisted in a later slice), so a
+    // reopened adapter addresses versions through the generic lookup.
+    assert!(matches!(
+        reopened.read_candidate_message("thread-a", "cp-1", 0, 1, &mut Vec::new()),
+        Err(CheckpointStoreError::CheckpointNotFound)
+    ));
+    Ok(())
+}
