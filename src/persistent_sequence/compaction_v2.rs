@@ -402,7 +402,12 @@ impl V2PayloadRangeMapping {
 /// active/retired requests, tombstones) are intentionally absent: checkpoint
 /// order is unchanged, so they need no physical replacement and stay with the
 /// committed state until a later apply unit consumes this preparation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Clone` is deliberately absent: the prepared replacement is a single-use
+/// owned transition object, and no caller may duplicate it for a later
+/// independent apply. The only production transition is `compact_v2_state`,
+/// which prepares and applies under one exclusive borrow.
+#[derive(Debug, PartialEq, Eq)]
 pub(super) struct V2PreparedCompaction {
     payload: Vec<u8>,
     nodes: Vec<V2NodeRecord>,
@@ -467,6 +472,40 @@ pub(super) fn prepare_v2_compaction(
         node_mapping,
         payload_mapping,
     })
+}
+
+/// Atomically compacts the committed physical state in place.
+///
+/// Preparation runs against the exclusively borrowed state, so no caller can
+/// observe or mutate the state between preparation and application: a stale
+/// prepared object can never overwrite newer state because no prepared object
+/// ever escapes. After preparation succeeds, the private apply performs only
+/// infallible field replacement; there is no `Result`-producing operation,
+/// no rollback path, and no fallible allocation past that point. Semantic
+/// ledgers are preserved untouched because checkpoint order is unchanged.
+pub(super) fn compact_v2_state(state: &mut V2CommittedState) -> Result<(), V2CompactionError> {
+    let prepared = prepare_v2_compaction(&*state)?;
+    apply_prepared_compaction(state, prepared);
+    Ok(())
+}
+
+/// Replaces the physical tables with the prepared compact replacement.
+///
+/// Module-private on purpose: only `compact_v2_state` may call this, with a
+/// preparation produced from the same exclusive borrow. Assignments,
+/// destructuring, and drops only.
+fn apply_prepared_compaction(state: &mut V2CommittedState, prepared: V2PreparedCompaction) {
+    let V2PreparedCompaction {
+        payload,
+        nodes,
+        versions,
+        checkpoints,
+        ..
+    } = prepared;
+    state.payload = payload;
+    state.nodes = nodes;
+    state.versions = versions;
+    state.checkpoints = checkpoints;
 }
 
 /// Validates retained source ranges and repacks their exact bytes densely.
@@ -902,7 +941,10 @@ fn try_clone_compaction_string(value: &str) -> Result<String, V2CompactionError>
 
 #[cfg(test)]
 mod tests {
-    use super::super::apply_v2::{apply_v2_commit, V2CommittedState};
+    use super::super::apply_v2::{
+        apply_v2_commit, V2ApplyError, V2ApplyOutcome, V2CommittedState, V2RequestStatus,
+    };
+    use super::super::backend_v2::{export_v2_sealed_state, recover_v2_backend};
     use super::super::commit_v2::{checkpoint_operation_digest, encode_v2_commit};
     use super::super::format_v2::{decode_v2_node, encode_v2_node, V2NodeRecord, V2RootRecord};
     use super::super::image_v2::{v2_node_fields, V2NodeFields};
@@ -1807,5 +1849,229 @@ mod tests {
         assert!(prepared.payload_mapping().is_empty());
         assert_eq!(state.deleted_checkpoints, before_deleted);
         assert_eq!(state.retired_requests, before_retired);
+    }
+
+    fn operation_digest_at(state: &V2CommittedState, ordinal: usize) -> [u8; 32] {
+        checkpoint_operation_digest(&state.checkpoints[ordinal]).unwrap()
+    }
+
+    #[test]
+    fn compacted_state_exports_and_reopens_with_authority_preserved() {
+        let mut state = build_abcde_state();
+        let digest_a = operation_digest_at(&state, 0);
+        let digest_b = operation_digest_at(&state, 1);
+        let digest_c = operation_digest_at(&state, 2);
+        let digest_d = operation_digest_at(&state, 3);
+        let digest_e = operation_digest_at(&state, 4);
+        delete_bc_subtree(&mut state);
+
+        compact_v2_state(&mut state).unwrap();
+        let geometry = state.geometry().unwrap();
+        assert_eq!(
+            geometry,
+            V2WalGeometry {
+                payload_len: 9,
+                node_count: 5,
+                version_count: 3,
+                checkpoint_count: 3,
+            }
+        );
+
+        let snapshot = export_v2_sealed_state(&state).unwrap().unwrap();
+        let reopened = recover_v2_backend(Some(&snapshot), &[]).unwrap();
+        assert_eq!(reopened.state.geometry().unwrap(), geometry);
+        assert_eq!(reopened.state.checkpoints, state.checkpoints);
+        assert_eq!(
+            reopened.state.checkpoint_ordinals,
+            state.checkpoint_ordinals
+        );
+        assert_eq!(reopened.state.request_records, state.request_records);
+        assert_eq!(reopened.state.retired_requests, state.retired_requests);
+        assert_eq!(
+            reopened.state.deleted_checkpoints,
+            state.deleted_checkpoints
+        );
+        assert!(reopened
+            .state
+            .deleted_checkpoints
+            .contains(&("thread".to_owned(), "cp-2".to_owned())));
+        assert!(reopened
+            .state
+            .deleted_checkpoints
+            .contains(&("thread".to_owned(), "cp-3".to_owned())));
+
+        assert_eq!(
+            reopened.state.classify_request(b"req-1", digest_a),
+            Ok(V2RequestStatus::Replay {
+                checkpoint_ordinal: 0
+            })
+        );
+        assert_eq!(
+            reopened.state.classify_request(b"req-4", digest_d),
+            Ok(V2RequestStatus::Replay {
+                checkpoint_ordinal: 1
+            })
+        );
+        assert_eq!(
+            reopened.state.classify_request(b"req-5", digest_e),
+            Ok(V2RequestStatus::Replay {
+                checkpoint_ordinal: 2
+            })
+        );
+        assert_eq!(
+            reopened.state.classify_request(b"req-2", digest_b),
+            Ok(V2RequestStatus::Retired)
+        );
+        assert_eq!(
+            reopened.state.classify_request(b"req-3", digest_c),
+            Ok(V2RequestStatus::Retired)
+        );
+        assert_eq!(
+            reopened.state.classify_request(b"req-1", [0xFF; 32]),
+            Err(V2ApplyError::RequestConflict)
+        );
+        assert_eq!(
+            reopened.state.classify_request(b"req-2", [0xFF; 32]),
+            Err(V2ApplyError::RequestConflict)
+        );
+    }
+
+    #[test]
+    fn compacted_state_remains_appendable_and_reopens() {
+        let mut state = build_abcde_state();
+        delete_bc_subtree(&mut state);
+        compact_v2_state(&mut state).unwrap();
+
+        // Append a new checkpoint from retained compacted D (ordinal 1,
+        // compact version 1) using the standard transaction machinery.
+        let compact_base = state.geometry().unwrap();
+        let parent_root = state.versions[1].root();
+        let next = branch_child_transaction(
+            compact_base,
+            6,
+            "thread",
+            "cp-4",
+            Some("cp-sibling"),
+            1,
+            parent_root,
+            b"fff",
+        );
+        let encoded = encode_v2_commit(compact_base, &next, Some(b"req-6")).unwrap();
+        assert_eq!(
+            apply_v2_commit(&mut state, &encoded),
+            Ok(V2ApplyOutcome::Applied {
+                checkpoint_ordinal: 3
+            })
+        );
+        assert_eq!(state.versions[3].version_id(), 3);
+        assert_eq!(state.versions[3].parent_version(), Some(1));
+        assert_eq!(state.checkpoints.len(), 4);
+        assert_eq!(state.checkpoints[3].checkpoint_id, "cp-4");
+
+        // Deleted B/C identities remain non-resurrectable after compaction.
+        let zombie_base = state.geometry().unwrap();
+        let zombie_root = state.versions[0].root();
+        let zombie = branch_child_transaction(
+            zombie_base,
+            7,
+            "thread",
+            "cp-2",
+            Some("cp-1"),
+            0,
+            zombie_root,
+            b"zzz",
+        );
+        let zombie_encoded = encode_v2_commit(zombie_base, &zombie, Some(b"req-zombie")).unwrap();
+        assert_eq!(
+            apply_v2_commit(&mut state, &zombie_encoded),
+            Err(V2ApplyError::Invalid(
+                "v2 checkpoint identity was logically deleted"
+            ))
+        );
+        assert_eq!(state.geometry().unwrap(), zombie_base);
+
+        let snapshot = export_v2_sealed_state(&state).unwrap().unwrap();
+        let reopened = recover_v2_backend(Some(&snapshot), &[]).unwrap();
+        assert_eq!(reopened.state.checkpoints.len(), 4);
+        assert_eq!(reopened.state.checkpoints[3].checkpoint_id, "cp-4");
+        assert_eq!(
+            reopened.state.checkpoints[3].parent_checkpoint_id,
+            Some("cp-sibling".to_owned())
+        );
+    }
+
+    #[test]
+    fn tombstone_only_state_compacts_as_idempotent_noop() {
+        let mut state = V2CommittedState::default();
+        state
+            .deleted_checkpoints
+            .insert(("thread".to_owned(), "cp-1".to_owned()));
+        state.retired_requests.insert(b"req-1".to_vec(), [0x11; 32]);
+
+        compact_v2_state(&mut state).unwrap();
+        assert_eq!(state.geometry().unwrap(), V2WalGeometry::default());
+
+        let snapshot = export_v2_sealed_state(&state).unwrap().unwrap();
+        let reopened = recover_v2_backend(Some(&snapshot), &[]).unwrap();
+        assert_eq!(reopened.state.geometry().unwrap(), V2WalGeometry::default());
+        assert_eq!(
+            reopened.state.deleted_checkpoints,
+            state.deleted_checkpoints
+        );
+        assert_eq!(reopened.state.retired_requests, state.retired_requests);
+    }
+
+    #[test]
+    fn compacting_twice_reaches_identical_physical_state() {
+        let mut state = build_abcde_state();
+        delete_bc_subtree(&mut state);
+        compact_v2_state(&mut state).unwrap();
+
+        let payload = state.payload.clone();
+        let nodes = state.nodes.clone();
+        let versions = state.versions.clone();
+        let checkpoints = state.checkpoints.clone();
+        let ordinals = state.checkpoint_ordinals.clone();
+        let active = state.request_records.clone();
+        let retired = state.retired_requests.clone();
+        let tombstones = state.deleted_checkpoints.clone();
+
+        compact_v2_state(&mut state).unwrap();
+        assert_eq!(state.payload, payload);
+        assert_eq!(state.nodes, nodes);
+        assert_eq!(state.versions, versions);
+        assert_eq!(state.checkpoints, checkpoints);
+        assert_eq!(state.checkpoint_ordinals, ordinals);
+        assert_eq!(state.request_records, active);
+        assert_eq!(state.retired_requests, retired);
+        assert_eq!(state.deleted_checkpoints, tombstones);
+    }
+
+    #[test]
+    fn failed_compaction_leaves_committed_state_unchanged() {
+        let mut state = overlapping_range_state();
+        let payload = state.payload.clone();
+        let nodes = state.nodes.clone();
+        let versions = state.versions.clone();
+        let checkpoints = state.checkpoints.clone();
+        let ordinals = state.checkpoint_ordinals.clone();
+        let active = state.request_records.clone();
+        let retired = state.retired_requests.clone();
+        let tombstones = state.deleted_checkpoints.clone();
+
+        assert_eq!(
+            compact_v2_state(&mut state),
+            Err(V2CompactionError::Invalid(
+                "v2 compaction retained payload ranges overlap or duplicate"
+            ))
+        );
+        assert_eq!(state.payload, payload);
+        assert_eq!(state.nodes, nodes);
+        assert_eq!(state.versions, versions);
+        assert_eq!(state.checkpoints, checkpoints);
+        assert_eq!(state.checkpoint_ordinals, ordinals);
+        assert_eq!(state.request_records, active);
+        assert_eq!(state.retired_requests, retired);
+        assert_eq!(state.deleted_checkpoints, tombstones);
     }
 }

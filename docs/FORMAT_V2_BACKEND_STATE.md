@@ -434,6 +434,66 @@ different but semantically equivalent compact physical representation. It does
 not publish Format v2 and does not change logical deletion authority;
 apply/publication remain later units.
 
+## Atomic compaction apply
+
+**DECISION**
+
+The prepared replacement becomes a usable operation through exactly one
+exclusive-borrow entry point:
+
+```text
+compact_v2_state(&mut V2CommittedState)
+    |
+    | prepare_v2_compaction(&*state)?
+    | private infallible apply
+    v
+compact committed semantic state
+```
+
+No independently callable `apply(prepared)` exists: a preparation created at
+time T can never overwrite a state that has since advanced, because no
+prepared object ever escapes the call. The private apply destructures the
+prepared object and replaces only payload, nodes, versions, and checkpoints;
+ordinals, active/retired requests, and tombstones stay untouched because
+checkpoint order is unchanged. Past successful preparation there is no
+`Result`-producing operation, no rollback path, and no fallible allocation:
+assignments, destructuring, and drops only. `Clone` is deliberately absent
+from the prepared type so the replacement behaves as a single-use owned
+transition rather than something casually duplicable.
+
+The compacted state must export as valid `T2S2`, reopen exactly (geometry,
+checkpoint identities/order/commitments, request ordinals/digests, retired and
+tombstone authority, conflict behavior), accept new appends from compacted
+coordinates with the standard transaction machinery, and compact idempotently.
+Tombstone-only states compact as a physical no-op with authority preserved.
+
+**WHY**
+
+Preparation safety is worthless if a stale prepared object can be applied to
+the wrong state generation. A fingerprint/generation protocol would add a new
+failure-prone comparison; structural safety (prepare and apply fused under one
+`&mut` borrow) removes the hazard class entirely. Proving export/reopen
+equivalence plus continued appendability is what promotes the compacted state
+from "decodable bytes" to "operating state".
+
+**ALTERNATIVES REJECTED**
+
+- Public `apply_prepared_compaction(state, prepared)`: rejected because an
+  independently applicable preparation can go stale.
+- Source fingerprint/generation check on apply: rejected as a fragile
+  compensation for an API shape that should not exist.
+- Snapshot-byte comparison for idempotence: rejected because semantic-state
+  equality is the meaningful invariant; byte freezing belongs to no new
+  format vector here.
+- Remapping ledgers during apply: rejected because unchanged checkpoint order
+  keeps every ledger coordinate valid.
+
+**FORMAT IMPACT**
+
+None. This is still staged internal Format-v2 behavior: no filesystem
+publication, no manifest authority, no WAL recycling, no migration, and no
+Format-v2 production activation.
+
 ## Current boundary
 
 This layer still does not:
