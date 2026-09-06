@@ -19,11 +19,18 @@
 //! a later unit.
 
 use super::apply_v2::V2CommittedState;
+use super::backend_v2::{validate_checkpoint_index, V2BackendError};
 use super::commit_v2::{checkpoint_operation_digest, V2CommitError};
 use super::format_v2::{V2FormatError, V2NodeRecord, V2RootRecord};
-use super::image_v2::{v2_node_fields, V2ImageError, V2NodeFields};
+use super::image_v2::{
+    encode_v2_image, v2_node_fields, V2ImageError, V2NodeFields, V2SequenceImage,
+};
 use super::publication_v2::{
     checkpoint_state_metadata, V2CheckpointRecord, V2PublicationError, V2VersionRecord,
+};
+use super::snapshot_v2::{
+    encode_v2_sealed_snapshot, V2ActiveRequestRecord, V2DeletedCheckpointRecord,
+    V2RetiredRequestRecord, V2SealedSnapshot, V2SnapshotError,
 };
 use std::collections::HashSet;
 use std::fmt;
@@ -34,6 +41,8 @@ pub(super) enum V2CompactionError {
     Format(V2FormatError),
     Publication(V2PublicationError),
     Commit(V2CommitError),
+    Snapshot(V2SnapshotError),
+    Backend(V2BackendError),
     Invalid(&'static str),
     Overflow(&'static str),
     Capacity(&'static str),
@@ -46,6 +55,8 @@ impl fmt::Display for V2CompactionError {
             Self::Format(error) => write!(formatter, "{error}"),
             Self::Publication(error) => write!(formatter, "{error}"),
             Self::Commit(error) => write!(formatter, "{error}"),
+            Self::Snapshot(error) => write!(formatter, "{error}"),
+            Self::Backend(error) => write!(formatter, "{error}"),
             Self::Invalid(message) | Self::Overflow(message) | Self::Capacity(message) => {
                 formatter.write_str(message)
             }
@@ -76,6 +87,18 @@ impl From<V2PublicationError> for V2CompactionError {
 impl From<V2CommitError> for V2CompactionError {
     fn from(error: V2CommitError) -> Self {
         Self::Commit(error)
+    }
+}
+
+impl From<V2SnapshotError> for V2CompactionError {
+    fn from(error: V2SnapshotError) -> Self {
+        Self::Snapshot(error)
+    }
+}
+
+impl From<V2BackendError> for V2CompactionError {
+    fn from(error: V2BackendError) -> Self {
+        Self::Backend(error)
     }
 }
 
@@ -506,6 +529,149 @@ fn apply_prepared_compaction(state: &mut V2CommittedState, prepared: V2PreparedC
     state.nodes = nodes;
     state.versions = versions;
     state.checkpoints = checkpoints;
+}
+
+/// Prepares the fully encoded compact `T2S2` authority candidate without
+/// mutating the authoritative state.
+///
+/// This is the pre-publication bridge, not the in-memory compactor: the
+/// source state stays authoritative while every fallible step (index
+/// validation, compact preparation, image encoding, ledger serialization,
+/// snapshot encoding) completes. A later publisher can write/sync these bytes
+/// and only then adopt the compact memory state. The prepared compact tables
+/// are consumed directly; the whole state is never cloned and compacted.
+///
+/// Empty-state rules mirror the backend exactly: a truly unused state yields
+/// no artifact, while a tombstone-only state yields an authoritative
+/// tombstone-only artifact.
+pub(super) fn prepare_compacted_v2_sealed_artifact(
+    state: &V2CommittedState,
+) -> Result<Option<Vec<u8>>, V2CompactionError> {
+    validate_checkpoint_index(state)?;
+    let V2PreparedCompaction {
+        payload,
+        nodes,
+        versions,
+        checkpoints,
+        ..
+    } = prepare_v2_compaction(state)?;
+    if checkpoints.is_empty() {
+        if !payload.is_empty()
+            || !nodes.is_empty()
+            || !versions.is_empty()
+            || !state.request_records.is_empty()
+        {
+            return Err(V2CompactionError::Invalid(
+                "tombstone-only v2 backend contains live semantic state",
+            ));
+        }
+        if state.retired_requests.is_empty() && state.deleted_checkpoints.is_empty() {
+            return Ok(None);
+        }
+        let snapshot = V2SealedSnapshot {
+            image: Vec::new(),
+            versions: Vec::new(),
+            checkpoints: Vec::new(),
+            active_requests: Vec::new(),
+            retired_requests: artifact_retired_requests(state)?,
+            deleted_checkpoints: artifact_deleted_checkpoints(state)?,
+        };
+        return Ok(Some(encode_v2_sealed_snapshot(&snapshot)?));
+    }
+    if versions.is_empty() || nodes.is_empty() || payload.is_empty() {
+        return Err(V2CompactionError::Invalid(
+            "non-empty v2 backend is missing persistent sequence state",
+        ));
+    }
+    let mut roots: Vec<V2RootRecord> = Vec::new();
+    roots.try_reserve_exact(versions.len()).map_err(|_| {
+        V2CompactionError::Capacity("v2 compaction artifact root table allocation failed")
+    })?;
+    for version in &versions {
+        roots.push(version.root());
+    }
+    let image = encode_v2_image(&V2SequenceImage {
+        payload,
+        nodes,
+        roots,
+    })?;
+    let snapshot = V2SealedSnapshot {
+        image,
+        versions,
+        checkpoints,
+        active_requests: artifact_active_requests(state)?,
+        retired_requests: artifact_retired_requests(state)?,
+        deleted_checkpoints: artifact_deleted_checkpoints(state)?,
+    };
+    Ok(Some(encode_v2_sealed_snapshot(&snapshot)?))
+}
+
+/// Serializes the authoritative source active-request ledger with exact
+/// request IDs, operation digests, and (unchanged) checkpoint ordinals.
+fn artifact_active_requests(
+    state: &V2CommittedState,
+) -> Result<Vec<V2ActiveRequestRecord>, V2CompactionError> {
+    let mut records: Vec<V2ActiveRequestRecord> = Vec::new();
+    records
+        .try_reserve(state.request_records.len())
+        .map_err(|_| {
+            V2CompactionError::Capacity("v2 compaction artifact active request allocation failed")
+        })?;
+    for (request_id, record) in &state.request_records {
+        records.push(V2ActiveRequestRecord::new(
+            try_clone_request_id(request_id)?,
+            record.operation_digest,
+            record.checkpoint_ordinal,
+        )?);
+    }
+    Ok(records)
+}
+
+/// Serializes the authoritative source retired-request ledger exactly.
+fn artifact_retired_requests(
+    state: &V2CommittedState,
+) -> Result<Vec<V2RetiredRequestRecord>, V2CompactionError> {
+    let mut records: Vec<V2RetiredRequestRecord> = Vec::new();
+    records
+        .try_reserve(state.retired_requests.len())
+        .map_err(|_| {
+            V2CompactionError::Capacity("v2 compaction artifact retired request allocation failed")
+        })?;
+    for (request_id, operation_digest) in &state.retired_requests {
+        records.push(V2RetiredRequestRecord::new(
+            try_clone_request_id(request_id)?,
+            *operation_digest,
+        )?);
+    }
+    Ok(records)
+}
+
+/// Serializes the authoritative source deleted-checkpoint identities exactly.
+fn artifact_deleted_checkpoints(
+    state: &V2CommittedState,
+) -> Result<Vec<V2DeletedCheckpointRecord>, V2CompactionError> {
+    let mut records: Vec<V2DeletedCheckpointRecord> = Vec::new();
+    records
+        .try_reserve(state.deleted_checkpoints.len())
+        .map_err(|_| {
+            V2CompactionError::Capacity("v2 compaction artifact tombstone allocation failed")
+        })?;
+    for (thread_id, checkpoint_id) in &state.deleted_checkpoints {
+        records.push(V2DeletedCheckpointRecord::new(
+            try_clone_compaction_string(thread_id)?,
+            try_clone_compaction_string(checkpoint_id)?,
+        )?);
+    }
+    Ok(records)
+}
+
+fn try_clone_request_id(request_id: &[u8]) -> Result<Vec<u8>, V2CompactionError> {
+    let mut cloned = Vec::new();
+    cloned.try_reserve_exact(request_id.len()).map_err(|_| {
+        V2CompactionError::Capacity("v2 compaction request identity allocation failed")
+    })?;
+    cloned.extend_from_slice(request_id);
+    Ok(cloned)
 }
 
 /// Validates retained source ranges and repacks their exact bytes densely.
@@ -944,13 +1110,14 @@ mod tests {
     use super::super::apply_v2::{
         apply_v2_commit, V2ApplyError, V2ApplyOutcome, V2CommittedState, V2RequestStatus,
     };
-    use super::super::backend_v2::{export_v2_sealed_state, recover_v2_backend};
+    use super::super::backend_v2::{export_v2_sealed_state, recover_v2_backend, V2BackendError};
     use super::super::commit_v2::{checkpoint_operation_digest, encode_v2_commit};
     use super::super::format_v2::{decode_v2_node, encode_v2_node, V2NodeRecord, V2RootRecord};
     use super::super::image_v2::{v2_node_fields, V2NodeFields};
     use super::super::publication_v2::{
         checkpoint_state_metadata, V2CheckpointRecord, V2VersionRecord,
     };
+    use super::super::snapshot_v2::V2SnapshotError;
     use super::super::transaction_v2::{V2WalGeometry, V2WalTransaction};
     use super::*;
 
@@ -1751,6 +1918,12 @@ mod tests {
             },
         ];
         state
+            .checkpoint_ordinals
+            .insert(("thread".to_owned(), "cp-1".to_owned()), 0);
+        state
+            .checkpoint_ordinals
+            .insert(("thread".to_owned(), "cp-2".to_owned()), 1);
+        state
     }
 
     #[test]
@@ -2073,5 +2246,267 @@ mod tests {
         assert_eq!(state.request_records, active);
         assert_eq!(state.retired_requests, retired);
         assert_eq!(state.deleted_checkpoints, tombstones);
+    }
+
+    fn assert_unchanged_against_twin(state: &V2CommittedState, twin: &V2CommittedState) {
+        assert_eq!(state.payload, twin.payload);
+        assert_eq!(state.nodes, twin.nodes);
+        assert_eq!(state.versions, twin.versions);
+        assert_eq!(state.checkpoints, twin.checkpoints);
+        assert_eq!(state.checkpoint_ordinals, twin.checkpoint_ordinals);
+        assert_eq!(state.request_records, twin.request_records);
+        assert_eq!(state.retired_requests, twin.retired_requests);
+        assert_eq!(state.deleted_checkpoints, twin.deleted_checkpoints);
+    }
+
+    #[test]
+    fn compact_artifact_prepares_from_sparse_source_without_mutation() {
+        let mut state = build_abcde_state();
+        delete_bc_subtree(&mut state);
+        let mut twin = build_abcde_state();
+        delete_bc_subtree(&mut twin);
+
+        let bytes = prepare_compacted_v2_sealed_artifact(&state)
+            .unwrap()
+            .unwrap();
+        assert_unchanged_against_twin(&state, &twin);
+        // The source physical geometry is still the sparse pre-compaction
+        // geometry; only the reopened artifact is dense.
+        assert_eq!(
+            state.geometry().unwrap(),
+            V2WalGeometry {
+                payload_len: 15,
+                node_count: 9,
+                version_count: 5,
+                checkpoint_count: 3,
+            }
+        );
+
+        let reopened = recover_v2_backend(Some(&bytes), &[]).unwrap();
+        assert_eq!(
+            reopened.state.geometry().unwrap(),
+            V2WalGeometry {
+                payload_len: 9,
+                node_count: 5,
+                version_count: 3,
+                checkpoint_count: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn compact_artifact_reopens_with_exact_semantic_equivalence() {
+        let mut state = build_abcde_state();
+        delete_bc_subtree(&mut state);
+
+        let bytes = prepare_compacted_v2_sealed_artifact(&state)
+            .unwrap()
+            .unwrap();
+        let reopened = recover_v2_backend(Some(&bytes), &[]).unwrap();
+        // Logical checkpoint content is exact; only physical version
+        // coordinates change (source [0,3,4] becomes dense [0,1,2]).
+        assert_eq!(reopened.state.checkpoints.len(), state.checkpoints.len());
+        for (new, old) in reopened
+            .state
+            .checkpoints
+            .iter()
+            .zip(state.checkpoints.iter())
+        {
+            assert_eq!(new.checkpoint_no, old.checkpoint_no);
+            assert_eq!(new.thread_id, old.thread_id);
+            assert_eq!(new.checkpoint_id, old.checkpoint_id);
+            assert_eq!(new.parent_checkpoint_id, old.parent_checkpoint_id);
+            assert_eq!(new.state, old.state);
+        }
+        let reopened_identities: Vec<u32> = reopened
+            .state
+            .checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.identity_version)
+            .collect();
+        assert_eq!(reopened_identities, vec![0, 1, 2]);
+        assert_eq!(
+            reopened.state.checkpoint_ordinals,
+            state.checkpoint_ordinals
+        );
+        assert_eq!(reopened.state.request_records, state.request_records);
+        assert_eq!(reopened.state.retired_requests, state.retired_requests);
+        assert_eq!(
+            reopened.state.deleted_checkpoints,
+            state.deleted_checkpoints
+        );
+        assert_ne!(reopened.state.payload.len(), state.payload.len());
+        assert_ne!(reopened.state.nodes.len(), state.nodes.len());
+        assert_ne!(reopened.state.versions.len(), state.versions.len());
+    }
+
+    #[test]
+    fn compact_artifact_reopen_preserves_request_behavior() {
+        let mut state = build_abcde_state();
+        let digest_a = operation_digest_at(&state, 0);
+        let digest_b = operation_digest_at(&state, 1);
+        let digest_c = operation_digest_at(&state, 2);
+        let digest_d = operation_digest_at(&state, 3);
+        let digest_e = operation_digest_at(&state, 4);
+        delete_bc_subtree(&mut state);
+
+        let bytes = prepare_compacted_v2_sealed_artifact(&state)
+            .unwrap()
+            .unwrap();
+        let reopened = recover_v2_backend(Some(&bytes), &[]).unwrap();
+        assert_eq!(
+            reopened.state.classify_request(b"req-1", digest_a),
+            Ok(V2RequestStatus::Replay {
+                checkpoint_ordinal: 0
+            })
+        );
+        assert_eq!(
+            reopened.state.classify_request(b"req-4", digest_d),
+            Ok(V2RequestStatus::Replay {
+                checkpoint_ordinal: 1
+            })
+        );
+        assert_eq!(
+            reopened.state.classify_request(b"req-5", digest_e),
+            Ok(V2RequestStatus::Replay {
+                checkpoint_ordinal: 2
+            })
+        );
+        assert_eq!(
+            reopened.state.classify_request(b"req-2", digest_b),
+            Ok(V2RequestStatus::Retired)
+        );
+        assert_eq!(
+            reopened.state.classify_request(b"req-3", digest_c),
+            Ok(V2RequestStatus::Retired)
+        );
+        assert_eq!(
+            reopened.state.classify_request(b"req-4", [0xFF; 32]),
+            Err(V2ApplyError::RequestConflict)
+        );
+        assert_eq!(
+            reopened.state.classify_request(b"req-2", [0xFF; 32]),
+            Err(V2ApplyError::RequestConflict)
+        );
+    }
+
+    #[test]
+    fn compact_artifact_matches_accepted_semantic_compactor_bytes() {
+        let mut source1 = build_abcde_state();
+        delete_bc_subtree(&mut source1);
+        let bytes = prepare_compacted_v2_sealed_artifact(&source1)
+            .unwrap()
+            .unwrap();
+
+        let mut source2 = build_abcde_state();
+        delete_bc_subtree(&mut source2);
+        compact_v2_state(&mut source2).unwrap();
+        let ordinary = export_v2_sealed_state(&source2).unwrap().unwrap();
+
+        assert_eq!(bytes, ordinary);
+        let from_artifact = recover_v2_backend(Some(&bytes), &[]).unwrap();
+        let from_compacted = recover_v2_backend(Some(&ordinary), &[]).unwrap();
+        assert_eq!(
+            from_artifact.state.checkpoints,
+            from_compacted.state.checkpoints
+        );
+        assert_eq!(
+            from_artifact.state.checkpoint_ordinals,
+            from_compacted.state.checkpoint_ordinals
+        );
+        assert_eq!(
+            from_artifact.state.request_records,
+            from_compacted.state.request_records
+        );
+        assert_eq!(
+            from_artifact.state.retired_requests,
+            from_compacted.state.retired_requests
+        );
+        assert_eq!(
+            from_artifact.state.deleted_checkpoints,
+            from_compacted.state.deleted_checkpoints
+        );
+        assert_eq!(
+            from_artifact.state.geometry().unwrap(),
+            from_compacted.state.geometry().unwrap()
+        );
+    }
+
+    #[test]
+    fn compact_artifact_rejects_corrupt_checkpoint_index() {
+        let mut state = build_abcde_state();
+        delete_bc_subtree(&mut state);
+        let mut twin = build_abcde_state();
+        delete_bc_subtree(&mut twin);
+        state
+            .checkpoint_ordinals
+            .insert(("thread".to_owned(), "bogus".to_owned()), 99);
+        twin.checkpoint_ordinals
+            .insert(("thread".to_owned(), "bogus".to_owned()), 99);
+
+        assert_eq!(
+            prepare_compacted_v2_sealed_artifact(&state),
+            Err(V2CompactionError::Backend(V2BackendError::Invalid(
+                "v2 checkpoint index cardinality disagrees with checkpoint table"
+            )))
+        );
+        assert_unchanged_against_twin(&state, &twin);
+    }
+
+    #[test]
+    fn compact_artifact_rejects_active_retired_overlap() {
+        let mut state = build_abcde_state();
+        delete_bc_subtree(&mut state);
+        let mut twin = build_abcde_state();
+        delete_bc_subtree(&mut twin);
+        state.retired_requests.insert(b"req-4".to_vec(), [0x55; 32]);
+        twin.retired_requests.insert(b"req-4".to_vec(), [0x55; 32]);
+
+        assert_eq!(
+            prepare_compacted_v2_sealed_artifact(&state),
+            Err(V2CompactionError::Snapshot(V2SnapshotError::Invalid(
+                "v2 request identity is both active and retired"
+            )))
+        );
+        assert_unchanged_against_twin(&state, &twin);
+    }
+
+    #[test]
+    fn compact_artifact_preserves_tombstone_only_authority() {
+        let mut state = V2CommittedState::default();
+        state
+            .deleted_checkpoints
+            .insert(("thread".to_owned(), "cp-1".to_owned()));
+        state.retired_requests.insert(b"req-1".to_vec(), [0x77; 32]);
+
+        let bytes = prepare_compacted_v2_sealed_artifact(&state)
+            .unwrap()
+            .unwrap();
+        let reopened = recover_v2_backend(Some(&bytes), &[]).unwrap();
+        assert_eq!(reopened.state.geometry().unwrap(), V2WalGeometry::default());
+        assert_eq!(
+            reopened.state.deleted_checkpoints,
+            state.deleted_checkpoints
+        );
+        assert_eq!(reopened.state.retired_requests, state.retired_requests);
+    }
+
+    #[test]
+    fn compact_artifact_of_truly_empty_state_is_absent() {
+        let state = V2CommittedState::default();
+        assert_eq!(prepare_compacted_v2_sealed_artifact(&state), Ok(None));
+    }
+
+    #[test]
+    fn compact_artifact_rejects_uncompactionable_physical_state() {
+        let state = overlapping_range_state();
+        let twin = overlapping_range_state();
+        assert_eq!(
+            prepare_compacted_v2_sealed_artifact(&state),
+            Err(V2CompactionError::Invalid(
+                "v2 compaction retained payload ranges overlap or duplicate"
+            ))
+        );
+        assert_unchanged_against_twin(&state, &twin);
     }
 }

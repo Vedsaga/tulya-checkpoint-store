@@ -262,7 +262,7 @@ fn import_v2_sealed_state(bytes: &[u8]) -> Result<V2CommittedState, V2BackendErr
     Ok(state)
 }
 
-fn validate_checkpoint_index(state: &V2CommittedState) -> Result<(), V2BackendError> {
+pub(super) fn validate_checkpoint_index(state: &V2CommittedState) -> Result<(), V2BackendError> {
     if state.checkpoint_ordinals.len() != state.checkpoints.len() {
         return Err(V2BackendError::Invalid(
             "v2 checkpoint index cardinality disagrees with checkpoint table",

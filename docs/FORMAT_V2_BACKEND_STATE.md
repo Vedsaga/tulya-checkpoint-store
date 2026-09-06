@@ -494,6 +494,82 @@ None. This is still staged internal Format-v2 behavior: no filesystem
 publication, no manifest authority, no WAL recycling, no migration, and no
 Format-v2 production activation.
 
+## Immutable compact authority candidate
+
+**DECISION**
+
+The fully encoded compact `T2S2` authority candidate is prepared from
+`&V2CommittedState` without mutating the authoritative state:
+
+```text
+authoritative state
+        |
+        | validate checkpoint index (existing backend validator)
+        | prepare compact replacement (accepted unit)
+        | build canonical T2I2 image from compact tables
+        | serialize authoritative source ledgers
+        | encode schema-2 T2S2
+        v
+compact artifact bytes
+```
+
+The existing `compact_v2_state(&mut)` remains the pure staged
+semantic/in-memory operation; the new
+`prepare_compacted_v2_sealed_artifact(&)` is the immutable pre-publication
+preparation. The second is not implemented by cloning and compacting the whole
+state: it consumes the preparation result directly. The compact checkpoint
+table is used with the authoritative source ledgers (active requests with
+exact IDs/digests/unchanged ordinals, retired requests, tombstones), because
+unchanged checkpoint order keeps every ledger coordinate valid. A corrupt
+checkpoint index fails closed up front rather than being silently repaired by
+ordinal reconstruction. Truly empty states yield no artifact; tombstone-only
+states yield an authoritative tombstone-only artifact.
+
+**WHY**
+
+Mutating live memory to the compact form before the new disk authority is
+durable would leave memory "new" while disk authority is still "old" across
+any publication failure. Preparing the exact candidate bytes immutably keeps
+the old authority intact through every pre-publication failure, so the later
+publisher only needs write/sync/publish followed by memory adoption.
+
+**ALTERNATIVES REJECTED**
+
+- Compact live memory first, then publish: rejected because a publication
+  failure splits memory-new from disk-old authority.
+- Clone the whole state, compact the clone, export the clone: rejected as
+  unnecessary full-state duplication hiding the preparation boundary.
+- Rebuilding ledgers from compact order instead of serializing source
+  ledgers: rejected because identical order makes them the same data with
+  more code.
+- Rewriting the snapshot encoder for this unit: rejected; canonical encoding
+  and its validators are reused unchanged.
+
+**FORMAT IMPACT**
+
+None. No record family, layout, or byte interpretation changes; the staged
+`T2S2` schema-2 carries the compact physical representation with unchanged
+ledger semantics. Disk publication and manifest authority are still later
+units.
+
+## Accepted semantic-compaction evidence
+
+```text
+cargo fmt --all -- --check                         PASS
+cargo clippy --lib --features local-server
+  --locked -- -D warnings                         PASS
+
+persistent_sequence::compaction_v2               24/24
+persistent_sequence::backend_v2                   7/7
+persistent_sequence::apply_v2                     9/9
+persistent_sequence::conformance_v2               9/9
+full library                                      146/146
+```
+
+This accepts the pure semantic compaction pipeline (logical deletion,
+reachability planning, canonical dense preparation, exclusive prepare/apply,
+export/reopen, continued append). Durable publication remains a later unit.
+
 ## Current boundary
 
 This layer still does not:
