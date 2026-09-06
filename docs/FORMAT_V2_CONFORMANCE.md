@@ -5,6 +5,10 @@ language-neutral fixture at the Lean/Rust boundary.  The Rust unit runner in
 conformance_v2.rs parses it with serde_json and checks:
 
 - canonical T2N2/T2R2 leaf and balanced-branch structural commitment bytes;
+- historical-root preservation and independent sibling-branch commitments;
+- fail-closed noncanonical node/root metadata;
+- dense compaction remapping that preserves live checkpoint identities and
+  operation digests;
 - canonical T2S2 live-ledger and tombstone-only snapshot bytes plus reopen;
 - complete-frame and torn-final-frame hot-WAL recovery outcomes;
 - fail-closed recovery for reserve garbage, bare structural records,

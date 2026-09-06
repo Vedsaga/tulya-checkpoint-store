@@ -1,7 +1,12 @@
-use super::apply_v2::{V2ApplyError, V2CommittedState, V2RequestRecord, V2RequestStatus};
+use super::apply_v2::{
+    apply_v2_commit, V2ApplyError, V2CommittedState, V2RequestRecord, V2RequestStatus,
+};
 use super::avl::V2AvlSequence;
 use super::commit_v2::{checkpoint_operation_digest, decode_v2_commit, encode_v2_commit};
-use super::format_v2::{encode_v2_node, encode_v2_root, V2NodeRecord, V2RootRecord};
+use super::compaction_v2::prepare_v2_compaction;
+use super::format_v2::{
+    decode_v2_node, decode_v2_root, encode_v2_node, encode_v2_root, V2NodeRecord, V2RootRecord,
+};
 use super::hot_frame_v2::encode_v2_hot_frame;
 use super::publication_v2::{
     checkpoint_state_metadata, V2CheckpointRecord, V2StateMetadata, V2VersionRecord,
@@ -258,6 +263,268 @@ fn structural_commitment_vectors_match_canonical_node_and_root_codecs() {
             "root encoding vector {} disagrees",
             string(vector, "name")
         );
+    }
+}
+
+#[test]
+fn structural_history_vectors_preserve_old_roots_and_sibling_independence() {
+    let fixture = fixture();
+    assert_eq!(string(&fixture, "schema"), SCHEMA);
+
+    for vector in array(&fixture, "structural_history_vectors") {
+        let mut sequence = V2AvlSequence::default();
+        let base = sequence
+            .append(None, &decode_hex(string(vector, "base_payload_hex")))
+            .unwrap()
+            .root();
+        let base_encoding = encode_hex(&encode_v2_root(base));
+        let left = sequence
+            .append(Some(base), &decode_hex(string(vector, "left_append_hex")))
+            .unwrap()
+            .root();
+        let right = sequence
+            .append(Some(base), &decode_hex(string(vector, "right_append_hex")))
+            .unwrap()
+            .root();
+
+        assert_eq!(
+            sequence.read_range(base, 0, base.logical_len()).unwrap(),
+            decode_hex(string(vector, "expected_parent_hex")),
+            "parent payload vector {} disagrees",
+            string(vector, "name")
+        );
+        assert_eq!(
+            sequence.read_range(left, 0, left.logical_len()).unwrap(),
+            decode_hex(string(vector, "expected_left_hex")),
+            "left payload vector {} disagrees",
+            string(vector, "name")
+        );
+        assert_eq!(
+            sequence.read_range(right, 0, right.logical_len()).unwrap(),
+            decode_hex(string(vector, "expected_right_hex")),
+            "right payload vector {} disagrees",
+            string(vector, "name")
+        );
+        assert_eq!(
+            encode_hex(&encode_v2_root(base)),
+            base_encoding,
+            "historical parent root changed for vector {}",
+            string(vector, "name")
+        );
+        assert_ne!(
+            left.commitment(),
+            right.commitment(),
+            "sibling roots unexpectedly share a commitment for vector {}",
+            string(vector, "name")
+        );
+        sequence.verify_root(base).unwrap();
+        sequence.verify_root(left).unwrap();
+        sequence.verify_root(right).unwrap();
+    }
+}
+
+#[test]
+fn structural_invalid_vectors_fail_closed() {
+    let fixture = fixture();
+    assert_eq!(string(&fixture, "schema"), SCHEMA);
+    for vector in array(&fixture, "structural_invalid_vectors") {
+        match string(vector, "kind") {
+            "node-height" => {
+                let node = V2NodeRecord::leaf(0, b"abc").unwrap();
+                let mut encoded = encode_v2_node(node).to_vec();
+                encoded[6] = 2;
+                assert!(decode_v2_node(&encoded).is_err());
+            }
+            "root-flags" => {
+                let node = V2NodeRecord::leaf(0, b"abc").unwrap();
+                let root = V2RootRecord::from_node(0, node).unwrap();
+                let mut encoded = encode_v2_root(root).to_vec();
+                encoded[5] = 1;
+                assert!(decode_v2_root(&encoded).is_err());
+            }
+            kind => panic!("unknown invalid structural vector kind {kind}"),
+        }
+        assert_eq!(string(vector, "expected"), "reject");
+    }
+}
+
+fn compaction_genesis_transaction(checkpoint_id: &str, payload: &[u8]) -> V2WalTransaction {
+    let node = V2NodeRecord::leaf(0, payload).unwrap();
+    let root = V2RootRecord::from_node(0, node).unwrap();
+    V2WalTransaction {
+        payload: payload.to_vec(),
+        nodes: vec![node],
+        versions: vec![V2VersionRecord::new(0, None, root).unwrap()],
+        checkpoint: V2CheckpointRecord {
+            checkpoint_no: 1,
+            thread_id: "thread".to_owned(),
+            checkpoint_id: checkpoint_id.to_owned(),
+            parent_checkpoint_id: None,
+            identity_version: 0,
+            messages_version: None,
+            result_version: None,
+            state: checkpoint_state_metadata(root, None, None).unwrap(),
+        },
+    }
+}
+
+fn compaction_branch_child_transaction(
+    base: V2WalGeometry,
+    checkpoint_no: u32,
+    thread_id: &str,
+    checkpoint_id: &str,
+    parent_checkpoint_id: Option<&str>,
+    parent_version: u32,
+    parent_root: V2RootRecord,
+    payload: &[u8],
+) -> V2WalTransaction {
+    let leaf = V2NodeRecord::leaf(base.payload_len, payload).unwrap();
+    let leaf_root = V2RootRecord::from_node(base.node_count, leaf).unwrap();
+    let branch = V2NodeRecord::branch(parent_root, leaf_root).unwrap();
+    let branch_root = V2RootRecord::from_node(base.node_count + 1, branch).unwrap();
+    let version_id = u32::try_from(base.version_count).unwrap();
+    V2WalTransaction {
+        payload: payload.to_vec(),
+        nodes: vec![leaf, branch],
+        versions: vec![
+            V2VersionRecord::new(version_id, Some(parent_version), branch_root).unwrap(),
+        ],
+        checkpoint: V2CheckpointRecord {
+            checkpoint_no,
+            thread_id: thread_id.to_owned(),
+            checkpoint_id: checkpoint_id.to_owned(),
+            parent_checkpoint_id: parent_checkpoint_id.map(str::to_owned),
+            identity_version: version_id,
+            messages_version: None,
+            result_version: None,
+            state: checkpoint_state_metadata(branch_root, None, None).unwrap(),
+        },
+    }
+}
+
+fn compaction_sparse_state() -> V2CommittedState {
+    let mut state = V2CommittedState::default();
+    let genesis = compaction_genesis_transaction("cp-1", b"aaa");
+    let base = state.geometry().unwrap();
+    let encoded = encode_v2_commit(base, &genesis, Some(b"req-1")).unwrap();
+    apply_v2_commit(&mut state, &encoded).unwrap();
+    let genesis_root = state.versions[0].root();
+
+    let base = state.geometry().unwrap();
+    let second = compaction_branch_child_transaction(
+        base,
+        2,
+        "thread",
+        "cp-2",
+        Some("cp-1"),
+        0,
+        genesis_root,
+        b"bbb",
+    );
+    let encoded = encode_v2_commit(base, &second, Some(b"req-2")).unwrap();
+    apply_v2_commit(&mut state, &encoded).unwrap();
+    let second_root = state.versions[1].root();
+
+    let base = state.geometry().unwrap();
+    let third = compaction_branch_child_transaction(
+        base,
+        3,
+        "thread",
+        "cp-3",
+        Some("cp-2"),
+        1,
+        second_root,
+        b"ccc",
+    );
+    let encoded = encode_v2_commit(base, &third, Some(b"req-3")).unwrap();
+    apply_v2_commit(&mut state, &encoded).unwrap();
+
+    let base = state.geometry().unwrap();
+    let sibling = compaction_branch_child_transaction(
+        base,
+        4,
+        "thread",
+        "cp-sibling",
+        Some("cp-1"),
+        0,
+        genesis_root,
+        b"ddd",
+    );
+    let encoded = encode_v2_commit(base, &sibling, Some(b"req-4")).unwrap();
+    apply_v2_commit(&mut state, &encoded).unwrap();
+
+    let base = state.geometry().unwrap();
+    let other = compaction_branch_child_transaction(
+        base,
+        5,
+        "other-thread",
+        "other-root",
+        None,
+        0,
+        genesis_root,
+        b"eee",
+    );
+    let encoded = encode_v2_commit(base, &other, Some(b"req-5")).unwrap();
+    apply_v2_commit(&mut state, &encoded).unwrap();
+
+    let prepared_delete = state
+        .prepare_delete_checkpoint_subtree("thread", "cp-2")
+        .unwrap();
+    state.apply_prepared_delete_checkpoint_subtree(prepared_delete);
+    state
+}
+
+#[test]
+fn compaction_vectors_preserve_logical_checkpoints_and_digests() {
+    let fixture = fixture();
+    assert_eq!(string(&fixture, "schema"), SCHEMA);
+
+    for vector in array(&fixture, "compaction_vectors") {
+        assert_eq!(string(vector, "kind"), "deleted-middle-subtree");
+        let state = compaction_sparse_state();
+        let source_digests = state
+            .checkpoints
+            .iter()
+            .map(checkpoint_operation_digest)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let prepared = prepare_v2_compaction(&state).unwrap();
+
+        assert_eq!(
+            prepared.payload(),
+            decode_hex(string(vector, "expected_compact_payload_hex"))
+        );
+        assert_eq!(
+            prepared.nodes().len(),
+            number(vector, "expected_compact_node_count") as usize
+        );
+        assert_eq!(
+            prepared.versions().len(),
+            number(vector, "expected_compact_version_count") as usize
+        );
+        assert_eq!(
+            prepared.checkpoints().len(),
+            number(vector, "expected_compact_checkpoint_count") as usize
+        );
+        for (index, expected) in array(vector, "expected_live").iter().enumerate() {
+            let (thread_id, checkpoint_id) = string_pair(expected);
+            let checkpoint = &prepared.checkpoints()[index];
+            assert_eq!(checkpoint.thread_id, thread_id);
+            assert_eq!(checkpoint.checkpoint_id, checkpoint_id);
+            assert_eq!(
+                checkpoint.identity_version,
+                array(vector, "expected_identity_versions")[index]
+                    .as_u64()
+                    .unwrap() as u32
+            );
+        }
+        let compact_digests = prepared
+            .checkpoints()
+            .iter()
+            .map(checkpoint_operation_digest)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(source_digests, compact_digests);
     }
 }
 
