@@ -30,6 +30,8 @@ mod avl;
 mod backend_v2;
 #[allow(dead_code)]
 mod commit_v2;
+#[allow(dead_code)]
+mod compaction_v2;
 #[cfg(test)]
 mod conformance_v2;
 #[allow(dead_code)]

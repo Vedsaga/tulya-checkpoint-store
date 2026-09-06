@@ -289,6 +289,72 @@ The focused backend tests require:
   checkpoint identity; and
 - corrupt sealed bytes are rejected before hot replay.
 
+## Compaction reachability plan
+
+**DECISION**
+
+Physical reachability is computed as a deterministic plan over source
+identifiers before any remapping or reclamation exists:
+
+```text
+seed required versions from every live checkpoint
+  identity_version + messages_version/result_version when present
+retain every transitive parent_version ancestor (iterative worklist)
+traverse the AVL DAG from every retained version root (iterative worklist)
+retain every reachable node exactly once
+record every retained leaf payload range verbatim
+              |
+              v
+    V2CompactionPlan
+```
+
+The plan exposes retained source version IDs ascending, retained source node
+IDs ascending, and retained source payload ranges ordered by original offset,
+then length. It contains old/source identifiers only: no compacted IDs, no
+replacement nodes or versions, no apply step, and no publication.
+
+Version planning fails closed on a checkpoint reference to a nonexistent
+version, a version ID that disagrees with its vector coordinate, a missing or
+non-prior parent, or an invalid conversion boundary. Node traversal fails
+closed on a root or branch child outside the node table, a child that is not
+topologically prior to its parent, or a leaf whose range overflows or leaves
+the payload arena. The planner receives `&V2CommittedState` only, so every
+such failure leaves committed state untouched by construction; there is no
+rollback path because no semantic mutation ever starts.
+
+Payload ranges are recorded per retained leaf without merging or
+deduplication. Canonical appends allocate disjoint delta ranges, so overlaps
+can only arise from a malformed arena; preserving them verbatim lets the later
+remapping unit reject or handle them explicitly.
+
+**WHY**
+
+Logical deletion deliberately precedes physical reclamation, so unreachable
+arena/version history accumulates after partial deletion. Reclaiming bytes
+requires first agreeing, in an auditable unit, on exactly which physical state
+remains semantically required. Separating the read-only reachability analysis
+from the destructive remapping keeps each side independently reviewable and
+testable: the plan can be asserted exactly (source IDs and ranges) without
+reasoning about replacement coordinates.
+
+**ALTERNATIVES REJECTED**
+
+- Compact the arena in the same unit as planning: rejected because analysis
+  and destructive remapping have different correctness boundaries.
+- Retain only directly referenced checkpoint versions without ancestry:
+  rejected because historical versions remain addressable history until
+  remapping proves otherwise.
+- Merge or deduplicate payload ranges during planning: rejected because
+  merging presumes a remapping policy this unit must not invent.
+- Mutate `V2CommittedState` in place while traversing: rejected because a
+  read-only `&self` plan is fail-atomic by construction.
+
+**FORMAT IMPACT**
+
+None. This unit computes physical reachability only; it does not reclaim
+bytes; it does not change logical deletion authority; it does not publish
+Format v2; source IDs remain source IDs; remapping is the next unit.
+
 ## Current boundary
 
 This layer still does not:
