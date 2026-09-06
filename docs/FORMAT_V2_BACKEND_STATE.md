@@ -241,7 +241,7 @@ None. The staged schema-2 `T2S2` already carries active requests, retired
 requests, and deleted checkpoint identities. No record family or byte
 interpretation changes.
 
-**STAGED ACCEPTANCE**
+**ACCEPTED EVIDENCE**
 
 This unit is accepted only after focused tests prove:
 
@@ -255,6 +255,25 @@ This unit is accepted only after focused tests prove:
 - snapshot export/reopen preserves deletion and retired-request authority; and
 - deleting the final live checkpoint produces a valid tombstone-only backend
   that reopens with zero sequence geometry.
+
+Reviewer inspected commit `e556c2fd189ad8c9d9bc5c2d7599eec4e91c24ca`
+and confirmed it is formatter-only. Validation passed:
+
+```text
+cargo fmt --all -- --check                         PASS
+cargo clippy --lib --features local-server
+  --locked -- -D warnings                         PASS
+
+persistent_sequence::apply_v2                     9/9
+persistent_sequence::backend_v2                   7/7
+persistent_sequence::commit_v2                    4/4
+persistent_sequence::publication_v2               3/3
+full library                                      113/113
+```
+
+This accepts the staged semantic transition only. It does not make Format v2
+authoritative in CheckpointStore. It does not implement physical
+compaction/reclamation. It does not change persisted format bytes.
 
 ## Acceptance properties
 
