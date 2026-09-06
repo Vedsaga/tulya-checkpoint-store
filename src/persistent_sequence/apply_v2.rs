@@ -4,7 +4,9 @@
 //! scanner/writer can use the same validation boundary before publishing or
 //! replaying a `T2C2` commit into authoritative state.
 
-use super::commit_v2::{decode_v2_commit, V2CommitError, V2DecodedCommit};
+use super::commit_v2::{
+    checkpoint_operation_digest, decode_v2_commit, V2CommitError, V2DecodedCommit,
+};
 use super::format_v2::{encode_v2_node, V2FormatError, V2NodeRecord, V2RootRecord};
 use super::publication_v2::{
     checkpoint_state_metadata, V2CheckpointRecord, V2PublicationError, V2VersionRecord,
@@ -14,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 const V2_MAX_REQUEST_ID_BYTES: usize = 4096;
+const V2_MAX_IDENTIFIER_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum V2ApplyError {
@@ -80,6 +83,22 @@ pub(super) enum V2ApplyOutcome {
 pub(super) struct V2RequestRecord {
     pub(super) operation_digest: [u8; 32],
     pub(super) checkpoint_ordinal: u64,
+}
+
+#[derive(Debug)]
+pub(super) struct V2PreparedSubtreeDelete {
+    delete_mask: Vec<u8>,
+    checkpoint_ordinals: HashMap<(String, String), u64>,
+    request_records: HashMap<Vec<u8>, V2RequestRecord>,
+    retired_requests: HashMap<Vec<u8>, [u8; 32]>,
+    deleted_checkpoints: HashSet<(String, String)>,
+    deleted_checkpoint_count: u64,
+}
+
+impl V2PreparedSubtreeDelete {
+    pub(super) const fn deleted_checkpoint_count(&self) -> u64 {
+        self.deleted_checkpoint_count
+    }
 }
 
 #[derive(Debug, Default)]
@@ -161,6 +180,348 @@ impl V2CommittedState {
         let _ = self.request_records.remove(request_id);
         let _ = self.retired_requests.insert(retired_key, operation_digest);
         Ok(())
+    }
+
+    pub(super) fn prepare_delete_checkpoint_subtree(
+        &self,
+        thread_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<V2PreparedSubtreeDelete, V2ApplyError> {
+        validate_checkpoint_identifier(thread_id)?;
+        validate_checkpoint_identifier(checkpoint_id)?;
+        let checkpoint_positions = self.validate_delete_source_state()?;
+
+        let target_index = match checkpoint_positions.get(&(thread_id, checkpoint_id)).copied() {
+            Some(index) => index,
+            None => {
+                if self
+                    .deleted_checkpoints
+                    .iter()
+                    .any(|(thread, checkpoint)| thread == thread_id && checkpoint == checkpoint_id)
+                {
+                    return Err(V2ApplyError::Invalid(
+                        "v2 checkpoint identity is already deleted",
+                    ));
+                }
+                return Err(V2ApplyError::Invalid(
+                    "v2 checkpoint identity to delete is absent",
+                ));
+            }
+        };
+
+        let checkpoint_count = self.checkpoints.len();
+        let mut delete_mask = Vec::new();
+        delete_mask
+            .try_reserve_exact(checkpoint_count)
+            .map_err(|_| V2ApplyError::Capacity("v2 deletion mask allocation failed"))?;
+        delete_mask.resize(checkpoint_count, 0);
+        delete_mask[target_index] = 1;
+
+        for index in target_index.saturating_add(1)..checkpoint_count {
+            let checkpoint = &self.checkpoints[index];
+            if checkpoint.thread_id != thread_id {
+                continue;
+            }
+            let Some(parent) = checkpoint.parent_checkpoint_id.as_deref() else {
+                continue;
+            };
+            let parent_index = checkpoint_positions
+                .get(&(checkpoint.thread_id.as_str(), parent))
+                .copied()
+                .ok_or(V2ApplyError::Invalid(
+                    "v2 live checkpoint parent is absent from the index",
+                ))?;
+            if parent_index >= index {
+                return Err(V2ApplyError::Invalid(
+                    "v2 live checkpoint parent is not topologically prior",
+                ));
+            }
+            if delete_mask[parent_index] != 0 {
+                delete_mask[index] = 1;
+            }
+        }
+
+        self.prepare_delete_ledgers(delete_mask)
+    }
+
+    pub(super) fn apply_prepared_delete_checkpoint_subtree(
+        &mut self,
+        prepared: V2PreparedSubtreeDelete,
+    ) {
+        let V2PreparedSubtreeDelete {
+            delete_mask,
+            checkpoint_ordinals,
+            request_records,
+            retired_requests,
+            deleted_checkpoints,
+            deleted_checkpoint_count: _,
+        } = prepared;
+
+        let mut index = 0usize;
+        self.checkpoints.retain(|_| {
+            let retain = delete_mask.get(index).copied().unwrap_or(1) == 0;
+            index = index.saturating_add(1);
+            retain
+        });
+        self.checkpoint_ordinals = checkpoint_ordinals;
+        self.request_records = request_records;
+        self.retired_requests = retired_requests;
+        self.deleted_checkpoints = deleted_checkpoints;
+
+        if self.checkpoints.is_empty() {
+            self.payload.clear();
+            self.nodes.clear();
+            self.versions.clear();
+        }
+    }
+
+    fn validate_delete_source_state(
+        &self,
+    ) -> Result<HashMap<(&str, &str), usize>, V2ApplyError> {
+        if self.checkpoint_ordinals.len() != self.checkpoints.len() {
+            return Err(V2ApplyError::Invalid(
+                "v2 checkpoint index cardinality disagrees with checkpoint table",
+            ));
+        }
+
+        let mut positions = HashMap::new();
+        positions
+            .try_reserve(self.checkpoints.len())
+            .map_err(|_| V2ApplyError::Capacity("v2 checkpoint position map allocation failed"))?;
+
+        for (index, checkpoint) in self.checkpoints.iter().enumerate() {
+            validate_checkpoint_identifier(&checkpoint.thread_id)?;
+            validate_checkpoint_identifier(&checkpoint.checkpoint_id)?;
+            if let Some(parent) = checkpoint.parent_checkpoint_id.as_deref() {
+                validate_checkpoint_identifier(parent)?;
+            }
+            if self.deleted_checkpoints.contains(&(
+                checkpoint.thread_id.clone(),
+                checkpoint.checkpoint_id.clone(),
+            )) {
+                return Err(V2ApplyError::Invalid(
+                    "v2 checkpoint identity is both live and deleted",
+                ));
+            }
+            if positions
+                .insert(
+                    (
+                        checkpoint.thread_id.as_str(),
+                        checkpoint.checkpoint_id.as_str(),
+                    ),
+                    index,
+                )
+                .is_some()
+            {
+                return Err(V2ApplyError::Invalid(
+                    "v2 checkpoint table contains duplicate identity",
+                ));
+            }
+            let expected_ordinal = u64::try_from(index)
+                .map_err(|_| V2ApplyError::Overflow("v2 checkpoint ordinal exceeds u64"))?;
+            let indexed_ordinal = self
+                .checkpoint_ordinals
+                .iter()
+                .find_map(|((thread, checkpoint_id), ordinal)| {
+                    (thread == &checkpoint.thread_id
+                        && checkpoint_id == &checkpoint.checkpoint_id)
+                        .then_some(*ordinal)
+                })
+                .ok_or(V2ApplyError::Invalid(
+                    "v2 live checkpoint is absent from the index",
+                ))?;
+            if indexed_ordinal != expected_ordinal {
+                return Err(V2ApplyError::Invalid(
+                    "v2 checkpoint index disagrees with checkpoint table",
+                ));
+            }
+            if let Some(parent) = checkpoint.parent_checkpoint_id.as_deref() {
+                let parent_index = positions
+                    .get(&(checkpoint.thread_id.as_str(), parent))
+                    .copied()
+                    .ok_or(V2ApplyError::Invalid(
+                        "v2 live checkpoint parent is not topologically prior in the same thread",
+                    ))?;
+                if parent_index >= index {
+                    return Err(V2ApplyError::Invalid(
+                        "v2 live checkpoint parent is not topologically prior",
+                    ));
+                }
+            }
+        }
+
+        for (thread_id, checkpoint_id) in &self.deleted_checkpoints {
+            validate_checkpoint_identifier(thread_id)?;
+            validate_checkpoint_identifier(checkpoint_id)?;
+        }
+
+        for (request_id, record) in &self.request_records {
+            validate_request_id(request_id)?;
+            if self.retired_requests.contains_key(request_id) {
+                return Err(V2ApplyError::Invalid(
+                    "v2 request identity is both active and retired",
+                ));
+            }
+            let checkpoint_index = usize::try_from(record.checkpoint_ordinal)
+                .map_err(|_| V2ApplyError::Overflow("v2 request checkpoint ordinal exceeds usize"))?;
+            let checkpoint = self
+                .checkpoints
+                .get(checkpoint_index)
+                .ok_or(V2ApplyError::Invalid(
+                    "v2 active request checkpoint ordinal is outside the checkpoint table",
+                ))?;
+            if checkpoint_operation_digest(checkpoint)? != record.operation_digest {
+                return Err(V2ApplyError::Invalid(
+                    "v2 active request digest disagrees with its checkpoint",
+                ));
+            }
+        }
+        for request_id in self.retired_requests.keys() {
+            validate_request_id(request_id)?;
+        }
+
+        Ok(positions)
+    }
+
+    fn prepare_delete_ledgers(
+        &self,
+        delete_mask: Vec<u8>,
+    ) -> Result<V2PreparedSubtreeDelete, V2ApplyError> {
+        let deleted_count = delete_mask.iter().filter(|value| **value != 0).count();
+        let retained_count = self
+            .checkpoints
+            .len()
+            .checked_sub(deleted_count)
+            .ok_or(V2ApplyError::Invalid(
+                "v2 deletion mask exceeds checkpoint table",
+            ))?;
+        let deleted_checkpoint_count = u64::try_from(deleted_count)
+            .map_err(|_| V2ApplyError::Overflow("v2 deleted checkpoint count exceeds u64"))?;
+
+        let mut checkpoint_ordinals = HashMap::new();
+        checkpoint_ordinals
+            .try_reserve(retained_count)
+            .map_err(|_| V2ApplyError::Capacity("v2 retained checkpoint index allocation failed"))?;
+
+        let final_deleted_count = self
+            .deleted_checkpoints
+            .len()
+            .checked_add(deleted_count)
+            .ok_or(V2ApplyError::Overflow(
+                "v2 deleted checkpoint ledger length exceeds usize",
+            ))?;
+        let mut deleted_checkpoints = HashSet::new();
+        deleted_checkpoints
+            .try_reserve(final_deleted_count)
+            .map_err(|_| V2ApplyError::Capacity("v2 deleted checkpoint ledger allocation failed"))?;
+        for (thread_id, checkpoint_id) in &self.deleted_checkpoints {
+            let key = try_clone_checkpoint_key(thread_id, checkpoint_id)?;
+            let _ = deleted_checkpoints.insert(key);
+        }
+
+        let mut next_ordinal = 0u64;
+        for (index, checkpoint) in self.checkpoints.iter().enumerate() {
+            if delete_mask.get(index).copied().unwrap_or(1) != 0 {
+                let key = try_clone_checkpoint_key(&checkpoint.thread_id, &checkpoint.checkpoint_id)?;
+                let _ = deleted_checkpoints.insert(key);
+            } else {
+                let key = try_clone_checkpoint_key(&checkpoint.thread_id, &checkpoint.checkpoint_id)?;
+                let _ = checkpoint_ordinals.insert(key, next_ordinal);
+                next_ordinal = next_ordinal
+                    .checked_add(1)
+                    .ok_or(V2ApplyError::Overflow("v2 retained checkpoint ordinal exceeds u64"))?;
+            }
+        }
+
+        let retire_count = self
+            .request_records
+            .values()
+            .filter(|record| {
+                usize::try_from(record.checkpoint_ordinal)
+                    .ok()
+                    .and_then(|index| delete_mask.get(index))
+                    .copied()
+                    .unwrap_or(0)
+                    != 0
+            })
+            .count();
+        let retained_request_count = self
+            .request_records
+            .len()
+            .checked_sub(retire_count)
+            .ok_or(V2ApplyError::Invalid(
+                "v2 retired request count exceeds active request ledger",
+            ))?;
+
+        let mut request_records = HashMap::new();
+        request_records
+            .try_reserve(retained_request_count)
+            .map_err(|_| V2ApplyError::Capacity("v2 retained request ledger allocation failed"))?;
+
+        let final_retired_count = self
+            .retired_requests
+            .len()
+            .checked_add(retire_count)
+            .ok_or(V2ApplyError::Overflow(
+                "v2 retired request ledger length exceeds usize",
+            ))?;
+        let mut retired_requests = HashMap::new();
+        retired_requests
+            .try_reserve(final_retired_count)
+            .map_err(|_| V2ApplyError::Capacity("v2 retired request ledger allocation failed"))?;
+        for (request_id, operation_digest) in &self.retired_requests {
+            let key = try_clone_bytes(request_id, "v2 retired request key allocation failed")?;
+            let _ = retired_requests.insert(key, *operation_digest);
+        }
+
+        for (request_id, record) in &self.request_records {
+            let old_index = usize::try_from(record.checkpoint_ordinal)
+                .map_err(|_| V2ApplyError::Overflow("v2 request checkpoint ordinal exceeds usize"))?;
+            let deleted = delete_mask
+                .get(old_index)
+                .copied()
+                .ok_or(V2ApplyError::Invalid(
+                    "v2 active request checkpoint ordinal is outside the deletion mask",
+                ))?
+                != 0;
+            let key = try_clone_bytes(request_id, "v2 request key allocation failed")?;
+            if deleted {
+                let _ = retired_requests.insert(key, record.operation_digest);
+            } else {
+                let checkpoint = self
+                    .checkpoints
+                    .get(old_index)
+                    .ok_or(V2ApplyError::Invalid(
+                        "v2 retained request checkpoint is outside the checkpoint table",
+                    ))?;
+                let new_ordinal = checkpoint_ordinals
+                    .iter()
+                    .find_map(|((thread_id, checkpoint_id), ordinal)| {
+                        (thread_id == &checkpoint.thread_id
+                            && checkpoint_id == &checkpoint.checkpoint_id)
+                            .then_some(*ordinal)
+                    })
+                    .ok_or(V2ApplyError::Invalid(
+                        "v2 retained request checkpoint is absent from the prepared index",
+                    ))?;
+                let _ = request_records.insert(
+                    key,
+                    V2RequestRecord {
+                        operation_digest: record.operation_digest,
+                        checkpoint_ordinal: new_ordinal,
+                    },
+                );
+            }
+        }
+
+        Ok(V2PreparedSubtreeDelete {
+            delete_mask,
+            checkpoint_ordinals,
+            request_records,
+            retired_requests,
+            deleted_checkpoints,
+            deleted_checkpoint_count,
+        })
     }
 }
 
@@ -395,6 +756,43 @@ fn resolve_version(
         )
         .copied()
         .ok_or(V2ApplyError::Invalid("v2 referenced new version is absent"))
+}
+
+fn validate_checkpoint_identifier(identifier: &str) -> Result<(), V2ApplyError> {
+    if identifier.is_empty() || identifier.len() > V2_MAX_IDENTIFIER_BYTES {
+        return Err(V2ApplyError::Invalid(
+            "v2 checkpoint identifier is empty or exceeds the byte limit",
+        ));
+    }
+    Ok(())
+}
+
+fn try_clone_bytes(bytes: &[u8], message: &'static str) -> Result<Vec<u8>, V2ApplyError> {
+    let mut cloned = Vec::new();
+    cloned
+        .try_reserve_exact(bytes.len())
+        .map_err(|_| V2ApplyError::Capacity(message))?;
+    cloned.extend_from_slice(bytes);
+    Ok(cloned)
+}
+
+fn try_clone_string(value: &str) -> Result<String, V2ApplyError> {
+    let mut cloned = String::new();
+    cloned
+        .try_reserve_exact(value.len())
+        .map_err(|_| V2ApplyError::Capacity("v2 checkpoint identity allocation failed"))?;
+    cloned.push_str(value);
+    Ok(cloned)
+}
+
+fn try_clone_checkpoint_key(
+    thread_id: &str,
+    checkpoint_id: &str,
+) -> Result<(String, String), V2ApplyError> {
+    Ok((
+        try_clone_string(thread_id)?,
+        try_clone_string(checkpoint_id)?,
+    ))
 }
 
 fn validate_request_id(request_id: &[u8]) -> Result<(), V2ApplyError> {
