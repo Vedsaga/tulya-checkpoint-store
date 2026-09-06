@@ -705,7 +705,7 @@ Test near-full filesystems for:
 - WAL replacement;
 - delete/prune;
 - compaction;
-- migration;
+- future released-format migration, when one exists;
 - backup.
 
 Maintenance must not destroy old authority before replacement authority is
@@ -751,7 +751,7 @@ cargo-fuzz targets:
   hot-WAL transaction parser
   sealed segment/index parser
   checkpoint/root/node parser
-  migration parser
+  future released-format migration parser (once migration exists)
 ```
 
 Add property/state-machine tests generating random valid histories containing:
@@ -1508,7 +1508,7 @@ Before production release:
       reviewed;
 - [ ] Python dependency audit passes or exception is reviewed;
 - [ ] licenses are compatible;
-- [ ] release notes include format compatibility/migration requirements;
+- [ ] release notes include the exact released format contract and any upgrade/migration requirements that actually apply;
 - [ ] checksums/attestations/SBOM published where practical;
 - [ ] rollback procedure documented.
 
@@ -1912,7 +1912,7 @@ change:
 1. identify which invariant above can be affected;
 2. add/fail a test before changing the implementation where practical;
 3. rerun official LangGraph conformance;
-4. rerun the relevant crash/I/O/migration/locality matrix;
+4. rerun the relevant crash/I/O/locality matrix and migration matrix only when a released migration exists;
 5. preserve every released format fixture; prototype fixtures discarded before v0.1 are not compatibility contracts;
 6. update release evidence;
 7. report regressions and losses, not only improvements.
