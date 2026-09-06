@@ -279,7 +279,12 @@ fn plan_retained_arena(
         .map_err(|_| V2CompactionError::Capacity("v2 compaction node plan allocation failed"))?;
     ordered_nodes.extend(retained.iter().copied());
     ordered_nodes.sort_unstable();
-    ranges.sort_by(|left, right| (left.offset, left.length).cmp(&(right.offset, right.length)));
+    // Unstable ordering is allocation-free, consistent with this unit's
+    // explicit `Capacity` handling. Stability has no semantic value here
+    // because identical `(offset, length)` entries are indistinguishable.
+    ranges.sort_unstable_by(|left, right| {
+        (left.offset, left.length).cmp(&(right.offset, right.length))
+    });
     Ok((ordered_nodes, ranges))
 }
 
@@ -301,7 +306,7 @@ mod tests {
     use super::super::commit_v2::encode_v2_commit;
     use super::super::format_v2::{V2NodeRecord, V2RootRecord};
     use super::super::publication_v2::{
-        checkpoint_state_metadata, V2CheckpointRecord, V2StateMetadata, V2VersionRecord,
+        checkpoint_state_metadata, V2CheckpointRecord, V2VersionRecord,
     };
     use super::super::transaction_v2::{V2WalGeometry, V2WalTransaction};
     use super::*;
@@ -329,8 +334,9 @@ mod tests {
     fn branch_child_transaction(
         base: V2WalGeometry,
         checkpoint_no: u32,
+        thread_id: &str,
         checkpoint_id: &str,
-        parent_checkpoint_id: &str,
+        parent_checkpoint_id: Option<&str>,
         parent_version: u32,
         parent_root: V2RootRecord,
         payload: &[u8],
@@ -348,38 +354,13 @@ mod tests {
             ],
             checkpoint: V2CheckpointRecord {
                 checkpoint_no,
-                thread_id: "thread".to_owned(),
+                thread_id: thread_id.to_owned(),
                 checkpoint_id: checkpoint_id.to_owned(),
-                parent_checkpoint_id: Some(parent_checkpoint_id.to_owned()),
+                parent_checkpoint_id: parent_checkpoint_id.map(str::to_owned),
                 identity_version: version_id,
                 messages_version: None,
                 result_version: None,
                 state: checkpoint_state_metadata(branch_root, None, None).unwrap(),
-            },
-        }
-    }
-
-    fn checkpoint_only_transaction(
-        checkpoint_no: u32,
-        thread_id: &str,
-        checkpoint_id: &str,
-        parent_checkpoint_id: Option<&str>,
-        identity_version: u32,
-        state: V2StateMetadata,
-    ) -> V2WalTransaction {
-        V2WalTransaction {
-            payload: Vec::new(),
-            nodes: Vec::new(),
-            versions: Vec::new(),
-            checkpoint: V2CheckpointRecord {
-                checkpoint_no,
-                thread_id: thread_id.to_owned(),
-                checkpoint_id: checkpoint_id.to_owned(),
-                parent_checkpoint_id: parent_checkpoint_id.map(str::to_owned),
-                identity_version,
-                messages_version: None,
-                result_version: None,
-                state,
             },
         }
     }
@@ -401,88 +382,116 @@ mod tests {
             .collect()
     }
 
-    fn leaf_state(
-        payload: &[u8],
-        node_id: u64,
-        version_id: u32,
-        identity_version: u32,
-    ) -> V2CommittedState {
-        let leaf = V2NodeRecord::leaf(0, payload).unwrap();
-        let root = V2RootRecord::from_node(node_id, leaf).unwrap();
-        let version = V2VersionRecord::new(version_id, None, root).unwrap();
-        let mut state = V2CommittedState::default();
-        state.payload = payload.to_vec();
-        state.nodes = vec![leaf];
-        state.versions = vec![version];
-        state.checkpoints = vec![V2CheckpointRecord {
-            checkpoint_no: 1,
-            thread_id: "thread".to_owned(),
-            checkpoint_id: "cp-1".to_owned(),
-            parent_checkpoint_id: None,
-            identity_version,
-            messages_version: None,
-            result_version: None,
-            state: checkpoint_state_metadata(root, None, None).unwrap(),
-        }];
-        state
-    }
-
     #[test]
     fn deleted_subtree_history_is_unreachable_but_retained_roots_survive() {
+        // Physical topology under test:
+        //   A(cp-1, v0/n0)
+        //   ├── B(cp-2, v1/n1-n2 derived from A)
+        //   │   └── C(cp-3, v2/n3-n4 derived from B)
+        //   └── D(cp-sibling, v3/n5-n6 derived from A, distinct root)
+        //   other-thread E(other-root, v4/n7-n8 derived from A, distinct root)
+        // Deleting B must drop only the B/C-exclusive versions, nodes, and
+        // payload ranges while keeping the distinct D and E histories.
         let mut state = V2CommittedState::default();
         apply_transaction(&mut state, &genesis_transaction("cp-1", b"aaa"), b"req-1");
         let genesis_root = state.versions[0].root();
         let base = state.geometry().unwrap();
         apply_transaction(
             &mut state,
-            &branch_child_transaction(base, 2, "cp-2", "cp-1", 0, genesis_root, b"bbb"),
+            &branch_child_transaction(
+                base,
+                2,
+                "thread",
+                "cp-2",
+                Some("cp-1"),
+                0,
+                genesis_root,
+                b"bbb",
+            ),
             b"req-2",
         );
         let second_root = state.versions[1].root();
         let base = state.geometry().unwrap();
         apply_transaction(
             &mut state,
-            &branch_child_transaction(base, 3, "cp-3", "cp-2", 1, second_root, b"ccc"),
+            &branch_child_transaction(
+                base,
+                3,
+                "thread",
+                "cp-3",
+                Some("cp-2"),
+                1,
+                second_root,
+                b"ccc",
+            ),
             b"req-3",
         );
-        let sibling = checkpoint_only_transaction(
-            4,
-            "thread",
-            "cp-sibling",
-            Some("cp-1"),
-            0,
-            state.checkpoints[0].state,
+        let base = state.geometry().unwrap();
+        apply_transaction(
+            &mut state,
+            &branch_child_transaction(
+                base,
+                4,
+                "thread",
+                "cp-sibling",
+                Some("cp-1"),
+                0,
+                genesis_root,
+                b"ddd",
+            ),
+            b"req-4",
         );
-        apply_transaction(&mut state, &sibling, b"req-4");
-        let other = checkpoint_only_transaction(
-            5,
-            "other-thread",
-            "other-root",
-            None,
-            0,
-            state.checkpoints[0].state,
+        let base = state.geometry().unwrap();
+        apply_transaction(
+            &mut state,
+            &branch_child_transaction(
+                base,
+                5,
+                "other-thread",
+                "other-root",
+                None,
+                0,
+                genesis_root,
+                b"eee",
+            ),
+            b"req-5",
         );
-        apply_transaction(&mut state, &other, b"req-5");
 
         let before = plan_v2_compaction(&state).unwrap();
-        assert_eq!(before.retained_versions(), &[0, 1, 2]);
-        assert_eq!(before.retained_nodes(), &[0, 1, 2, 3, 4]);
-        assert_eq!(payload_ranges(&before), vec![(0, 3), (3, 3), (6, 3)]);
+        assert_eq!(before.retained_versions(), &[0, 1, 2, 3, 4]);
+        assert_eq!(before.retained_nodes(), &[0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            payload_ranges(&before),
+            vec![(0, 3), (3, 3), (6, 3), (9, 3), (12, 3)]
+        );
 
         let prepared = state
             .prepare_delete_checkpoint_subtree("thread", "cp-2")
             .unwrap();
+        assert_eq!(prepared.deleted_checkpoint_count(), 2);
         state.apply_prepared_delete_checkpoint_subtree(prepared);
 
         let after = plan_v2_compaction(&state).unwrap();
-        assert_eq!(after.retained_versions(), &[0]);
-        assert_eq!(after.retained_nodes(), &[0]);
-        assert_eq!(payload_ranges(&after), vec![(0, 3)]);
-        assert!(!after.retained_versions().contains(&1));
-        assert!(!after.retained_versions().contains(&2));
-        for unreachable in [1, 2, 3, 4] {
-            assert!(!after.retained_nodes().contains(&unreachable));
+        assert_eq!(after.retained_versions(), &[0, 3, 4]);
+        assert_eq!(after.retained_nodes(), &[0, 5, 6, 7, 8]);
+        let after_ranges = payload_ranges(&after);
+        assert_eq!(after_ranges, vec![(0, 3), (9, 3), (12, 3)]);
+        for pruned_version in [1, 2] {
+            assert!(!after.retained_versions().contains(&pruned_version));
         }
+        for pruned_node in [1, 2, 3, 4] {
+            assert!(!after.retained_nodes().contains(&pruned_node));
+        }
+        assert!(!after_ranges.contains(&(3, 3)));
+        assert!(!after_ranges.contains(&(6, 3)));
+        assert_eq!(
+            after
+                .retained_nodes()
+                .iter()
+                .filter(|node| **node == 0)
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -493,13 +502,31 @@ mod tests {
         let base = state.geometry().unwrap();
         apply_transaction(
             &mut state,
-            &branch_child_transaction(base, 2, "cp-2", "cp-1", 0, genesis_root, b"bbb"),
+            &branch_child_transaction(
+                base,
+                2,
+                "thread",
+                "cp-2",
+                Some("cp-1"),
+                0,
+                genesis_root,
+                b"bbb",
+            ),
             b"req-2",
         );
         let base = state.geometry().unwrap();
         apply_transaction(
             &mut state,
-            &branch_child_transaction(base, 3, "cp-3", "cp-1", 0, genesis_root, b"ccc"),
+            &branch_child_transaction(
+                base,
+                3,
+                "thread",
+                "cp-3",
+                Some("cp-1"),
+                0,
+                genesis_root,
+                b"ccc",
+            ),
             b"req-3",
         );
 
@@ -524,14 +551,32 @@ mod tests {
         let base = state.geometry().unwrap();
         apply_transaction(
             &mut state,
-            &branch_child_transaction(base, 2, "cp-2", "cp-1", 0, genesis_root, b"bbb"),
+            &branch_child_transaction(
+                base,
+                2,
+                "thread",
+                "cp-2",
+                Some("cp-1"),
+                0,
+                genesis_root,
+                b"bbb",
+            ),
             b"req-2",
         );
         let second_root = state.versions[1].root();
         let base = state.geometry().unwrap();
         apply_transaction(
             &mut state,
-            &branch_child_transaction(base, 3, "cp-3", "cp-2", 1, second_root, b"ccc"),
+            &branch_child_transaction(
+                base,
+                3,
+                "thread",
+                "cp-3",
+                Some("cp-2"),
+                1,
+                second_root,
+                b"ccc",
+            ),
             b"req-3",
         );
 
@@ -547,7 +592,16 @@ mod tests {
         let genesis_root = state.versions[0].root();
 
         let base = state.geometry().unwrap();
-        let mut second = branch_child_transaction(base, 2, "cp-2", "cp-1", 0, genesis_root, b"bbb");
+        let mut second = branch_child_transaction(
+            base,
+            2,
+            "thread",
+            "cp-2",
+            Some("cp-1"),
+            0,
+            genesis_root,
+            b"bbb",
+        );
         let second_version = u32::try_from(base.version_count).unwrap();
         second.checkpoint.identity_version = 0;
         second.checkpoint.messages_version = Some(second_version);
@@ -557,7 +611,16 @@ mod tests {
 
         let second_root = state.versions[1].root();
         let base = state.geometry().unwrap();
-        let mut third = branch_child_transaction(base, 3, "cp-3", "cp-2", 1, second_root, b"ccc");
+        let mut third = branch_child_transaction(
+            base,
+            3,
+            "thread",
+            "cp-3",
+            Some("cp-2"),
+            1,
+            second_root,
+            b"ccc",
+        );
         let third_version = u32::try_from(base.version_count).unwrap();
         third.checkpoint.identity_version = 0;
         third.checkpoint.result_version = Some(third_version);
