@@ -355,6 +355,85 @@ None. This unit computes physical reachability only; it does not reclaim
 bytes; it does not change logical deletion authority; it does not publish
 Format v2; source IDs remain source IDs; remapping is the next unit.
 
+## Prepared compact replacement
+
+**DECISION**
+
+The accepted reachability plan is converted into a fully prepared dense
+replacement before any mutation exists:
+
+```text
+source state + reachability plan
+              |
+              v
+deterministic old->new version/node/payload mappings
+              |
+              v
+compact payload (dense repack, no gaps)
+compact node table (canonical rebuild, no holes)
+compact version table (sequential IDs, remapped parents/roots)
+checkpoints with remapped physical version IDs
+              |
+              v
+    V2PreparedCompaction
+```
+
+Retained old node/version IDs arrive ascending, so the first retained source
+object becomes compact `0`, the next compact `1`, and so on. Branch children
+are topologically prior, so ascending order also guarantees each child mapping
+already exists when its parent is rebuilt. Retained leaf ranges repack in plan
+order with `new_offset = current compact payload length`; gaps from deleted
+leaves disappear, while any overlap, duplicate, backward move, overflow, or
+out-of-bounds reference fails closed instead of being silently merged.
+
+Every retained object is rebuilt with the canonical constructors, never copied
+and patched: leaves via `V2NodeRecord::leaf(new_offset, bytes)`, branches via
+`V2NodeRecord::branch(new_left_root, new_right_root)`, versions via
+`V2VersionRecord::new(new_id, remapped_parent, remapped_root)`. Each rebuild
+must preserve source height, logical length, and commitment (plus explicit
+`left_len` agreement for branches); each version root must match its source
+root triple, so a root is never trusted merely because its `node_id`
+resolves. Each rebuilt checkpoint recomputes `checkpoint_state_metadata` from
+the remapped compact roots and must reproduce both the source state and the
+source operation digest, proving physical compaction cannot alter logical
+request identity.
+
+Checkpoint order and logical identity are unchanged, so ordinals, active
+request ordinals, retired digests, and tombstones need no replacement and are
+left completely untouched for the later apply step. Preparation takes
+`&V2CommittedState` only and uses checked arithmetic with explicit fallible
+reservation throughout, so failure leaves committed state untouched by
+construction.
+
+**WHY**
+
+Copying reachable bytes without re-deriving them would preserve any latent
+structural corruption (wrong commitments, wrong lengths, root disagreement)
+into the compacted representation. Canonical reconstruction turns preparation
+into the semantic-verification boundary the reachability plan deliberately
+deferred: the compact state is a fresh valid physical representation whose
+logical commitments are exactly identical. Keeping apply/publication in later
+units preserves the prepare-then-apply discipline used by deletion and request
+retirement.
+
+**ALTERNATIVES REJECTED**
+
+- Copy source records and rewrite IDs in place: rejected because patching
+  cannot detect commitment/length/root disagreement.
+- Merge overlapping payload ranges during repack: rejected because merging
+  presumes a policy for malformed arenas; rejection is the fail-closed answer.
+- Remap request ledgers and tombstones into the prepared object: rejected
+  because unchanged checkpoint order leaves their coordinates valid.
+- Mutate committed state during preparation: rejected because `&self`
+  preparation is fail-atomic by construction.
+
+**FORMAT IMPACT**
+
+None. The staged `T2S2`/`T2I2` layout itself is unchanged; this prepares a
+different but semantically equivalent compact physical representation. It does
+not publish Format v2 and does not change logical deletion authority;
+apply/publication remain later units.
+
 ## Current boundary
 
 This layer still does not:

@@ -10,15 +10,30 @@
 //! mutates no committed state, and publishes nothing. Identifier remapping and
 //! actual reclamation are later units. The plan carries source identifiers
 //! only, so a future apply step cannot confuse old and new coordinates.
+//!
+//! The second compaction slice prepares the compact replacement itself:
+//! deterministic dense old-to-new remapping, canonical reconstruction of every
+//! retained leaf/branch/version-record (never byte patching), and checkpoint
+//! tables whose logical state and operation digests are proven identical. The
+//! prepared object still mutates nothing and publishes nothing; applying it is
+//! a later unit.
 
 use super::apply_v2::V2CommittedState;
+use super::commit_v2::{checkpoint_operation_digest, V2CommitError};
+use super::format_v2::{V2FormatError, V2NodeRecord, V2RootRecord};
 use super::image_v2::{v2_node_fields, V2ImageError, V2NodeFields};
+use super::publication_v2::{
+    checkpoint_state_metadata, V2CheckpointRecord, V2PublicationError, V2VersionRecord,
+};
 use std::collections::HashSet;
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum V2CompactionError {
     Image(V2ImageError),
+    Format(V2FormatError),
+    Publication(V2PublicationError),
+    Commit(V2CommitError),
     Invalid(&'static str),
     Overflow(&'static str),
     Capacity(&'static str),
@@ -28,6 +43,9 @@ impl fmt::Display for V2CompactionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Image(error) => write!(formatter, "{error}"),
+            Self::Format(error) => write!(formatter, "{error}"),
+            Self::Publication(error) => write!(formatter, "{error}"),
+            Self::Commit(error) => write!(formatter, "{error}"),
             Self::Invalid(message) | Self::Overflow(message) | Self::Capacity(message) => {
                 formatter.write_str(message)
             }
@@ -40,6 +58,24 @@ impl std::error::Error for V2CompactionError {}
 impl From<V2ImageError> for V2CompactionError {
     fn from(error: V2ImageError) -> Self {
         Self::Image(error)
+    }
+}
+
+impl From<V2FormatError> for V2CompactionError {
+    fn from(error: V2FormatError) -> Self {
+        Self::Format(error)
+    }
+}
+
+impl From<V2PublicationError> for V2CompactionError {
+    fn from(error: V2PublicationError) -> Self {
+        Self::Publication(error)
+    }
+}
+
+impl From<V2CommitError> for V2CompactionError {
+    fn from(error: V2CommitError) -> Self {
+        Self::Commit(error)
     }
 }
 
@@ -300,11 +336,576 @@ fn claim_node(retained: &mut HashSet<u64>, worklist: &mut Vec<u64>, node_id: u64
     }
 }
 
+/// One deterministic old-to-new version identifier mapping entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct V2VersionIdMapping {
+    old_version: u32,
+    new_version: u32,
+}
+
+impl V2VersionIdMapping {
+    pub(super) const fn old_version(self) -> u32 {
+        self.old_version
+    }
+
+    pub(super) const fn new_version(self) -> u32 {
+        self.new_version
+    }
+}
+
+/// One deterministic old-to-new node identifier mapping entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct V2NodeIdMapping {
+    old_node: u64,
+    new_node: u64,
+}
+
+impl V2NodeIdMapping {
+    pub(super) const fn old_node(self) -> u64 {
+        self.old_node
+    }
+
+    pub(super) const fn new_node(self) -> u64 {
+        self.new_node
+    }
+}
+
+/// One deterministic source-range to compact-offset mapping entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct V2PayloadRangeMapping {
+    old_offset: u64,
+    length: u64,
+    new_offset: u64,
+}
+
+impl V2PayloadRangeMapping {
+    pub(super) const fn old_offset(self) -> u64 {
+        self.old_offset
+    }
+
+    pub(super) const fn length(self) -> u64 {
+        self.length
+    }
+
+    pub(super) const fn new_offset(self) -> u64 {
+        self.new_offset
+    }
+}
+
+/// Fully prepared compact physical replacement for the committed state.
+///
+/// The object owns the dense compact payload, node table, version table, and
+/// checkpoint table with remapped physical version references, plus the
+/// deterministic mappings that produced them. Checkpoint order, logical
+/// identity, state commitments, and operation digests are identical to the
+/// source; only physical coordinates change. Semantic ledgers (ordinals,
+/// active/retired requests, tombstones) are intentionally absent: checkpoint
+/// order is unchanged, so they need no physical replacement and stay with the
+/// committed state until a later apply unit consumes this preparation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct V2PreparedCompaction {
+    payload: Vec<u8>,
+    nodes: Vec<V2NodeRecord>,
+    versions: Vec<V2VersionRecord>,
+    checkpoints: Vec<V2CheckpointRecord>,
+    version_mapping: Vec<V2VersionIdMapping>,
+    node_mapping: Vec<V2NodeIdMapping>,
+    payload_mapping: Vec<V2PayloadRangeMapping>,
+}
+
+impl V2PreparedCompaction {
+    pub(super) fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    pub(super) fn nodes(&self) -> &[V2NodeRecord] {
+        &self.nodes
+    }
+
+    pub(super) fn versions(&self) -> &[V2VersionRecord] {
+        &self.versions
+    }
+
+    pub(super) fn checkpoints(&self) -> &[V2CheckpointRecord] {
+        &self.checkpoints
+    }
+
+    pub(super) fn version_mapping(&self) -> &[V2VersionIdMapping] {
+        &self.version_mapping
+    }
+
+    pub(super) fn node_mapping(&self) -> &[V2NodeIdMapping] {
+        &self.node_mapping
+    }
+
+    pub(super) fn payload_mapping(&self) -> &[V2PayloadRangeMapping] {
+        &self.payload_mapping
+    }
+}
+
+/// Prepares the dense compact replacement for `state` without mutating it.
+///
+/// Preparation takes `&V2CommittedState` only: every fallible validation,
+/// allocation, canonical reconstruction, and digest comparison completes
+/// before any future mutation point could exist, so failure leaves committed
+/// state untouched by construction.
+pub(super) fn prepare_v2_compaction(
+    state: &V2CommittedState,
+) -> Result<V2PreparedCompaction, V2CompactionError> {
+    let plan = plan_v2_compaction(state)?;
+    let (payload, payload_mapping) = repack_compact_payload(state, &plan)?;
+    let (nodes, node_mapping) = rebuild_compact_nodes(state, &plan, &payload, &payload_mapping)?;
+    let (versions, version_mapping) =
+        rebuild_compact_versions(state, &plan, &nodes, &node_mapping)?;
+    let checkpoints = rebuild_compact_checkpoints(state, &versions, &version_mapping)?;
+    Ok(V2PreparedCompaction {
+        payload,
+        nodes,
+        versions,
+        checkpoints,
+        version_mapping,
+        node_mapping,
+        payload_mapping,
+    })
+}
+
+/// Validates retained source ranges and repacks their exact bytes densely.
+///
+/// Ranges arrive ordered by `(offset, length)`. Gaps (deleted leaves) are
+/// valid and simply disappear; any overlap, duplicate, backward move, overflow,
+/// or out-of-bounds reference fails closed instead of being silently merged.
+fn repack_compact_payload(
+    state: &V2CommittedState,
+    plan: &V2CompactionPlan,
+) -> Result<(Vec<u8>, Vec<V2PayloadRangeMapping>), V2CompactionError> {
+    let ranges = plan.retained_payload_ranges();
+    let mut total = 0u64;
+    for range in ranges {
+        total = total
+            .checked_add(range.length())
+            .ok_or(V2CompactionError::Overflow(
+                "v2 compaction compact payload length exceeds u64",
+            ))?;
+    }
+    let total_usize = usize::try_from(total).map_err(|_| {
+        V2CompactionError::Overflow("v2 compaction compact payload length exceeds usize")
+    })?;
+    let mut payload: Vec<u8> = Vec::new();
+    payload.try_reserve_exact(total_usize).map_err(|_| {
+        V2CompactionError::Capacity("v2 compaction compact payload allocation failed")
+    })?;
+    let mut mapping: Vec<V2PayloadRangeMapping> = Vec::new();
+    mapping.try_reserve_exact(ranges.len()).map_err(|_| {
+        V2CompactionError::Capacity("v2 compaction payload mapping allocation failed")
+    })?;
+    let mut previous_end = 0u64;
+    for range in ranges {
+        if range.offset() < previous_end {
+            return Err(V2CompactionError::Invalid(
+                "v2 compaction retained payload ranges overlap or duplicate",
+            ));
+        }
+        let end = range
+            .offset()
+            .checked_add(range.length())
+            .ok_or(V2CompactionError::Overflow(
+                "v2 compaction retained payload range exceeds u64",
+            ))?;
+        let start_usize = usize::try_from(range.offset()).map_err(|_| {
+            V2CompactionError::Overflow("v2 compaction retained payload offset exceeds usize")
+        })?;
+        let end_usize = usize::try_from(end).map_err(|_| {
+            V2CompactionError::Overflow("v2 compaction retained payload end exceeds usize")
+        })?;
+        let bytes = state
+            .payload
+            .get(start_usize..end_usize)
+            .ok_or(V2CompactionError::Invalid(
+                "v2 compaction retained payload range is outside the source payload",
+            ))?;
+        let new_offset = u64::try_from(payload.len()).map_err(|_| {
+            V2CompactionError::Overflow("v2 compaction compact payload offset exceeds u64")
+        })?;
+        payload.extend_from_slice(bytes);
+        mapping.push(V2PayloadRangeMapping {
+            old_offset: range.offset(),
+            length: range.length(),
+            new_offset,
+        });
+        previous_end = end;
+    }
+    Ok((payload, mapping))
+}
+
+/// Rebuilds every retained node canonically in ascending old-ID order.
+///
+/// Ascending order guarantees each retained branch child is already remapped
+/// (valid children are topologically prior). Leaves and branches are
+/// re-derived with the canonical constructors from compact coordinates and
+/// required to preserve source height, logical length, and commitment; branch
+/// `left_len` semantics are checked explicitly as well. Nothing is copied and
+/// patched.
+fn rebuild_compact_nodes(
+    state: &V2CommittedState,
+    plan: &V2CompactionPlan,
+    compact_payload: &[u8],
+    payload_mapping: &[V2PayloadRangeMapping],
+) -> Result<(Vec<V2NodeRecord>, Vec<V2NodeIdMapping>), V2CompactionError> {
+    let retained = plan.retained_nodes();
+    let mut nodes: Vec<V2NodeRecord> = Vec::new();
+    nodes.try_reserve_exact(retained.len()).map_err(|_| {
+        V2CompactionError::Capacity("v2 compaction compact node table allocation failed")
+    })?;
+    let mut mapping: Vec<V2NodeIdMapping> = Vec::new();
+    mapping
+        .try_reserve_exact(retained.len())
+        .map_err(|_| V2CompactionError::Capacity("v2 compaction node mapping allocation failed"))?;
+    for old_id in retained.iter().copied() {
+        let old_index = usize::try_from(old_id).map_err(|_| {
+            V2CompactionError::Overflow("v2 compaction source node identifier exceeds usize")
+        })?;
+        let old = state
+            .nodes
+            .get(old_index)
+            .copied()
+            .ok_or(V2CompactionError::Invalid(
+                "v2 compaction planned node is absent from the source table",
+            ))?;
+        let rebuilt = match v2_node_fields(old)? {
+            V2NodeFields::Leaf {
+                payload_offset,
+                payload_len,
+            } => {
+                let new_offset =
+                    remapped_payload_offset(payload_mapping, payload_offset, payload_len)?;
+                let start = usize::try_from(new_offset).map_err(|_| {
+                    V2CompactionError::Overflow(
+                        "v2 compaction compact payload offset exceeds usize",
+                    )
+                })?;
+                let len = usize::try_from(payload_len).map_err(|_| {
+                    V2CompactionError::Overflow(
+                        "v2 compaction compact payload length exceeds usize",
+                    )
+                })?;
+                let end = start.checked_add(len).ok_or(V2CompactionError::Overflow(
+                    "v2 compaction compact payload range exceeds usize",
+                ))?;
+                // Bounds were proven while repacking; this re-slices the exact
+                // compact bytes the rebuilt leaf commits to.
+                let bytes = compact_payload
+                    .get(start..end)
+                    .ok_or(V2CompactionError::Invalid(
+                        "v2 compaction compact payload range is outside the compact payload",
+                    ))?;
+                let rebuilt = V2NodeRecord::leaf(new_offset, bytes)?;
+                if rebuilt.height() != old.height() {
+                    return Err(V2CompactionError::Invalid(
+                        "v2 compaction rebuilt leaf height disagrees with source",
+                    ));
+                }
+                if rebuilt.logical_len() != old.logical_len() {
+                    return Err(V2CompactionError::Invalid(
+                        "v2 compaction rebuilt leaf logical length disagrees with source",
+                    ));
+                }
+                if rebuilt.commitment() != old.commitment() {
+                    return Err(V2CompactionError::Invalid(
+                        "v2 compaction rebuilt leaf commitment disagrees with source",
+                    ));
+                }
+                rebuilt
+            }
+            V2NodeFields::Branch {
+                left_node_id,
+                right_node_id,
+                left_len,
+            } => {
+                let new_left = remapped_node_id(&mapping, left_node_id)?;
+                let new_right = remapped_node_id(&mapping, right_node_id)?;
+                let left_index = usize::try_from(new_left).map_err(|_| {
+                    V2CompactionError::Overflow(
+                        "v2 compaction compact node identifier exceeds usize",
+                    )
+                })?;
+                let right_index = usize::try_from(new_right).map_err(|_| {
+                    V2CompactionError::Overflow(
+                        "v2 compaction compact node identifier exceeds usize",
+                    )
+                })?;
+                let left_root = V2RootRecord::from_node(
+                    new_left,
+                    nodes
+                        .get(left_index)
+                        .copied()
+                        .ok_or(V2CompactionError::Invalid(
+                            "v2 compaction remapped left child is absent",
+                        ))?,
+                )?;
+                let right_root = V2RootRecord::from_node(
+                    new_right,
+                    nodes
+                        .get(right_index)
+                        .copied()
+                        .ok_or(V2CompactionError::Invalid(
+                            "v2 compaction remapped right child is absent",
+                        ))?,
+                )?;
+                let rebuilt = V2NodeRecord::branch(left_root, right_root)?;
+                if rebuilt.height() != old.height() {
+                    return Err(V2CompactionError::Invalid(
+                        "v2 compaction rebuilt branch height disagrees with source",
+                    ));
+                }
+                if rebuilt.logical_len() != old.logical_len() {
+                    return Err(V2CompactionError::Invalid(
+                        "v2 compaction rebuilt branch logical length disagrees with source",
+                    ));
+                }
+                if rebuilt.commitment() != old.commitment() {
+                    return Err(V2CompactionError::Invalid(
+                        "v2 compaction rebuilt branch commitment disagrees with source",
+                    ));
+                }
+                match v2_node_fields(rebuilt)? {
+                    V2NodeFields::Branch {
+                        left_len: rebuilt_left_len,
+                        ..
+                    } => {
+                        if rebuilt_left_len != left_len {
+                            return Err(V2CompactionError::Invalid(
+                                "v2 compaction rebuilt branch left length disagrees with source",
+                            ));
+                        }
+                    }
+                    V2NodeFields::Leaf { .. } => {
+                        return Err(V2CompactionError::Invalid(
+                            "v2 compaction rebuilt branch decoded as a leaf",
+                        ));
+                    }
+                }
+                rebuilt
+            }
+        };
+        let new_id = u64::try_from(nodes.len()).map_err(|_| {
+            V2CompactionError::Overflow("v2 compaction compact node identifier exceeds u64")
+        })?;
+        nodes.push(rebuilt);
+        mapping.push(V2NodeIdMapping {
+            old_node: old_id,
+            new_node: new_id,
+        });
+    }
+    Ok((nodes, mapping))
+}
+
+/// Rebuilds every retained version with dense sequential IDs.
+///
+/// Retained versions arrive ascending, and every retained parent is
+/// topologically prior, so each parent mapping already exists. Roots are
+/// re-derived canonically from the rebuilt compact nodes and required to match
+/// the source root height, logical length, and commitment: a source root is
+/// never trusted merely because its `node_id` resolves.
+fn rebuild_compact_versions(
+    state: &V2CommittedState,
+    plan: &V2CompactionPlan,
+    compact_nodes: &[V2NodeRecord],
+    node_mapping: &[V2NodeIdMapping],
+) -> Result<(Vec<V2VersionRecord>, Vec<V2VersionIdMapping>), V2CompactionError> {
+    let retained = plan.retained_versions();
+    let mut versions: Vec<V2VersionRecord> = Vec::new();
+    versions.try_reserve_exact(retained.len()).map_err(|_| {
+        V2CompactionError::Capacity("v2 compaction compact version table allocation failed")
+    })?;
+    let mut mapping: Vec<V2VersionIdMapping> = Vec::new();
+    mapping.try_reserve_exact(retained.len()).map_err(|_| {
+        V2CompactionError::Capacity("v2 compaction version mapping allocation failed")
+    })?;
+    for old_id in retained.iter().copied() {
+        let old_index = usize::try_from(old_id).map_err(|_| {
+            V2CompactionError::Overflow("v2 compaction source version identifier exceeds usize")
+        })?;
+        let old = state
+            .versions
+            .get(old_index)
+            .copied()
+            .ok_or(V2CompactionError::Invalid(
+                "v2 compaction planned version is absent from the source table",
+            ))?;
+        if old.version_id() != old_id {
+            return Err(V2CompactionError::Invalid(
+                "v2 compaction source version id disagrees with its vector coordinate",
+            ));
+        }
+        let new_parent = match old.parent_version() {
+            None => None,
+            Some(parent) => Some(remapped_version_id(&mapping, parent)?),
+        };
+        let new_root_node = remapped_node_id(node_mapping, old.root().node_id())?;
+        let new_root_index = usize::try_from(new_root_node).map_err(|_| {
+            V2CompactionError::Overflow("v2 compaction compact root node identifier exceeds usize")
+        })?;
+        let new_root = V2RootRecord::from_node(
+            new_root_node,
+            compact_nodes
+                .get(new_root_index)
+                .copied()
+                .ok_or(V2CompactionError::Invalid(
+                    "v2 compaction remapped version root is absent",
+                ))?,
+        )?;
+        let source_root = old.root();
+        if new_root.logical_len() != source_root.logical_len()
+            || new_root.height() != source_root.height()
+            || new_root.commitment() != source_root.commitment()
+        {
+            return Err(V2CompactionError::Invalid(
+                "v2 compaction rebuilt version root disagrees with source",
+            ));
+        }
+        let new_id = u32::try_from(versions.len()).map_err(|_| {
+            V2CompactionError::Overflow("v2 compaction compact version identifier exceeds u32")
+        })?;
+        versions.push(V2VersionRecord::new(new_id, new_parent, new_root)?);
+        mapping.push(V2VersionIdMapping {
+            old_version: old_id,
+            new_version: new_id,
+        });
+    }
+    Ok((versions, mapping))
+}
+
+/// Rebuilds the checkpoint table with remapped physical version references.
+///
+/// Logical identity, order, and state commitments are preserved exactly; only
+/// `identity/messages/result_version` coordinates change. Each rebuilt
+/// checkpoint must reproduce the source state commitment and the source
+/// operation digest, proving physical compaction cannot alter logical request
+/// identity. String materialization stays in this fallible preparation phase.
+fn rebuild_compact_checkpoints(
+    state: &V2CommittedState,
+    compact_versions: &[V2VersionRecord],
+    version_mapping: &[V2VersionIdMapping],
+) -> Result<Vec<V2CheckpointRecord>, V2CompactionError> {
+    let mut checkpoints: Vec<V2CheckpointRecord> = Vec::new();
+    checkpoints
+        .try_reserve_exact(state.checkpoints.len())
+        .map_err(|_| {
+            V2CompactionError::Capacity("v2 compaction compact checkpoint table allocation failed")
+        })?;
+    for old in &state.checkpoints {
+        let new_identity = remapped_version_id(version_mapping, old.identity_version)?;
+        let new_messages = match old.messages_version {
+            None => None,
+            Some(version) => Some(remapped_version_id(version_mapping, version)?),
+        };
+        let new_result = match old.result_version {
+            None => None,
+            Some(version) => Some(remapped_version_id(version_mapping, version)?),
+        };
+        let identity_root = compact_version_root(compact_versions, new_identity)?;
+        let messages_root = match new_messages {
+            None => None,
+            Some(version) => Some(compact_version_root(compact_versions, version)?),
+        };
+        let result_root = match new_result {
+            None => None,
+            Some(version) => Some(compact_version_root(compact_versions, version)?),
+        };
+        let recomputed = checkpoint_state_metadata(identity_root, messages_root, result_root)?;
+        if recomputed != old.state {
+            return Err(V2CompactionError::Invalid(
+                "v2 compaction rebuilt checkpoint state disagrees with source",
+            ));
+        }
+        let rebuilt = V2CheckpointRecord {
+            checkpoint_no: old.checkpoint_no,
+            thread_id: try_clone_compaction_string(&old.thread_id)?,
+            checkpoint_id: try_clone_compaction_string(&old.checkpoint_id)?,
+            parent_checkpoint_id: old
+                .parent_checkpoint_id
+                .as_deref()
+                .map(try_clone_compaction_string)
+                .transpose()?,
+            identity_version: new_identity,
+            messages_version: new_messages,
+            result_version: new_result,
+            state: old.state,
+        };
+        if checkpoint_operation_digest(&rebuilt)? != checkpoint_operation_digest(old)? {
+            return Err(V2CompactionError::Invalid(
+                "v2 compaction rebuilt checkpoint operation digest disagrees with source",
+            ));
+        }
+        checkpoints.push(rebuilt);
+    }
+    Ok(checkpoints)
+}
+
+fn compact_version_root(
+    compact_versions: &[V2VersionRecord],
+    version_id: u32,
+) -> Result<V2RootRecord, V2CompactionError> {
+    let index = usize::try_from(version_id).map_err(|_| {
+        V2CompactionError::Overflow("v2 compaction compact version identifier exceeds usize")
+    })?;
+    compact_versions
+        .get(index)
+        .map(|version| version.root())
+        .ok_or(V2CompactionError::Invalid(
+            "v2 compaction compact version is absent",
+        ))
+}
+
+fn remapped_version_id(
+    mapping: &[V2VersionIdMapping],
+    old_version: u32,
+) -> Result<u32, V2CompactionError> {
+    mapping
+        .binary_search_by(|entry| entry.old_version.cmp(&old_version))
+        .map(|index| mapping[index].new_version)
+        .map_err(|_| {
+            V2CompactionError::Invalid("v2 compaction version reference has no compact mapping")
+        })
+}
+
+fn remapped_node_id(mapping: &[V2NodeIdMapping], old_node: u64) -> Result<u64, V2CompactionError> {
+    mapping
+        .binary_search_by(|entry| entry.old_node.cmp(&old_node))
+        .map(|index| mapping[index].new_node)
+        .map_err(|_| {
+            V2CompactionError::Invalid("v2 compaction node reference has no compact mapping")
+        })
+}
+
+fn remapped_payload_offset(
+    mapping: &[V2PayloadRangeMapping],
+    old_offset: u64,
+    length: u64,
+) -> Result<u64, V2CompactionError> {
+    mapping
+        .binary_search_by(|entry| (entry.old_offset, entry.length).cmp(&(old_offset, length)))
+        .map(|index| mapping[index].new_offset)
+        .map_err(|_| {
+            V2CompactionError::Invalid("v2 compaction payload range has no compact mapping")
+        })
+}
+
+fn try_clone_compaction_string(value: &str) -> Result<String, V2CompactionError> {
+    let mut cloned = String::new();
+    cloned.try_reserve_exact(value.len()).map_err(|_| {
+        V2CompactionError::Capacity("v2 compaction checkpoint identity allocation failed")
+    })?;
+    cloned.push_str(value);
+    Ok(cloned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::apply_v2::{apply_v2_commit, V2CommittedState};
-    use super::super::commit_v2::encode_v2_commit;
-    use super::super::format_v2::{V2NodeRecord, V2RootRecord};
+    use super::super::commit_v2::{checkpoint_operation_digest, encode_v2_commit};
+    use super::super::format_v2::{decode_v2_node, encode_v2_node, V2NodeRecord, V2RootRecord};
+    use super::super::image_v2::{v2_node_fields, V2NodeFields};
     use super::super::publication_v2::{
         checkpoint_state_metadata, V2CheckpointRecord, V2VersionRecord,
     };
@@ -382,16 +983,11 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn deleted_subtree_history_is_unreachable_but_retained_roots_survive() {
-        // Physical topology under test:
-        //   A(cp-1, v0/n0)
-        //   ├── B(cp-2, v1/n1-n2 derived from A)
-        //   │   └── C(cp-3, v2/n3-n4 derived from B)
-        //   └── D(cp-sibling, v3/n5-n6 derived from A, distinct root)
-        //   other-thread E(other-root, v4/n7-n8 derived from A, distinct root)
-        // Deleting B must drop only the B/C-exclusive versions, nodes, and
-        // payload ranges while keeping the distinct D and E histories.
+    /// Builds the shared A/B/C/D/E sparse-history fixture:
+    /// A(cp-1, v0/n0) -> B(cp-2, v1/n1-n2) -> C(cp-3, v2/n3-n4);
+    /// A -> D(cp-sibling, v3/n5-n6, distinct root);
+    /// other-thread E(other-root, v4/n7-n8, distinct root derived from A).
+    fn build_abcde_state() -> V2CommittedState {
         let mut state = V2CommittedState::default();
         apply_transaction(&mut state, &genesis_transaction("cp-1", b"aaa"), b"req-1");
         let genesis_root = state.versions[0].root();
@@ -456,6 +1052,28 @@ mod tests {
             ),
             b"req-5",
         );
+        state
+    }
+
+    fn delete_bc_subtree(state: &mut V2CommittedState) {
+        let prepared = state
+            .prepare_delete_checkpoint_subtree("thread", "cp-2")
+            .unwrap();
+        assert_eq!(prepared.deleted_checkpoint_count(), 2);
+        state.apply_prepared_delete_checkpoint_subtree(prepared);
+    }
+
+    #[test]
+    fn deleted_subtree_history_is_unreachable_but_retained_roots_survive() {
+        // Physical topology under test is built by `build_abcde_state`:
+        //   A(cp-1, v0/n0)
+        //   ├── B(cp-2, v1/n1-n2 derived from A)
+        //   │   └── C(cp-3, v2/n3-n4 derived from B)
+        //   └── D(cp-sibling, v3/n5-n6 derived from A, distinct root)
+        //   other-thread E(other-root, v4/n7-n8 derived from A, distinct root)
+        // Deleting B must drop only the B/C-exclusive versions, nodes, and
+        // payload ranges while keeping the distinct D and E histories.
+        let mut state = build_abcde_state();
 
         let before = plan_v2_compaction(&state).unwrap();
         assert_eq!(before.retained_versions(), &[0, 1, 2, 3, 4]);
@@ -465,11 +1083,7 @@ mod tests {
             vec![(0, 3), (3, 3), (6, 3), (9, 3), (12, 3)]
         );
 
-        let prepared = state
-            .prepare_delete_checkpoint_subtree("thread", "cp-2")
-            .unwrap();
-        assert_eq!(prepared.deleted_checkpoint_count(), 2);
-        state.apply_prepared_delete_checkpoint_subtree(prepared);
+        delete_bc_subtree(&mut state);
 
         let after = plan_v2_compaction(&state).unwrap();
         assert_eq!(after.retained_versions(), &[0, 3, 4]);
@@ -790,5 +1404,408 @@ mod tests {
             .deleted_checkpoints
             .contains(&("thread".to_owned(), "cp-1".to_owned())));
         assert!(state.retired_requests.contains_key(b"req-1".as_slice()));
+    }
+
+    #[test]
+    fn sparse_source_compaction_produces_exact_dense_remapping() {
+        let mut state = build_abcde_state();
+        delete_bc_subtree(&mut state);
+        let before_geometry = state.geometry().unwrap();
+
+        let prepared = prepare_v2_compaction(&state).unwrap();
+        assert_eq!(state.geometry().unwrap(), before_geometry);
+
+        assert_eq!(
+            prepared
+                .version_mapping()
+                .iter()
+                .map(|entry| (entry.old_version(), entry.new_version()))
+                .collect::<Vec<_>>(),
+            vec![(0, 0), (3, 1), (4, 2)]
+        );
+        assert_eq!(
+            prepared
+                .node_mapping()
+                .iter()
+                .map(|entry| (entry.old_node(), entry.new_node()))
+                .collect::<Vec<_>>(),
+            vec![(0, 0), (5, 1), (6, 2), (7, 3), (8, 4)]
+        );
+        assert_eq!(
+            prepared
+                .payload_mapping()
+                .iter()
+                .map(|entry| (entry.old_offset(), entry.length(), entry.new_offset()))
+                .collect::<Vec<_>>(),
+            vec![(0, 3, 0), (9, 3, 3), (12, 3, 6)]
+        );
+
+        assert_eq!(prepared.payload().to_vec(), b"aaadddeee".to_vec());
+        assert_eq!(prepared.nodes().len(), 5);
+        assert_eq!(prepared.versions().len(), 3);
+        assert_eq!(prepared.checkpoints().len(), 3);
+        let checkpoint_ids: Vec<&str> = prepared
+            .checkpoints()
+            .iter()
+            .map(|checkpoint| checkpoint.checkpoint_id.as_str())
+            .collect();
+        assert_eq!(checkpoint_ids, vec!["cp-1", "cp-sibling", "other-root"]);
+        let checkpoint_nos: Vec<u32> = prepared
+            .checkpoints()
+            .iter()
+            .map(|checkpoint| checkpoint.checkpoint_no)
+            .collect();
+        assert_eq!(checkpoint_nos, vec![1, 4, 5]);
+        assert_eq!(prepared.checkpoints()[0].identity_version, 0);
+        assert_eq!(prepared.checkpoints()[1].identity_version, 1);
+        assert_eq!(prepared.checkpoints()[2].identity_version, 2);
+        for (old, new) in state.checkpoints.iter().zip(prepared.checkpoints().iter()) {
+            assert_eq!(new.thread_id, old.thread_id);
+            assert_eq!(new.checkpoint_id, old.checkpoint_id);
+            assert_eq!(new.parent_checkpoint_id, old.parent_checkpoint_id);
+            assert_eq!(new.checkpoint_no, old.checkpoint_no);
+            assert_eq!(new.state, old.state);
+            assert_eq!(
+                checkpoint_operation_digest(new).unwrap(),
+                checkpoint_operation_digest(old).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_source_nodes_map_to_single_compact_nodes() {
+        let mut state = V2CommittedState::default();
+        apply_transaction(&mut state, &genesis_transaction("cp-1", b"aaa"), b"req-1");
+        let genesis_root = state.versions[0].root();
+        let base = state.geometry().unwrap();
+        apply_transaction(
+            &mut state,
+            &branch_child_transaction(
+                base,
+                2,
+                "thread",
+                "cp-2",
+                Some("cp-1"),
+                0,
+                genesis_root,
+                b"bbb",
+            ),
+            b"req-2",
+        );
+        let base = state.geometry().unwrap();
+        apply_transaction(
+            &mut state,
+            &branch_child_transaction(
+                base,
+                3,
+                "thread",
+                "cp-3",
+                Some("cp-1"),
+                0,
+                genesis_root,
+                b"ccc",
+            ),
+            b"req-3",
+        );
+
+        let prepared = prepare_v2_compaction(&state).unwrap();
+        assert_eq!(prepared.nodes().len(), 5);
+        let shared: Vec<u64> = prepared
+            .node_mapping()
+            .iter()
+            .filter(|entry| entry.old_node() == 0)
+            .map(|entry| entry.new_node())
+            .collect();
+        assert_eq!(shared, vec![0]);
+        for compact in [prepared.nodes()[2], prepared.nodes()[4]] {
+            assert!(
+                matches!(
+                    v2_node_fields(compact).unwrap(),
+                    V2NodeFields::Branch {
+                        left_node_id: 0,
+                        ..
+                    }
+                ),
+                "compact branch must reference compact node 0"
+            );
+        }
+        assert!(matches!(
+            v2_node_fields(prepared.nodes()[2]).unwrap(),
+            V2NodeFields::Branch {
+                left_node_id: 0,
+                right_node_id: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            v2_node_fields(prepared.nodes()[4]).unwrap(),
+            V2NodeFields::Branch {
+                left_node_id: 0,
+                right_node_id: 3,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn retained_version_parents_remap_across_identifier_holes() {
+        let mut state = build_abcde_state();
+        delete_bc_subtree(&mut state);
+
+        let prepared = prepare_v2_compaction(&state).unwrap();
+        let versions = prepared.versions();
+        assert_eq!(versions.len(), 3);
+        assert_eq!(versions[0].version_id(), 0);
+        assert_eq!(versions[0].parent_version(), None);
+        assert_eq!(versions[0].root().node_id(), 0);
+        assert_eq!(versions[1].version_id(), 1);
+        assert_eq!(versions[1].parent_version(), Some(0));
+        assert_eq!(versions[1].root().node_id(), 2);
+        assert_eq!(versions[2].version_id(), 2);
+        assert_eq!(versions[2].parent_version(), Some(0));
+        assert_eq!(versions[2].root().node_id(), 4);
+    }
+
+    #[test]
+    fn version_root_metadata_mismatch_fails_closed() {
+        // The forged root resolves to existing node 0 but carries another
+        // leaf's commitment. Reachability accepts node existence; preparation
+        // must compare root metadata and fail.
+        let mut state = V2CommittedState::default();
+        apply_transaction(&mut state, &genesis_transaction("cp-1", b"aaa"), b"req-1");
+        let other = V2NodeRecord::leaf(0, b"xyz").unwrap();
+        let forged_root = V2RootRecord::from_node(0, other).unwrap();
+        state.versions = vec![V2VersionRecord::new(0, None, forged_root).unwrap()];
+
+        let plan = plan_v2_compaction(&state).unwrap();
+        assert_eq!(plan.retained_versions(), &[0]);
+        assert_eq!(
+            prepare_v2_compaction(&state),
+            Err(V2CompactionError::Invalid(
+                "v2 compaction rebuilt version root disagrees with source"
+            ))
+        );
+        assert_eq!(state.versions[0].root(), forged_root);
+    }
+
+    fn retained_branch_mutation_fixture() -> V2CommittedState {
+        let payload = b"aaa";
+        let leaf = V2NodeRecord::leaf(0, payload).unwrap();
+        let leaf_root = V2RootRecord::from_node(0, leaf).unwrap();
+        let branch = V2NodeRecord::branch(leaf_root, leaf_root).unwrap();
+        let branch_root = V2RootRecord::from_node(1, branch).unwrap();
+        let mut state = V2CommittedState::default();
+        state.payload = payload.to_vec();
+        state.nodes = vec![leaf, branch];
+        state.versions = vec![V2VersionRecord::new(0, None, branch_root).unwrap()];
+        state.checkpoints = vec![V2CheckpointRecord {
+            checkpoint_no: 1,
+            thread_id: "thread".to_owned(),
+            checkpoint_id: "cp-1".to_owned(),
+            parent_checkpoint_id: None,
+            identity_version: 0,
+            messages_version: None,
+            result_version: None,
+            state: checkpoint_state_metadata(branch_root, None, None).unwrap(),
+        }];
+        state
+    }
+
+    fn with_corrupt_branch(
+        mut state: V2CommittedState,
+        corrupt: impl FnOnce(&mut [u8]),
+    ) -> V2CommittedState {
+        let mut encoded = encode_v2_node(state.nodes[1]);
+        corrupt(&mut encoded);
+        state.nodes[1] = decode_v2_node(&encoded).unwrap();
+        state
+    }
+
+    #[test]
+    fn retained_branch_semantic_mismatch_fails_closed() {
+        assert!(prepare_v2_compaction(&retained_branch_mutation_fixture()).is_ok());
+
+        let commitment = with_corrupt_branch(retained_branch_mutation_fixture(), |bytes| {
+            bytes[40] ^= 1;
+        });
+        assert!(plan_v2_compaction(&commitment).is_ok());
+        assert_eq!(
+            prepare_v2_compaction(&commitment),
+            Err(V2CompactionError::Invalid(
+                "v2 compaction rebuilt branch commitment disagrees with source"
+            ))
+        );
+
+        let height = with_corrupt_branch(retained_branch_mutation_fixture(), |bytes| {
+            bytes[6..8].copy_from_slice(&5u16.to_le_bytes());
+        });
+        assert!(plan_v2_compaction(&height).is_ok());
+        assert_eq!(
+            prepare_v2_compaction(&height),
+            Err(V2CompactionError::Invalid(
+                "v2 compaction rebuilt branch height disagrees with source"
+            ))
+        );
+
+        let logical_len = with_corrupt_branch(retained_branch_mutation_fixture(), |bytes| {
+            bytes[8..16].copy_from_slice(&99u64.to_le_bytes());
+        });
+        assert!(plan_v2_compaction(&logical_len).is_ok());
+        assert_eq!(
+            prepare_v2_compaction(&logical_len),
+            Err(V2CompactionError::Invalid(
+                "v2 compaction rebuilt branch logical length disagrees with source"
+            ))
+        );
+
+        // Mutating only the left-length field keeps the stored commitment
+        // identical to the canonical rebuild, so the explicit left-length
+        // comparison is the load-bearing check here.
+        let left_len = with_corrupt_branch(retained_branch_mutation_fixture(), |bytes| {
+            bytes[32..40].copy_from_slice(&1u64.to_le_bytes());
+        });
+        assert!(plan_v2_compaction(&left_len).is_ok());
+        assert_eq!(
+            prepare_v2_compaction(&left_len),
+            Err(V2CompactionError::Invalid(
+                "v2 compaction rebuilt branch left length disagrees with source"
+            ))
+        );
+    }
+
+    fn overlapping_range_state() -> V2CommittedState {
+        let payload = b"aaabbb";
+        let first = V2NodeRecord::leaf(0, payload).unwrap();
+        let second = V2NodeRecord::leaf(2, b"bb").unwrap();
+        let first_root = V2RootRecord::from_node(0, first).unwrap();
+        let second_root = V2RootRecord::from_node(1, second).unwrap();
+        let mut state = V2CommittedState::default();
+        state.payload = payload.to_vec();
+        state.nodes = vec![first, second];
+        state.versions = vec![
+            V2VersionRecord::new(0, None, first_root).unwrap(),
+            V2VersionRecord::new(1, Some(0), second_root).unwrap(),
+        ];
+        state.checkpoints = vec![
+            V2CheckpointRecord {
+                checkpoint_no: 1,
+                thread_id: "thread".to_owned(),
+                checkpoint_id: "cp-1".to_owned(),
+                parent_checkpoint_id: None,
+                identity_version: 0,
+                messages_version: None,
+                result_version: None,
+                state: checkpoint_state_metadata(first_root, None, None).unwrap(),
+            },
+            V2CheckpointRecord {
+                checkpoint_no: 2,
+                thread_id: "thread".to_owned(),
+                checkpoint_id: "cp-2".to_owned(),
+                parent_checkpoint_id: Some("cp-1".to_owned()),
+                identity_version: 1,
+                messages_version: None,
+                result_version: None,
+                state: checkpoint_state_metadata(second_root, None, None).unwrap(),
+            },
+        ];
+        state
+    }
+
+    #[test]
+    fn overlapping_retained_payload_ranges_fail_closed() {
+        // Each range is individually in-bounds, so reachability retains both
+        // leaves; preparation must reject the overlap instead of merging it.
+        let overlapping = overlapping_range_state();
+        assert!(plan_v2_compaction(&overlapping).is_ok());
+        assert_eq!(
+            prepare_v2_compaction(&overlapping),
+            Err(V2CompactionError::Invalid(
+                "v2 compaction retained payload ranges overlap or duplicate"
+            ))
+        );
+
+        let payload = b"aaa";
+        let leaf = V2NodeRecord::leaf(0, payload).unwrap();
+        let first_root = V2RootRecord::from_node(0, leaf).unwrap();
+        let second_root = V2RootRecord::from_node(1, leaf).unwrap();
+        let mut duplicate = V2CommittedState::default();
+        duplicate.payload = payload.to_vec();
+        duplicate.nodes = vec![leaf, leaf];
+        duplicate.versions = vec![
+            V2VersionRecord::new(0, None, first_root).unwrap(),
+            V2VersionRecord::new(1, Some(0), second_root).unwrap(),
+        ];
+        duplicate.checkpoints = vec![V2CheckpointRecord {
+            checkpoint_no: 1,
+            thread_id: "thread".to_owned(),
+            checkpoint_id: "cp-1".to_owned(),
+            parent_checkpoint_id: None,
+            identity_version: 1,
+            messages_version: None,
+            result_version: None,
+            state: checkpoint_state_metadata(second_root, None, None).unwrap(),
+        }];
+        assert!(plan_v2_compaction(&duplicate).is_ok());
+        assert_eq!(
+            prepare_v2_compaction(&duplicate),
+            Err(V2CompactionError::Invalid(
+                "v2 compaction retained payload ranges overlap or duplicate"
+            ))
+        );
+    }
+
+    #[test]
+    fn inconsistent_checkpoint_state_fails_closed() {
+        let mut state = build_abcde_state();
+        delete_bc_subtree(&mut state);
+        let other = V2NodeRecord::leaf(0, b"zzz").unwrap();
+        let other_root = V2RootRecord::from_node(0, other).unwrap();
+        state.checkpoints[1].state = checkpoint_state_metadata(other_root, None, None).unwrap();
+        assert_eq!(
+            prepare_v2_compaction(&state),
+            Err(V2CompactionError::Invalid(
+                "v2 compaction rebuilt checkpoint state disagrees with source"
+            ))
+        );
+        assert_eq!(state.checkpoints.len(), 3);
+    }
+
+    #[test]
+    fn operation_digests_survive_physical_remapping() {
+        let mut state = build_abcde_state();
+        delete_bc_subtree(&mut state);
+
+        let prepared = prepare_v2_compaction(&state).unwrap();
+        assert_eq!(state.checkpoints.len(), prepared.checkpoints().len());
+        let mut seen: Vec<[u8; 32]> = Vec::new();
+        for (old, new) in state.checkpoints.iter().zip(prepared.checkpoints().iter()) {
+            let old_digest = checkpoint_operation_digest(old).unwrap();
+            assert_eq!(checkpoint_operation_digest(new).unwrap(), old_digest);
+            assert!(!seen.contains(&old_digest));
+            seen.push(old_digest);
+        }
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
+    fn tombstone_only_state_prepares_empty_replacement() {
+        let mut state = V2CommittedState::default();
+        state
+            .deleted_checkpoints
+            .insert(("thread".to_owned(), "cp-1".to_owned()));
+        state.retired_requests.insert(b"req-1".to_vec(), [0x99; 32]);
+        let before_deleted = state.deleted_checkpoints.clone();
+        let before_retired = state.retired_requests.clone();
+
+        let prepared = prepare_v2_compaction(&state).unwrap();
+        assert!(prepared.payload().is_empty());
+        assert!(prepared.nodes().is_empty());
+        assert!(prepared.versions().is_empty());
+        assert!(prepared.checkpoints().is_empty());
+        assert!(prepared.version_mapping().is_empty());
+        assert!(prepared.node_mapping().is_empty());
+        assert!(prepared.payload_mapping().is_empty());
+        assert_eq!(state.deleted_checkpoints, before_deleted);
+        assert_eq!(state.retired_requests, before_retired);
     }
 }
