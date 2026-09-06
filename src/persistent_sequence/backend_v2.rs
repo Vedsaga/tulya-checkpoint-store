@@ -458,6 +458,101 @@ mod tests {
     }
 
     #[test]
+    fn prepared_subtree_delete_survives_snapshot_and_tombstone_only_reopen() {
+        let first = first_transaction();
+        let first_digest = checkpoint_operation_digest(&first.checkpoint).unwrap();
+        let first_frame = frame(V2WalGeometry::default(), &first, b"req-1");
+        let first_recovered = recover_v2_backend(None, &first_frame).unwrap();
+
+        let second_base = first_recovered.state.geometry().unwrap();
+        let second = second_transaction(second_base);
+        let second_digest = checkpoint_operation_digest(&second.checkpoint).unwrap();
+        let second_frame = frame(second_base, &second, b"req-2");
+
+        let mut full_hot = first_frame;
+        full_hot.extend_from_slice(&second_frame);
+        let mut recovered = recover_v2_backend(None, &full_hot).unwrap();
+
+        let prepared = recovered
+            .state
+            .prepare_delete_checkpoint_subtree("thread", "cp-2")
+            .unwrap();
+        assert_eq!(prepared.deleted_checkpoint_count(), 1);
+        recovered
+            .state
+            .apply_prepared_delete_checkpoint_subtree(prepared);
+
+        assert_eq!(recovered.state.geometry().unwrap().checkpoint_count, 1);
+        assert_eq!(
+            recovered
+                .state
+                .classify_request(b"req-2", second_digest)
+                .unwrap(),
+            V2RequestStatus::Retired
+        );
+        let snapshot = export_v2_sealed_state(&recovered.state).unwrap().unwrap();
+
+        let mut reopened = recover_v2_backend(Some(&snapshot), &[]).unwrap();
+        assert_eq!(reopened.state.geometry().unwrap().checkpoint_count, 1);
+        assert!(reopened
+            .state
+            .deleted_checkpoints
+            .contains(&("thread".to_owned(), "cp-2".to_owned())));
+        assert_eq!(
+            reopened
+                .state
+                .classify_request(b"req-1", first_digest)
+                .unwrap(),
+            V2RequestStatus::Replay {
+                checkpoint_ordinal: 0
+            }
+        );
+        assert_eq!(
+            reopened
+                .state
+                .classify_request(b"req-2", second_digest)
+                .unwrap(),
+            V2RequestStatus::Retired
+        );
+
+        let prepared = reopened
+            .state
+            .prepare_delete_checkpoint_subtree("thread", "cp-1")
+            .unwrap();
+        assert_eq!(prepared.deleted_checkpoint_count(), 1);
+        reopened
+            .state
+            .apply_prepared_delete_checkpoint_subtree(prepared);
+        assert_eq!(reopened.state.geometry().unwrap(), V2WalGeometry::default());
+
+        let tombstone_snapshot = export_v2_sealed_state(&reopened.state).unwrap().unwrap();
+        let final_reopen = recover_v2_backend(Some(&tombstone_snapshot), &[]).unwrap();
+        assert_eq!(final_reopen.state.geometry().unwrap(), V2WalGeometry::default());
+        assert!(final_reopen
+            .state
+            .deleted_checkpoints
+            .contains(&("thread".to_owned(), "cp-1".to_owned())));
+        assert!(final_reopen
+            .state
+            .deleted_checkpoints
+            .contains(&("thread".to_owned(), "cp-2".to_owned())));
+        assert_eq!(
+            final_reopen
+                .state
+                .classify_request(b"req-1", first_digest)
+                .unwrap(),
+            V2RequestStatus::Retired
+        );
+        assert_eq!(
+            final_reopen
+                .state
+                .classify_request(b"req-2", second_digest)
+                .unwrap(),
+            V2RequestStatus::Retired
+        );
+    }
+
+    #[test]
     fn tombstone_only_base_survives_reopen_and_blocks_resurrection() {
         let mut state = V2CommittedState::default();
         state
