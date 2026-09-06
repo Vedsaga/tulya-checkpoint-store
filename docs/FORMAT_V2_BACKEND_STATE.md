@@ -153,6 +153,109 @@ yet part of a public v2 API.
 None. No `T2S2`, `T2D2`, WAL, manifest, or Format-v1 bytes change. This is
 an in-memory semantic-transition hardening only.
 
+**ACCEPTED EVIDENCE**
+
+Rust 1.80 formatting and strict Clippy passed; the focused `apply_v2` suite
+passed 7/7 and the full library suite passed 110/110. The overlap regression
+proves a failed retirement leaves both request ledgers unchanged.
+
+## Prepared subtree deletion
+
+**DECISION**
+
+A v2 subtree deletion is prepared as a complete replacement of all
+checkpoint-visible semantic ledgers before any committed state is mutated:
+
+```text
+validate source checkpoint/index/request/tombstone invariants
+find target + descendants by prior-parent topology
+build deletion mask
+fallibly clone retained checkpoint table
+fallibly build retained checkpoint ordinal index
+fallibly build active request ledger with remapped ordinals
+fallibly build retired request ledger including deleted requests
+fallibly build deleted-checkpoint tombstone set
+                    |
+                    v
+          V2PreparedSubtreeDelete
+                    |
+                    v
+apply: replace prepared ledgers only
+```
+
+Preparation takes `&self`, so validation or allocation failure cannot mutate
+semantic state. The apply phase performs no intended allocation, validation,
+or filesystem I/O.
+
+Every active request whose checkpoint is deleted moves to the retired ledger
+with the same operation digest. Active requests for retained checkpoints keep
+their identity/digest but receive the retained checkpoint's new ordinal.
+
+Deleting a checkpoint deletes every later same-thread descendant whose parent
+chain reaches the target. Sibling branches and other thread roots remain live.
+
+If at least one checkpoint survives, this semantic unit deliberately retains
+the existing payload/node/version arena, including unreachable historical
+sequence records. Logical deletion therefore does not depend on immediate
+physical compaction.
+
+If no live checkpoint survives, apply clears payload, nodes, and versions so
+the backend can emit the already-defined canonical tombstone-only `T2S2`
+representation.
+
+**WHY**
+
+Checkpoint tombstones and request retirement are one logical authority
+transition. Publishing one without the other could either resurrect a deleted
+checkpoint through request retry or incorrectly retire a request while its
+checkpoint remains live.
+
+Building complete replacement ledgers avoids rollback logic and avoids
+fallible insertion after semantic mutation starts. It also makes retained
+request-ordinal remapping explicit after checkpoint-vector compaction.
+
+Keeping unreachable immutable arena/version history after a partial deletion
+is correct but not space-optimal. This unit establishes deletion semantics
+before physical compaction, matching the repository invariant that logical
+delete precedes reclamation.
+
+**ALTERNATIVES REJECTED**
+
+- Tombstone the checkpoint first, then retire requests one at a time: rejected
+  because any later failure leaves a mixed deletion/idempotency state.
+- Mutate active maps in place and roll back on allocation failure: rejected
+  because rollback adds another failure-sensitive transition.
+- Rebuild the persistent-sequence arena in the same unit: rejected because
+  semantic deletion and physical compaction have different correctness
+  boundaries and should be tested independently.
+- Delete only the requested checkpoint while retaining descendants: rejected
+  because retained children would reference a deleted parent and violate
+  checkpoint topology.
+- Forget request IDs when deleting the last checkpoint: rejected because a
+  tombstone-only store must still reject stale exact retries and conflicting
+  request reuse.
+
+**FORMAT IMPACT**
+
+None. The staged schema-2 `T2S2` already carries active requests, retired
+requests, and deleted checkpoint identities. No record family or byte
+interpretation changes.
+
+**STAGED ACCEPTANCE**
+
+This unit is accepted only after focused tests prove:
+
+- preparation itself leaves source state unchanged;
+- subtree deletion removes target + descendants but preserves siblings/other
+  roots;
+- retained active-request ordinals are remapped exactly;
+- deleted checkpoint requests become retired with their original digests;
+- preparation failure on inconsistent request ledgers changes no semantic
+  state;
+- snapshot export/reopen preserves deletion and retired-request authority; and
+- deleting the final live checkpoint produces a valid tombstone-only backend
+  that reopens with zero sequence geometry.
+
 ## Acceptance properties
 
 The focused backend tests require:
@@ -175,7 +278,8 @@ This layer still does not:
 - define the public v2 manifest;
 - publish `T2S2` atomically;
 - recycle `hot.wal` after a v2 seal;
-- implement production deletion/compaction;
+- publish the prepared deletion as a durable production operation;
+- physically compact unreachable v2 arena/version history after partial deletion;
 - migrate a v1 directory;
 - route public `CheckpointStore` methods to a v2 backend; or
 - claim crash durability for live I/O.
