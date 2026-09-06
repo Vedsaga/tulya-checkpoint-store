@@ -119,10 +119,6 @@ impl PersistentRoot {
     ///
     /// The backend resolves the identifier against its arena on every call,
     /// so a forged length fails closed instead of misdirecting traversal.
-    ///
-    /// Staged in P1.1: first production callers land in P1.2, which removes
-    /// this allowance.
-    #[allow(dead_code)]
     pub(crate) const fn balanced_v2(node_id: u64, logical_len: LogicalLength) -> Self {
         Self {
             node_id,
@@ -236,9 +232,16 @@ impl From<V2AvlError> for SequenceError {
 /// Counters use saturating arithmetic deliberately: they must make locality
 /// regressions observable without ever failing a storage operation. Tests
 /// snapshot these values around single operations and assert deltas.
+///
+/// `nodes_inspected` counts arena-node resolutions performed by the append
+/// path itself (parent validation plus spine traversal), so an append over a
+/// large parent cannot report near-zero work while hiding traversal.
+/// Read/verify traversals accumulate under `nodes_read` instead; appends never
+/// touch that counter.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SequenceWorkCounters {
     pub(crate) nodes_allocated: u64,
+    pub(crate) nodes_inspected: u64,
     pub(crate) nodes_read: u64,
     pub(crate) payload_bytes_read: u64,
     pub(crate) payload_bytes_written: u64,
@@ -250,10 +253,6 @@ pub(crate) struct SequenceWorkCounters {
 /// intentionally read-only behind [`PersistentSequence`]; only the balanced
 /// backend implements this trait today, and its `CheckpointStore` callers land
 /// in the next integration slice.
-///
-/// Staged in P1.1: first production callers land in P1.2, which removes this
-/// allowance.
-#[allow(dead_code)]
 pub(crate) trait PersistentSequenceAppend {
     type Error;
 
@@ -275,6 +274,7 @@ pub(crate) trait PersistentSequenceAppend {
 /// re-entering through [`PersistentRoot`] resolves its arena position to
 /// canonical metadata, so forged lengths or unknown identifiers fail closed
 /// inside the core's existing checks.
+#[derive(Debug)]
 pub(crate) struct BalancedSequence {
     inner: V2AvlSequence,
     work: Cell<SequenceWorkCounters>,
@@ -289,10 +289,6 @@ impl BalancedSequence {
     }
 
     /// Returns a snapshot of the cumulative diagnostic work counters.
-    ///
-    /// Staged in P1.1: first production callers land in P1.2, which removes
-    /// this allowance.
-    #[allow(dead_code)]
     pub(crate) fn work_counters(&self) -> SequenceWorkCounters {
         self.work.get()
     }
@@ -323,11 +319,13 @@ impl BalancedSequence {
     /// Staged in P1.1: first production callers land in P1.2, which removes
     /// this allowance.
     #[allow(dead_code)]
-    fn note_written(&self, nodes: usize, payload_bytes: usize) {
-        let nodes = u64::try_from(nodes).unwrap_or(u64::MAX);
+    fn note_written(&self, allocated: usize, inspected: usize, payload_bytes: usize) {
+        let allocated = u64::try_from(allocated).unwrap_or(u64::MAX);
+        let inspected = u64::try_from(inspected).unwrap_or(u64::MAX);
         let payload_bytes = u64::try_from(payload_bytes).unwrap_or(u64::MAX);
         let mut work = self.work.get();
-        work.nodes_allocated = work.nodes_allocated.saturating_add(nodes);
+        work.nodes_allocated = work.nodes_allocated.saturating_add(allocated);
+        work.nodes_inspected = work.nodes_inspected.saturating_add(inspected);
         work.payload_bytes_written = work.payload_bytes_written.saturating_add(payload_bytes);
         self.work.set(work);
     }
@@ -372,7 +370,11 @@ impl PersistentSequenceAppend for BalancedSequence {
     ) -> Result<PersistentRoot, Self::Error> {
         let resolved = parent.map(|root| self.resolve(root)).transpose()?;
         let result = self.inner.append(resolved, bytes)?;
-        self.note_written(result.allocated_nodes(), bytes.len());
+        self.note_written(
+            result.allocated_nodes(),
+            result.inspected_nodes(),
+            bytes.len(),
+        );
         let root = result.root();
         Ok(PersistentRoot::balanced_v2(
             root.node_id(),
@@ -584,7 +586,14 @@ mod tests {
         );
         // One leaf plus a logarithmic AVL spine: nowhere near a whole-parent
         // copy of 4096 payload bytes into hundreds of nodes.
-        assert!((after_append.nodes_allocated - before_append.nodes_allocated) <= 8);
+        let allocated = after_append.nodes_allocated - before_append.nodes_allocated;
+        let inspected = after_append.nodes_inspected - before_append.nodes_inspected;
+        assert!(allocated <= 8);
+        // Every inspected node sits on the copy path: inspection stays
+        // proportional to allocation, so hidden linear traversal cannot hide
+        // behind a small allocation count.
+        assert!(inspected > 0);
+        assert!(inspected <= 8 * allocated);
         // The append path performs no counted read traversal of the parent:
         // this is the regression tripwire for whole-parent reconstruction.
         assert_eq!(after_append.nodes_read, before_append.nodes_read);
@@ -612,5 +621,25 @@ mod tests {
 
         assert_eq!(read_full(&sequence, root), b"x");
         assert_eq!(sequence.logical_len(big).unwrap(), LogicalLength::new(4096));
+    }
+
+    #[test]
+    fn balanced_append_inspection_stays_logarithmic_after_deep_history() {
+        let mut sequence = balanced_fixture();
+        let mut root = sequence.append(None, b"seed").unwrap();
+        for index in 0..200u32 {
+            let payload = [(index % 251) as u8, b'z'];
+            root = sequence.append(Some(root), &payload).unwrap();
+        }
+        let before = sequence.work_counters();
+        let child = sequence.append(Some(root), b"new").unwrap();
+        let after = sequence.work_counters();
+        let allocated = after.nodes_allocated - before.nodes_allocated;
+        let inspected = after.nodes_inspected - before.nodes_inspected;
+        assert!(allocated <= 24, "allocated {allocated} nodes for one delta");
+        assert!(inspected <= 96, "inspected {inspected} nodes for one delta");
+        assert!(inspected <= 8 * allocated + 8);
+        sequence.verify(child).unwrap();
+        assert_eq!(sequence.logical_len(child).unwrap().get(), 4 + 400 + 3);
     }
 }

@@ -48,6 +48,7 @@ impl From<V2ImageError> for V2AvlError {
 pub(super) struct V2AppendResult {
     root: V2RootRecord,
     allocated_nodes: usize,
+    inspected_nodes: usize,
 }
 
 impl V2AppendResult {
@@ -57,6 +58,10 @@ impl V2AppendResult {
 
     pub(super) const fn allocated_nodes(self) -> usize {
         self.allocated_nodes
+    }
+
+    pub(super) const fn inspected_nodes(self) -> usize {
+        self.inspected_nodes
     }
 }
 
@@ -109,10 +114,12 @@ impl V2AvlSequence {
 
         let payload_start = self.payload.len();
         let node_start = self.nodes.len();
-        match self.append_inner(parent, bytes) {
+        let mut inspected = 0usize;
+        match self.append_inner(parent, bytes, &mut inspected) {
             Ok(root) => Ok(V2AppendResult {
                 root,
                 allocated_nodes: self.nodes.len() - node_start,
+                inspected_nodes: inspected,
             }),
             Err(error) => {
                 self.payload.truncate(payload_start);
@@ -338,6 +345,7 @@ impl V2AvlSequence {
         &mut self,
         parent: Option<V2RootRecord>,
         bytes: &[u8],
+        inspected: &mut usize,
     ) -> Result<V2RootRecord, V2AvlError> {
         let payload_offset = u64::try_from(self.payload.len())
             .map_err(|_| V2AvlError::Overflow("v2 payload arena length exceeds u64"))?;
@@ -350,7 +358,13 @@ impl V2AvlSequence {
             record,
         })?;
         match parent {
-            Some(root) => self.concat(root, leaf),
+            Some(root) => {
+                // Parent validation resolves one arena node; count it so the
+                // append path reports its own traversal work.
+                *inspected = inspected.saturating_add(1);
+                self.node_for_root(root)?;
+                self.concat(root, leaf, inspected)
+            }
             None => Ok(leaf),
         }
     }
@@ -360,18 +374,19 @@ impl V2AvlSequence {
         &mut self,
         left: V2RootRecord,
         right: V2RootRecord,
+        inspected: &mut usize,
     ) -> Result<V2RootRecord, V2AvlError> {
         if left.height() > right.height().saturating_add(1) {
-            let (left_left, left_right) = self.branch_children(left)?;
-            let joined = self.concat(left_right, right)?;
-            return self.rebalance(left_left, joined);
+            let (left_left, left_right) = self.branch_children(left, inspected)?;
+            let joined = self.concat(left_right, right, inspected)?;
+            return self.rebalance(left_left, joined, inspected);
         }
         if right.height() > left.height().saturating_add(1) {
-            let (right_left, right_right) = self.branch_children(right)?;
-            let joined = self.concat(left, right_left)?;
-            return self.rebalance(joined, right_right);
+            let (right_left, right_right) = self.branch_children(right, inspected)?;
+            let joined = self.concat(left, right_left, inspected)?;
+            return self.rebalance(joined, right_right, inspected);
         }
-        self.allocate_branch(left, right)
+        self.allocate_branch(left, right, inspected)
     }
 
     /// Restores the AVL height invariant with a single or double rotation.
@@ -379,39 +394,43 @@ impl V2AvlSequence {
         &mut self,
         left: V2RootRecord,
         right: V2RootRecord,
+        inspected: &mut usize,
     ) -> Result<V2RootRecord, V2AvlError> {
         if left.height().abs_diff(right.height()) <= 1 {
-            return self.allocate_branch(left, right);
+            return self.allocate_branch(left, right, inspected);
         }
 
         if left.height() > right.height() {
-            let (left_left, left_right) = self.branch_children(left)?;
+            let (left_left, left_right) = self.branch_children(left, inspected)?;
             if left_left.height() >= left_right.height() {
-                let new_right = self.allocate_branch(left_right, right)?;
-                return self.allocate_branch(left_left, new_right);
+                let new_right = self.allocate_branch(left_right, right, inspected)?;
+                return self.allocate_branch(left_left, new_right, inspected);
             }
-            let (middle_left, middle_right) = self.branch_children(left_right)?;
-            let new_left = self.allocate_branch(left_left, middle_left)?;
-            let new_right = self.allocate_branch(middle_right, right)?;
-            return self.allocate_branch(new_left, new_right);
+            let (middle_left, middle_right) = self.branch_children(left_right, inspected)?;
+            let new_left = self.allocate_branch(left_left, middle_left, inspected)?;
+            let new_right = self.allocate_branch(middle_right, right, inspected)?;
+            return self.allocate_branch(new_left, new_right, inspected);
         }
 
-        let (right_left, right_right) = self.branch_children(right)?;
+        let (right_left, right_right) = self.branch_children(right, inspected)?;
         if right_right.height() >= right_left.height() {
-            let new_left = self.allocate_branch(left, right_left)?;
-            return self.allocate_branch(new_left, right_right);
+            let new_left = self.allocate_branch(left, right_left, inspected)?;
+            return self.allocate_branch(new_left, right_right, inspected);
         }
-        let (middle_left, middle_right) = self.branch_children(right_left)?;
-        let new_left = self.allocate_branch(left, middle_left)?;
-        let new_right = self.allocate_branch(middle_right, right_right)?;
-        self.allocate_branch(new_left, new_right)
+        let (middle_left, middle_right) = self.branch_children(right_left, inspected)?;
+        let new_left = self.allocate_branch(left, middle_left, inspected)?;
+        let new_right = self.allocate_branch(middle_right, right_right, inspected)?;
+        self.allocate_branch(new_left, new_right, inspected)
     }
 
     fn allocate_branch(
         &mut self,
         left: V2RootRecord,
         right: V2RootRecord,
+        inspected: &mut usize,
     ) -> Result<V2RootRecord, V2AvlError> {
+        // Both child validations below resolve one arena node each.
+        *inspected = inspected.saturating_add(2);
         self.node_for_root(left)?;
         self.node_for_root(right)?;
         let record = V2NodeRecord::branch(left, right)?;
@@ -433,7 +452,10 @@ impl V2AvlSequence {
     fn branch_children(
         &self,
         root: V2RootRecord,
+        inspected: &mut usize,
     ) -> Result<(V2RootRecord, V2RootRecord), V2AvlError> {
+        // The single resolution below reads one arena node.
+        *inspected = inspected.saturating_add(1);
         match self.node_for_root(root)? {
             ArenaNode::Branch { left, right, .. } => Ok((*left, *right)),
             ArenaNode::Leaf { .. } => Err(V2AvlError::Invalid(
@@ -655,14 +677,15 @@ mod tests {
     #[test]
     fn rebalance_exercises_single_and_double_rotations() {
         let mut sequence = V2AvlSequence::default();
+        let mut work = 0usize;
 
         let a = append_leaf(&mut sequence, b'a');
         let b = append_leaf(&mut sequence, b'b');
         let c = append_leaf(&mut sequence, b'c');
         let d = append_leaf(&mut sequence, b'd');
-        let cd = sequence.allocate_branch(c, d).unwrap();
-        let bcd = sequence.allocate_branch(b, cd).unwrap();
-        let single = sequence.rebalance(a, bcd).unwrap();
+        let cd = sequence.allocate_branch(c, d, &mut work).unwrap();
+        let bcd = sequence.allocate_branch(b, cd, &mut work).unwrap();
+        let single = sequence.rebalance(a, bcd, &mut work).unwrap();
         assert_eq!(single.height(), 3);
         assert_eq!(sequence.read_range(single, 0, 4).unwrap(), b"abcd");
         sequence.verify_root(single).unwrap();
@@ -671,9 +694,9 @@ mod tests {
         let f = append_leaf(&mut sequence, b'f');
         let g = append_leaf(&mut sequence, b'g');
         let h = append_leaf(&mut sequence, b'h');
-        let fg = sequence.allocate_branch(f, g).unwrap();
-        let fgh = sequence.allocate_branch(fg, h).unwrap();
-        let double = sequence.rebalance(e, fgh).unwrap();
+        let fg = sequence.allocate_branch(f, g, &mut work).unwrap();
+        let fgh = sequence.allocate_branch(fg, h, &mut work).unwrap();
+        let double = sequence.rebalance(e, fgh, &mut work).unwrap();
         assert_eq!(double.height(), 3);
         assert_eq!(sequence.read_range(double, 0, 4).unwrap(), b"efgh");
         sequence.verify_root(double).unwrap();
