@@ -28,8 +28,12 @@ use crate::persistent_sequence::{
     BalancedSequence, LogicalLength, PersistentRoot, PersistentSequence, PersistentSequenceAppend,
     SequenceError, SequenceRange, SequenceWorkCounters,
 };
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fmt;
+
+/// Domain separator for the generic history operation digest.
+const HISTORY_OPERATION_DOMAIN: &[u8] = b"tulya-history/v1/commit\0";
 
 /// Opaque core-assigned history/object identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -41,7 +45,15 @@ impl HistoryId {
     }
 }
 
-/// Opaque core-assigned version identity, dense per store.
+/// Opaque core-assigned version identity.
+///
+/// This is the STABLE LOGICAL identity adapters address versions by. It is
+/// deliberately distinct from the physical table position: compaction and
+/// reclamation (later slices) may relocate storage, but they must never
+/// change the logical identity an adapter holds. Every lookup
+/// coordinate-checks the table entry against the requested identity, so a
+/// relocated or fabricated identity fails closed instead of addressing the
+/// wrong record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct VersionId(u64);
 
@@ -106,15 +118,59 @@ impl From<SequenceError> for HistoryError {
     }
 }
 
+/// Computes the generic operation digest for one exact semantic operation.
+///
+/// The digest binds history, version, parent, and payload bytes. A request
+/// identity later binds to exactly one such digest, so reusing a request for
+/// any different history/version/parent/payload necessarily conflicts instead
+/// of replaying.
+pub(crate) fn history_operation_digest(
+    history: HistoryId,
+    version: VersionId,
+    parent: Option<VersionId>,
+    payload: &[u8],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(HISTORY_OPERATION_DOMAIN);
+    hasher.update(history.id().to_le_bytes());
+    hasher.update(version.id().to_le_bytes());
+    match parent {
+        Some(id) => {
+            hasher.update([1u8]);
+            hasher.update(id.id().to_le_bytes());
+        }
+        None => {
+            hasher.update([0u8]);
+            hasher.update(0u64.to_le_bytes());
+        }
+    }
+    hasher.update(
+        u64::try_from(payload.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    hasher.update(payload);
+    let digest = hasher.finalize();
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&digest);
+    output
+}
+
 /// Domain-neutral store of versioned opaque payload histories over one shared
 /// balanced arena. Histories isolate parenthood: a parent version must belong
 /// to the same history, so one object's lineage can never silently graft onto
 /// another's.
+///
+/// Identity allocation uses explicit monotonic counters with checked
+/// increments, independent of live-set cardinality: removing or reclaiming a
+/// history or version later must never cause a numeric identity to be reused.
 #[derive(Debug, Default)]
 pub(crate) struct PersistentHistoryStore {
     backend: BalancedSequence,
     histories: HashSet<HistoryId>,
     versions: Vec<Version>,
+    next_history_id: u64,
+    next_version_id: u64,
 }
 
 impl PersistentHistoryStore {
@@ -123,15 +179,23 @@ impl PersistentHistoryStore {
             backend: BalancedSequence::new(),
             histories: HashSet::new(),
             versions: Vec::new(),
+            next_history_id: 0,
+            next_version_id: 0,
         }
     }
 
     /// Creates an empty history and returns its core-assigned identity.
+    ///
+    /// Identities come from a monotonic counter, never from live-set size, so
+    /// a removed history's identity is never reassigned.
     pub(crate) fn create_history(&mut self) -> Result<HistoryId, HistoryError> {
-        let id = HistoryId(
-            u64::try_from(self.histories.len())
-                .map_err(|_| HistoryError::Overflow("persistent history count exceeds u64"))?,
-        );
+        let id = HistoryId(self.next_history_id);
+        self.next_history_id =
+            self.next_history_id
+                .checked_add(1)
+                .ok_or(HistoryError::Overflow(
+                    "persistent history count exceeds u64",
+                ))?;
         self.histories
             .try_reserve(1)
             .map_err(|_| HistoryError::Capacity("persistent history set allocation failed"))?;
@@ -166,10 +230,13 @@ impl PersistentHistoryStore {
                 Some(record.root())
             }
         };
-        let id = VersionId(
-            u64::try_from(self.versions.len())
-                .map_err(|_| HistoryError::Overflow("persistent version count exceeds u64"))?,
-        );
+        let id = VersionId(self.next_version_id);
+        self.next_version_id =
+            self.next_version_id
+                .checked_add(1)
+                .ok_or(HistoryError::Overflow(
+                    "persistent version count exceeds u64",
+                ))?;
         self.versions
             .try_reserve(1)
             .map_err(|_| HistoryError::Capacity("persistent version table allocation failed"))?;
@@ -375,6 +442,76 @@ mod tests {
         let history = store.create_history().unwrap();
         assert!(store.commit(history, None, b"").is_err());
         assert_eq!(store.versions.len(), 0);
+    }
+
+    #[test]
+    fn operation_digest_binds_exact_semantic_operation() {
+        let history = HistoryId(3);
+        let version = VersionId(7);
+        let parent = Some(VersionId(2));
+        let first = history_operation_digest(history, version, parent, b"payload");
+        assert_eq!(
+            first,
+            history_operation_digest(history, version, parent, b"payload")
+        );
+        // Any differing coordinate changes the digest: same request bound to
+        // one digest can never replay a different operation.
+        assert_ne!(
+            first,
+            history_operation_digest(HistoryId(4), version, parent, b"payload")
+        );
+        assert_ne!(
+            first,
+            history_operation_digest(history, VersionId(8), parent, b"payload")
+        );
+        assert_ne!(
+            first,
+            history_operation_digest(history, version, None, b"payload")
+        );
+        assert_ne!(
+            first,
+            history_operation_digest(history, version, parent, b"other")
+        );
+    }
+
+    #[test]
+    fn version_table_position_never_overrides_logical_identity() {
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let first = store.commit(history, None, b"one").unwrap();
+        let second = store.commit(history, Some(first.id()), b"two").unwrap();
+        // Physically swap the two records: both lookups must now fail closed
+        // because position disagrees with logical identity.
+        store.versions.swap(0, 1);
+        assert_eq!(
+            store.version_record(first.id()),
+            Err(HistoryError::Invalid(
+                "persistent version disagrees with its table coordinate"
+            ))
+        );
+        assert_eq!(
+            store.version_record(second.id()),
+            Err(HistoryError::Invalid(
+                "persistent version disagrees with its table coordinate"
+            ))
+        );
+    }
+
+    #[test]
+    fn allocation_identities_are_dense_and_monotonic() {
+        let mut store = PersistentHistoryStore::new();
+        let first_history = store.create_history().unwrap();
+        let second_history = store.create_history().unwrap();
+        assert_eq!(first_history.id(), 0);
+        assert_eq!(second_history.id(), 1);
+        let first = store.commit(first_history, None, b"one").unwrap();
+        let second = store
+            .commit(first_history, Some(first.id()), b"two")
+            .unwrap();
+        let third = store.commit(second_history, None, b"three").unwrap();
+        assert_eq!(first.id().id(), 0);
+        assert_eq!(second.id().id(), 1);
+        assert_eq!(third.id().id(), 2);
     }
 
     #[test]
