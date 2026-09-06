@@ -216,7 +216,12 @@ impl V2CommittedState {
             .try_reserve_exact(checkpoint_count)
             .map_err(|_| V2ApplyError::Capacity("v2 deletion mask allocation failed"))?;
         delete_mask.resize(checkpoint_count, 0);
-        delete_mask[target_index] = 1;
+        let target_slot = delete_mask
+            .get_mut(target_index)
+            .ok_or(V2ApplyError::Invalid(
+                "v2 deletion target is outside the checkpoint table",
+            ))?;
+        *target_slot = 1;
 
         for index in target_index.saturating_add(1)..checkpoint_count {
             let checkpoint = &self.checkpoints[index];
@@ -237,8 +242,20 @@ impl V2CommittedState {
                     "v2 live checkpoint parent is not topologically prior",
                 ));
             }
-            if delete_mask[parent_index] != 0 {
-                delete_mask[index] = 1;
+            let parent_deleted = delete_mask
+                .get(parent_index)
+                .copied()
+                .ok_or(V2ApplyError::Invalid(
+                    "v2 deletion parent is outside the deletion mask",
+                ))?
+                != 0;
+            if parent_deleted {
+                let slot = delete_mask
+                    .get_mut(index)
+                    .ok_or(V2ApplyError::Invalid(
+                        "v2 deletion checkpoint is outside the deletion mask",
+                    ))?;
+                *slot = 1;
             }
         }
 
