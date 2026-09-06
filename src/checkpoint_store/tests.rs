@@ -1984,3 +1984,87 @@ fn live_prune_faults_preserve_tombstone_authority() -> Result<(), Box<dyn std::e
 
     Ok(())
 }
+
+#[test]
+fn candidate_history_path_chains_store_to_core_to_sequence(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Vertical slice: CheckpointStore -> PersistentHistoryStore ->
+    // BalancedSequence, with thread/checkpoint mapping at the adapter layer.
+    let temp = tempfile::tempdir()?;
+    let config = CheckpointStoreConfig {
+        wal_segment_bytes: 1024 * 1024,
+        preinit_chunk_bytes: 64 * 1024,
+        sealed_block_size: 4096,
+        zstd_level: 1,
+        recovery_mode: CheckpointStoreRecoveryMode::ReusePayload,
+    };
+    let mut store = CheckpointStore::open(temp.path(), config)?;
+
+    let v1 = store.append_candidate_message("thread-a", "cp-1", None, b"hello")?;
+    let v2 = store.append_candidate_message("thread-a", "cp-2", Some("cp-1"), b" world")?;
+    let v3 = store.append_candidate_message("thread-a", "cp-3", Some("cp-1"), b"!!!")?;
+    let w1 = store.append_candidate_message("thread-b", "cp-1", None, b"other")?;
+
+    assert_ne!(v1.history(), w1.history());
+    assert_eq!(v1.parent(), None);
+    assert_eq!(v2.parent(), Some(v1.id()));
+    assert_eq!(v3.parent(), Some(v1.id()));
+
+    let mut output = Vec::new();
+    store.read_candidate_message("thread-a", "cp-1", 0, 5, &mut output)?;
+    assert_eq!(output, b"hello");
+    output.clear();
+    store.read_candidate_message("thread-a", "cp-2", 0, 11, &mut output)?;
+    assert_eq!(output, b"hello world");
+    output.clear();
+    store.read_candidate_message("thread-a", "cp-3", 5, 3, &mut output)?;
+    assert_eq!(output, b"!!!");
+    output.clear();
+    store.read_candidate_message("thread-b", "cp-1", 0, 5, &mut output)?;
+    assert_eq!(output, b"other");
+
+    let history = store.history_store();
+    history.verify(v1)?;
+    history.verify(v2)?;
+    history.verify(v3)?;
+    history.verify(w1)?;
+
+    assert_eq!(
+        store
+            .append_candidate_message("thread-a", "cp-2", Some("cp-1"), b"dup")
+            .unwrap_err()
+            .to_string(),
+        "checkpoint-store format error: candidate checkpoint identity already exists"
+    );
+    assert!(matches!(
+        store.append_candidate_message("thread-a", "cp-9", Some("missing"), b"x"),
+        Err(CheckpointStoreError::CheckpointNotFound)
+    ));
+    assert!(matches!(
+        store.append_candidate_message("thread-b", "cp-2", Some("cp-2"), b"x"),
+        Err(CheckpointStoreError::CheckpointNotFound)
+    ));
+    assert!(store
+        .append_candidate_message("thread-a", "cp-4", Some("cp-1"), b"")
+        .is_err());
+    assert!(matches!(
+        store.read_candidate_message("thread-a", "missing", 0, 1, &mut Vec::new()),
+        Err(CheckpointStoreError::CheckpointNotFound)
+    ));
+
+    // Candidate appends perform no whole-parent reads: the only payload bytes
+    // the core read are the ones this test explicitly asked to read above
+    // (5 + 11 + 3 + 5).
+    let before = store.history_store().work_counters();
+    let _big = store.append_candidate_message("thread-a", "cp-big", None, &vec![b'p'; 4096])?;
+    let mid = store.history_store().work_counters();
+    assert_eq!(mid.payload_bytes_read, before.payload_bytes_read);
+    let _child =
+        store.append_candidate_message("thread-a", "cp-big-child", Some("cp-big"), b"delta")?;
+    let after = store.history_store().work_counters();
+    assert_eq!(after.payload_bytes_read, mid.payload_bytes_read);
+    assert_eq!(after.payload_bytes_written - mid.payload_bytes_written, 5);
+    assert!((after.nodes_allocated - mid.nodes_allocated) <= 8);
+    assert!((after.nodes_inspected - mid.nodes_inspected) <= 32);
+    Ok(())
+}

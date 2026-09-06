@@ -37,6 +37,7 @@ use crate::error_classification::{
     DurabilityOperation,
 };
 use crate::hot_wal_commit::{FileHotWalCommitIo, HotWalCommitter};
+use crate::persistent_history::{HistoryId, PersistentHistoryStore, VersionId};
 
 mod storage_format;
 use storage_format::*;
@@ -761,6 +762,18 @@ pub struct CheckpointStore {
     hot: HotWal,
     lazy_base: Option<RefCell<LazyCheckpointStore>>,
     range_sizes: RefCell<Vec<Option<u64>>>,
+    /// Staged release-candidate history core. The legacy `state` remains
+    /// authoritative until the candidate path carries durability (P1.3+).
+    /// Staged P1.2: durability wiring makes these fields live; remove the
+    /// allowances then.
+    #[allow(dead_code)]
+    history: PersistentHistoryStore,
+    /// Adapter mapping: checkpoint thread to generic history identity.
+    #[allow(dead_code)]
+    history_ids: HashMap<String, HistoryId>,
+    /// Adapter mapping: checkpoint (thread, id) to generic version identity.
+    #[allow(dead_code)]
+    history_versions: HashMap<(String, String), VersionId>,
 }
 
 mod store;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::persistent_history::{HistoryError, PersistentHistoryStore, Version};
 use crate::persistent_sequence::{
     LogicalLength, PersistentRoot, PersistentSequence, SequenceRange, SequenceRepresentation,
 };
@@ -100,6 +101,9 @@ impl CheckpointStore {
             hot,
             lazy_base,
             range_sizes: RefCell::new(Vec::new()),
+            history: PersistentHistoryStore::new(),
+            history_ids: HashMap::new(),
+            history_versions: HashMap::new(),
         };
         if store.lazy_base.is_none() {
             let roots = store
@@ -570,6 +574,114 @@ impl CheckpointStore {
             canonical_state_hash,
         )?;
         self.append_encoded_transaction(&transaction)
+    }
+
+    /// Candidate release-path append through the generic history core.
+    ///
+    /// Staged P1.2: proves the `CheckpointStore -> PersistentHistoryStore ->
+    /// BalancedSequence` dependency chain on real store handles. Checkpoint
+    /// thread maps to generic history, checkpoint id maps to generic version,
+    /// and the message payload commits as opaque bytes with no whole-parent
+    /// XXH3 reconstruction. The legacy state remains authoritative; durability
+    /// (request ledger, seal, tombstones) arrives in later slices.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty identifiers, duplicate checkpoint identity
+    /// within a thread, unknown parent identity, or an empty payload.
+    ///
+    /// Staged P1.2 candidate path: durability wiring in P1.3+ makes this
+    /// live; remove the allowance then.
+    #[allow(dead_code)]
+    pub(crate) fn append_candidate_message(
+        &mut self,
+        thread_id: &str,
+        checkpoint_id: &str,
+        parent_checkpoint_id: Option<&str>,
+        payload: &[u8],
+    ) -> Result<Version, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
+        validate_checkpoint_identifier(thread_id, "thread id")?;
+        validate_checkpoint_identifier(checkpoint_id, "checkpoint id")?;
+        if let Some(parent_id) = parent_checkpoint_id {
+            validate_checkpoint_identifier(parent_id, "parent checkpoint id")?;
+        }
+        let key = (thread_id.to_owned(), checkpoint_id.to_owned());
+        if self.history_versions.contains_key(&key) {
+            return Err(format_error("candidate checkpoint identity already exists"));
+        }
+        let history = match self.history_ids.get(thread_id) {
+            Some(id) => *id,
+            None => {
+                let id = self.history.create_history().map_err(Self::history_error)?;
+                self.history_ids.insert(thread_id.to_owned(), id);
+                id
+            }
+        };
+        let parent = parent_checkpoint_id
+            .map(|parent_id| {
+                self.history_versions
+                    .get(&(thread_id.to_owned(), parent_id.to_owned()))
+                    .copied()
+                    .ok_or(CheckpointStoreError::CheckpointNotFound)
+            })
+            .transpose()?;
+        let version = self
+            .history
+            .commit(history, parent, payload)
+            .map_err(Self::history_error)?;
+        self.history_versions.insert(key, version.id());
+        Ok(version)
+    }
+
+    /// Candidate release-path exact read through the generic history core.
+    ///
+    /// Staged P1.2 candidate path: durability wiring in P1.3+ makes this
+    /// live; remove the allowance then.
+    #[allow(dead_code)]
+    pub(crate) fn read_candidate_message(
+        &self,
+        thread_id: &str,
+        checkpoint_id: &str,
+        offset: u64,
+        length: u64,
+        output: &mut Vec<u8>,
+    ) -> Result<(), CheckpointStoreError> {
+        let key = (thread_id.to_owned(), checkpoint_id.to_owned());
+        let id = self
+            .history_versions
+            .get(&key)
+            .copied()
+            .ok_or(CheckpointStoreError::CheckpointNotFound)?;
+        let history = self
+            .history_ids
+            .get(thread_id)
+            .copied()
+            .ok_or(CheckpointStoreError::CheckpointNotFound)?;
+        let version = self
+            .history
+            .committed_version_for_adapter(id, history)
+            .map_err(Self::history_error)?;
+        self.history
+            .read(version, offset, length, output)
+            .map_err(Self::history_error)
+    }
+
+    /// Borrows the staged history core for adapter-level verification and
+    /// diagnostic inspection.
+    ///
+    /// Staged P1.2 candidate path: durability wiring in P1.3+ makes this
+    /// live; remove the allowance then.
+    #[allow(dead_code)]
+    pub(crate) fn history_store(&self) -> &PersistentHistoryStore {
+        &self.history
+    }
+
+    /// Staged P1.2 candidate path: durability wiring in P1.3+ makes this
+    /// live; remove the allowance then.
+    #[allow(dead_code)]
+    fn history_error(error: HistoryError) -> CheckpointStoreError {
+        format_error(error.to_string())
     }
 
     fn legacy_v1_message_root_metadata(
