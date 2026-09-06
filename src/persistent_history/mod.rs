@@ -33,7 +33,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+pub(crate) mod authority;
 pub(crate) mod durable_log;
+pub(crate) mod manifest;
 pub(crate) mod snapshot;
 use durable_log::{DurableError, DurableHistoryLog, HistoryLogRecord};
 
@@ -911,6 +913,11 @@ impl PersistentHistoryStore {
     /// fails closed.
     pub(crate) fn lookup_version(&self, id: VersionId) -> Result<Version, HistoryError> {
         self.version_record(id)
+    }
+
+    /// Counts committed versions. Used for reopen statistics and tests.
+    pub(crate) fn version_count(&self) -> usize {
+        self.versions.len()
     }
 
     /// Resolves a version identity within an expected history for adapter

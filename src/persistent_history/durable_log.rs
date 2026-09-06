@@ -38,6 +38,7 @@ use super::{
     MAX_HISTORY_REQUEST_ID_BYTES,
 };
 use crate::error_classification::DurabilityOperation;
+use fs4::FileExt;
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -513,43 +514,62 @@ pub(crate) fn decode_history_log(
 /// exact-identity assertions, so a reordered, truncated, or forged log fails
 /// closed instead of reconstructing a divergent store.
 pub(crate) fn recover_history_store(bytes: &[u8]) -> Result<PersistentHistoryStore, HistoryError> {
-    let (records, _) = decode_history_log(bytes)?;
     let mut store = PersistentHistoryStore::new();
+    replay_history_suffix(&mut store, bytes)?;
+    Ok(store)
+}
+
+/// Replays decoded log bytes into a live store, ignoring a torn tail exactly
+/// like full recovery. Used when a snapshot already provides the prefix and
+/// only the hot suffix needs application.
+pub(crate) fn replay_history_suffix(
+    store: &mut PersistentHistoryStore,
+    bytes: &[u8],
+) -> Result<(), HistoryError> {
+    let (records, _) = decode_history_log(bytes)?;
     for record in &records {
-        match record {
-            HistoryLogRecord::CreateHistory { history, binding } => {
-                store.replay_create(*history, binding.as_deref())?;
-            }
-            HistoryLogRecord::Commit {
-                history,
-                version,
-                parent,
+        apply_recovered_record(store, record)?;
+    }
+    Ok(())
+}
+
+fn apply_recovered_record(
+    store: &mut PersistentHistoryStore,
+    record: &HistoryLogRecord,
+) -> Result<(), HistoryError> {
+    match record {
+        HistoryLogRecord::CreateHistory { history, binding } => {
+            store.replay_create(*history, binding.as_deref())?;
+        }
+        HistoryLogRecord::Commit {
+            history,
+            version,
+            parent,
+            payload,
+            request_id,
+            binding,
+            digest,
+        } => {
+            let assigned = store.replay_commit(
+                *history,
+                *version,
+                *parent,
                 payload,
-                request_id,
-                binding,
-                digest,
-            } => {
-                let assigned = store.replay_commit(
-                    *history,
-                    *version,
-                    *parent,
-                    payload,
-                    request_id.as_deref(),
-                    binding.as_deref(),
-                    *digest,
-                )?;
-                if assigned != *version {
-                    return Err(HistoryError::Invalid(
-                        "history log version identity disagrees with replay order",
-                    ));
-                }
-            }
-            HistoryLogRecord::Retire { request_id, digest } => {
-                store.replay_retire(request_id, *digest)?;
+                request_id.as_deref(),
+                binding.as_deref(),
+                *digest,
+            )?;
+            if assigned != *version {
+                return Err(HistoryError::Invalid(
+                    "history log version identity disagrees with replay order",
+                ));
             }
         }
+        HistoryLogRecord::Retire { request_id, digest } => {
+            store.replay_retire(request_id, *digest)?;
+        }
     }
-    Ok(store)
+    Ok(())
 }
 
 /// Append-only file handle for one history log, tracking the replayed logical
@@ -587,6 +607,43 @@ impl DurableHistoryLog {
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Opens a generation hot log for writing, holding an exclusive
+    /// non-blocking file lock for the handle lifetime.
+    ///
+    /// A second concurrent writer fails with a contended-lock I/O error
+    /// (`WouldBlock` kind on unix plus the `fs4` contended marker): callers
+    /// map exactly that to an explicit already-open rejection, mirroring the
+    /// store writer lock. The lock covers the hot file itself so seal can
+    /// hold the old generation while opening the next one without
+    /// self-deadlock; cross-generation safety comes from manifest-driven
+    /// recovery, which never reads a superseded hot file.
+    pub(crate) fn open_write(path: &Path) -> std::io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        file.try_lock_exclusive()?;
+        file.try_lock_exclusive()?;
+        let mut log = Self {
+            file,
+            path: path.to_path_buf(),
+            tail: 0,
+        };
+        log.tail = scan_log_tail(&log.read_all()?).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+        })?;
+        Ok(log)
+    }
+
+    /// Returns true when the underlying lock failure signals contention
+    /// rather than a genuine I/O error.
+    pub(crate) fn is_lock_contention(error: &std::io::Error) -> bool {
+        error.kind() == std::io::ErrorKind::WouldBlock
+            || error.raw_os_error() == fs4::lock_contended_error().raw_os_error()
     }
 
     /// Appends one complete frame at the logical tail, discarding any torn
