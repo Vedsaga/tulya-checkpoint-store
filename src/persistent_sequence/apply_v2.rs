@@ -87,11 +87,12 @@ pub(super) struct V2RequestRecord {
 
 #[derive(Debug)]
 pub(super) struct V2PreparedSubtreeDelete {
-    delete_mask: Vec<u8>,
+    checkpoints: Vec<V2CheckpointRecord>,
     checkpoint_ordinals: HashMap<(String, String), u64>,
     request_records: HashMap<Vec<u8>, V2RequestRecord>,
     retired_requests: HashMap<Vec<u8>, [u8; 32]>,
     deleted_checkpoints: HashSet<(String, String)>,
+    clear_sequence_geometry: bool,
     deleted_checkpoint_count: u64,
 }
 
@@ -249,26 +250,22 @@ impl V2CommittedState {
         prepared: V2PreparedSubtreeDelete,
     ) {
         let V2PreparedSubtreeDelete {
-            delete_mask,
+            checkpoints,
             checkpoint_ordinals,
             request_records,
             retired_requests,
             deleted_checkpoints,
+            clear_sequence_geometry,
             deleted_checkpoint_count: _,
         } = prepared;
 
-        let mut index = 0usize;
-        self.checkpoints.retain(|_| {
-            let retain = delete_mask.get(index).copied().unwrap_or(1) == 0;
-            index = index.saturating_add(1);
-            retain
-        });
+        self.checkpoints = checkpoints;
         self.checkpoint_ordinals = checkpoint_ordinals;
         self.request_records = request_records;
         self.retired_requests = retired_requests;
         self.deleted_checkpoints = deleted_checkpoints;
 
-        if self.checkpoints.is_empty() {
+        if clear_sequence_geometry {
             self.payload.clear();
             self.nodes.clear();
             self.versions.clear();
@@ -295,10 +292,9 @@ impl V2CommittedState {
             if let Some(parent) = checkpoint.parent_checkpoint_id.as_deref() {
                 validate_checkpoint_identifier(parent)?;
             }
-            if self.deleted_checkpoints.contains(&(
-                checkpoint.thread_id.clone(),
-                checkpoint.checkpoint_id.clone(),
-            )) {
+            if self.deleted_checkpoints.iter().any(|(thread_id, checkpoint_id)| {
+                thread_id == &checkpoint.thread_id && checkpoint_id == &checkpoint.checkpoint_id
+            }) {
                 return Err(V2ApplyError::Invalid(
                     "v2 checkpoint identity is both live and deleted",
                 ));
@@ -398,10 +394,21 @@ impl V2CommittedState {
         let deleted_checkpoint_count = u64::try_from(deleted_count)
             .map_err(|_| V2ApplyError::Overflow("v2 deleted checkpoint count exceeds u64"))?;
 
+        let mut checkpoints = Vec::new();
+        checkpoints
+            .try_reserve_exact(retained_count)
+            .map_err(|_| V2ApplyError::Capacity("v2 retained checkpoint table allocation failed"))?;
+
         let mut checkpoint_ordinals = HashMap::new();
         checkpoint_ordinals
             .try_reserve(retained_count)
             .map_err(|_| V2ApplyError::Capacity("v2 retained checkpoint index allocation failed"))?;
+
+        let mut new_ordinals = Vec::new();
+        new_ordinals
+            .try_reserve_exact(self.checkpoints.len())
+            .map_err(|_| V2ApplyError::Capacity("v2 checkpoint ordinal map allocation failed"))?;
+        new_ordinals.resize(self.checkpoints.len(), None);
 
         let final_deleted_count = self
             .deleted_checkpoints
@@ -425,8 +432,11 @@ impl V2CommittedState {
                 let key = try_clone_checkpoint_key(&checkpoint.thread_id, &checkpoint.checkpoint_id)?;
                 let _ = deleted_checkpoints.insert(key);
             } else {
+                let retained = try_clone_checkpoint_record(checkpoint)?;
                 let key = try_clone_checkpoint_key(&checkpoint.thread_id, &checkpoint.checkpoint_id)?;
+                checkpoints.push(retained);
                 let _ = checkpoint_ordinals.insert(key, next_ordinal);
+                new_ordinals[index] = Some(next_ordinal);
                 next_ordinal = next_ordinal
                     .checked_add(1)
                     .ok_or(V2ApplyError::Overflow("v2 retained checkpoint ordinal exceeds u64"))?;
@@ -488,21 +498,12 @@ impl V2CommittedState {
             if deleted {
                 let _ = retired_requests.insert(key, record.operation_digest);
             } else {
-                let checkpoint = self
-                    .checkpoints
+                let new_ordinal = new_ordinals
                     .get(old_index)
+                    .copied()
+                    .flatten()
                     .ok_or(V2ApplyError::Invalid(
-                        "v2 retained request checkpoint is outside the checkpoint table",
-                    ))?;
-                let new_ordinal = checkpoint_ordinals
-                    .iter()
-                    .find_map(|((thread_id, checkpoint_id), ordinal)| {
-                        (thread_id == &checkpoint.thread_id
-                            && checkpoint_id == &checkpoint.checkpoint_id)
-                            .then_some(*ordinal)
-                    })
-                    .ok_or(V2ApplyError::Invalid(
-                        "v2 retained request checkpoint is absent from the prepared index",
+                        "v2 retained request checkpoint is absent from the prepared ordinal map",
                     ))?;
                 let _ = request_records.insert(
                     key,
@@ -515,14 +516,16 @@ impl V2CommittedState {
         }
 
         Ok(V2PreparedSubtreeDelete {
-            delete_mask,
+            checkpoints,
             checkpoint_ordinals,
             request_records,
             retired_requests,
             deleted_checkpoints,
+            clear_sequence_geometry: retained_count == 0,
             deleted_checkpoint_count,
         })
     }
+}
 }
 
 pub(super) fn apply_v2_commit(
@@ -793,6 +796,25 @@ fn try_clone_checkpoint_key(
         try_clone_string(thread_id)?,
         try_clone_string(checkpoint_id)?,
     ))
+}
+
+fn try_clone_checkpoint_record(
+    checkpoint: &V2CheckpointRecord,
+) -> Result<V2CheckpointRecord, V2ApplyError> {
+    Ok(V2CheckpointRecord {
+        checkpoint_no: checkpoint.checkpoint_no,
+        thread_id: try_clone_string(&checkpoint.thread_id)?,
+        checkpoint_id: try_clone_string(&checkpoint.checkpoint_id)?,
+        parent_checkpoint_id: checkpoint
+            .parent_checkpoint_id
+            .as_deref()
+            .map(try_clone_string)
+            .transpose()?,
+        identity_version: checkpoint.identity_version,
+        messages_version: checkpoint.messages_version,
+        result_version: checkpoint.result_version,
+        state: checkpoint.state,
+    })
 }
 
 fn validate_request_id(request_id: &[u8]) -> Result<(), V2ApplyError> {
