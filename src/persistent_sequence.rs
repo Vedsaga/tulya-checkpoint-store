@@ -48,6 +48,11 @@ mod snapshot_v2;
 #[allow(dead_code)]
 mod transaction_v2;
 
+use avl::{V2AvlError, V2AvlSequence};
+use format_v2::V2RootRecord;
+use std::cell::Cell;
+use std::fmt;
+
 /// Logical byte length of a persistent sequence.
 ///
 /// Persistent lengths stay in a fixed-width integer. Conversion to `usize`
@@ -77,9 +82,14 @@ impl LogicalLength {
 /// `LegacyV1` names the pre-release left-deep DAG representation. It does not
 /// claim the balanced-tree or persisted-subtree-length guarantees required by
 /// the production locality gate.
+///
+/// `BalancedV2` names the release-candidate balanced AVL representation. Roots
+/// re-entering the backend resolve their node identifier against the arena;
+/// caller-supplied lengths must agree exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SequenceRepresentation {
     LegacyV1,
+    BalancedV2,
 }
 
 /// Typed root metadata consumed by checkpoint code.
@@ -102,6 +112,22 @@ impl PersistentRoot {
             node_id,
             logical_len,
             representation: SequenceRepresentation::LegacyV1,
+        }
+    }
+
+    /// Names a balanced-sequence root by arena position and exact length.
+    ///
+    /// The backend resolves the identifier against its arena on every call,
+    /// so a forged length fails closed instead of misdirecting traversal.
+    ///
+    /// Staged in P1.1: first production callers land in P1.2, which removes
+    /// this allowance.
+    #[allow(dead_code)]
+    pub(crate) const fn balanced_v2(node_id: u64, logical_len: LogicalLength) -> Self {
+        Self {
+            node_id,
+            logical_len,
+            representation: SequenceRepresentation::BalancedV2,
         }
     }
 
@@ -178,6 +204,190 @@ pub(crate) trait PersistentSequence {
     ) -> Result<(), Self::Error>;
 }
 
+/// Fallible sequence failure for the production seam.
+///
+/// Staged backend failures surface transparently so diagnostics are never
+/// flattened at the seam boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SequenceError {
+    Avl(V2AvlError),
+    Invalid(&'static str),
+}
+
+impl fmt::Display for SequenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Avl(error) => write!(formatter, "{error}"),
+            Self::Invalid(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for SequenceError {}
+
+impl From<V2AvlError> for SequenceError {
+    fn from(error: V2AvlError) -> Self {
+        Self::Avl(error)
+    }
+}
+
+/// Cumulative diagnostic work counters for one sequence backend.
+///
+/// Counters use saturating arithmetic deliberately: they must make locality
+/// regressions observable without ever failing a storage operation. Tests
+/// snapshot these values around single operations and assert deltas.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SequenceWorkCounters {
+    pub(crate) nodes_allocated: u64,
+    pub(crate) nodes_read: u64,
+    pub(crate) payload_bytes_read: u64,
+    pub(crate) payload_bytes_written: u64,
+}
+
+/// Writable persistent byte-sequence operations.
+///
+/// This is the write capability of the production seam. The legacy adapter is
+/// intentionally read-only behind [`PersistentSequence`]; only the balanced
+/// backend implements this trait today, and its `CheckpointStore` callers land
+/// in the next integration slice.
+///
+/// Staged in P1.1: first production callers land in P1.2, which removes this
+/// allowance.
+#[allow(dead_code)]
+pub(crate) trait PersistentSequenceAppend {
+    type Error;
+
+    /// Appends `bytes` to `parent` (or creates a root for `None`) without
+    /// mutating any retained history, and returns the new root.
+    fn append(
+        &mut self,
+        parent: Option<PersistentRoot>,
+        bytes: &[u8],
+    ) -> Result<PersistentRoot, Self::Error>;
+
+    /// Recomputes every reachable node's metadata and commitment.
+    fn verify(&self, root: PersistentRoot) -> Result<(), Self::Error>;
+}
+
+/// In-memory balanced persistent-sequence backend behind the production seam.
+///
+/// Wraps the staged AVL core without reimplementing tree logic. Every root
+/// re-entering through [`PersistentRoot`] resolves its arena position to
+/// canonical metadata, so forged lengths or unknown identifiers fail closed
+/// inside the core's existing checks.
+pub(crate) struct BalancedSequence {
+    inner: V2AvlSequence,
+    work: Cell<SequenceWorkCounters>,
+}
+
+impl BalancedSequence {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: V2AvlSequence::default(),
+            work: Cell::new(SequenceWorkCounters::default()),
+        }
+    }
+
+    /// Returns a snapshot of the cumulative diagnostic work counters.
+    ///
+    /// Staged in P1.1: first production callers land in P1.2, which removes
+    /// this allowance.
+    #[allow(dead_code)]
+    pub(crate) fn work_counters(&self) -> SequenceWorkCounters {
+        self.work.get()
+    }
+
+    fn resolve(&self, root: PersistentRoot) -> Result<V2RootRecord, SequenceError> {
+        if root.representation() != SequenceRepresentation::BalancedV2 {
+            return Err(SequenceError::Invalid(
+                "balanced sequence backend received an incompatible root",
+            ));
+        }
+        let canonical = self.inner.root_for_node_id(root.node_id())?;
+        if canonical.logical_len() != root.logical_len().get() {
+            return Err(SequenceError::Invalid(
+                "balanced sequence root length disagrees with arena",
+            ));
+        }
+        Ok(canonical)
+    }
+
+    fn note_read(&self, nodes: u64, payload_bytes: usize) {
+        let payload_bytes = u64::try_from(payload_bytes).unwrap_or(u64::MAX);
+        let mut work = self.work.get();
+        work.nodes_read = work.nodes_read.saturating_add(nodes);
+        work.payload_bytes_read = work.payload_bytes_read.saturating_add(payload_bytes);
+        self.work.set(work);
+    }
+
+    /// Staged in P1.1: first production callers land in P1.2, which removes
+    /// this allowance.
+    #[allow(dead_code)]
+    fn note_written(&self, nodes: usize, payload_bytes: usize) {
+        let nodes = u64::try_from(nodes).unwrap_or(u64::MAX);
+        let payload_bytes = u64::try_from(payload_bytes).unwrap_or(u64::MAX);
+        let mut work = self.work.get();
+        work.nodes_allocated = work.nodes_allocated.saturating_add(nodes);
+        work.payload_bytes_written = work.payload_bytes_written.saturating_add(payload_bytes);
+        self.work.set(work);
+    }
+}
+
+impl Default for BalancedSequence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PersistentSequence for BalancedSequence {
+    type Error = SequenceError;
+
+    fn logical_len(&self, root: PersistentRoot) -> Result<LogicalLength, Self::Error> {
+        Ok(LogicalLength::new(self.resolve(root)?.logical_len()))
+    }
+
+    fn read_range(
+        &self,
+        root: PersistentRoot,
+        range: SequenceRange,
+        output: &mut Vec<u8>,
+    ) -> Result<(), Self::Error> {
+        let canonical = self.resolve(root)?;
+        let (bytes, visited) =
+            self.inner
+                .read_range_counted(canonical, range.offset().get(), range.length().get())?;
+        output.extend_from_slice(&bytes);
+        self.note_read(visited, bytes.len());
+        Ok(())
+    }
+}
+
+impl PersistentSequenceAppend for BalancedSequence {
+    type Error = SequenceError;
+
+    fn append(
+        &mut self,
+        parent: Option<PersistentRoot>,
+        bytes: &[u8],
+    ) -> Result<PersistentRoot, Self::Error> {
+        let resolved = parent.map(|root| self.resolve(root)).transpose()?;
+        let result = self.inner.append(resolved, bytes)?;
+        self.note_written(result.allocated_nodes(), bytes.len());
+        let root = result.root();
+        Ok(PersistentRoot::balanced_v2(
+            root.node_id(),
+            LogicalLength::new(root.logical_len()),
+        ))
+    }
+
+    fn verify(&self, root: PersistentRoot) -> Result<(), Self::Error> {
+        let canonical = self.resolve(root)?;
+        let visited = self.inner.verify_root_counted(canonical)?;
+        self.note_read(visited, 0);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,5 +411,206 @@ mod tests {
         assert_eq!(root.node_id(), 41);
         assert_eq!(root.logical_len().get(), 8192);
         assert_eq!(root.representation(), SequenceRepresentation::LegacyV1);
+    }
+
+    fn balanced_fixture() -> BalancedSequence {
+        BalancedSequence::new()
+    }
+
+    fn read_full(sequence: &BalancedSequence, root: PersistentRoot) -> Vec<u8> {
+        let mut output = Vec::new();
+        let range =
+            SequenceRange::new(LogicalLength::new(0), sequence.logical_len(root).unwrap()).unwrap();
+        sequence.read_range(root, range, &mut output).unwrap();
+        output
+    }
+
+    #[test]
+    fn balanced_root_creation_reports_exact_metadata() {
+        let mut sequence = balanced_fixture();
+        let root = sequence.append(None, b"hello").unwrap();
+        assert_eq!(root.representation(), SequenceRepresentation::BalancedV2);
+        assert_eq!(root.node_id(), 0);
+        assert_eq!(root.logical_len(), LogicalLength::new(5));
+        assert_eq!(sequence.logical_len(root).unwrap(), LogicalLength::new(5));
+        assert_eq!(read_full(&sequence, root), b"hello");
+    }
+
+    #[test]
+    fn balanced_append_preserves_parent_and_extends_content() {
+        let mut sequence = balanced_fixture();
+        let parent = sequence.append(None, b"foo").unwrap();
+        let child = sequence.append(Some(parent), b"bar").unwrap();
+        assert_eq!(sequence.logical_len(child).unwrap(), LogicalLength::new(6));
+        assert_eq!(read_full(&sequence, parent), b"foo");
+        assert_eq!(read_full(&sequence, child), b"foobar");
+    }
+
+    #[test]
+    fn balanced_append_from_old_root_preserves_every_history() {
+        let mut sequence = balanced_fixture();
+        let root_a = sequence.append(None, b"aaa").unwrap();
+        let root_b = sequence.append(Some(root_a), b"bbb").unwrap();
+        let root_c = sequence.append(Some(root_b), b"ccc").unwrap();
+        let root_d = sequence.append(Some(root_a), b"ddd").unwrap();
+        assert_eq!(read_full(&sequence, root_a), b"aaa");
+        assert_eq!(read_full(&sequence, root_b), b"aaabbb");
+        assert_eq!(read_full(&sequence, root_c), b"aaabbbccc");
+        assert_eq!(read_full(&sequence, root_d), b"aaaddd");
+    }
+
+    #[test]
+    fn balanced_sibling_branches_share_parent_byte_exact() {
+        let mut sequence = balanced_fixture();
+        let parent = sequence.append(None, b"parent").unwrap();
+        let left = sequence.append(Some(parent), b"-left").unwrap();
+        let right = sequence.append(Some(parent), b"-right").unwrap();
+        assert_ne!(left.node_id(), right.node_id());
+        assert_eq!(read_full(&sequence, parent), b"parent");
+        assert_eq!(read_full(&sequence, left), b"parent-left");
+        assert_eq!(read_full(&sequence, right), b"parent-right");
+    }
+
+    #[test]
+    fn balanced_arbitrary_range_read_is_exact_across_leaves() {
+        let mut sequence = balanced_fixture();
+        let mut root = sequence.append(None, b"aa").unwrap();
+        for chunk in [b"bb", b"cc", b"dd", b"ee"] {
+            root = sequence.append(Some(root), chunk).unwrap();
+        }
+        assert_eq!(read_full(&sequence, root), b"aabbccddee");
+        let mut output = Vec::new();
+        let range = SequenceRange::new(LogicalLength::new(1), LogicalLength::new(6)).unwrap();
+        sequence.read_range(root, range, &mut output).unwrap();
+        assert_eq!(output, b"abbccd");
+
+        let mut empty = Vec::new();
+        let zero = SequenceRange::new(LogicalLength::new(3), LogicalLength::new(0)).unwrap();
+        sequence.read_range(root, zero, &mut empty).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn balanced_verify_accepts_valid_and_rejects_tampered_roots() {
+        let mut sequence = balanced_fixture();
+        let root = sequence.append(None, b"data").unwrap();
+        let child = sequence.append(Some(root), b"more").unwrap();
+        sequence.verify(root).unwrap();
+        sequence.verify(child).unwrap();
+
+        let tampered_len = PersistentRoot::balanced_v2(root.node_id(), LogicalLength::new(999));
+        assert_eq!(
+            sequence.verify(tampered_len),
+            Err(SequenceError::Invalid(
+                "balanced sequence root length disagrees with arena"
+            ))
+        );
+        let unknown = PersistentRoot::balanced_v2(999_999, LogicalLength::new(4));
+        assert!(sequence.verify(unknown).is_err());
+        assert!(sequence.logical_len(unknown).is_err());
+    }
+
+    #[test]
+    fn balanced_read_rejects_out_of_range_and_huge_lengths() {
+        let mut sequence = balanced_fixture();
+        let root = sequence.append(None, b"abc").unwrap();
+
+        let mut output = Vec::new();
+        let past_end = SequenceRange::new(LogicalLength::new(2), LogicalLength::new(2)).unwrap();
+        assert!(sequence.read_range(root, past_end, &mut output).is_err());
+        assert!(output.is_empty());
+
+        // A u64::MAX length must fail closed before any allocation attempt.
+        let mut huge = Vec::new();
+        let unbounded =
+            SequenceRange::new(LogicalLength::new(0), LogicalLength::new(u64::MAX)).unwrap();
+        assert!(sequence.read_range(root, unbounded, &mut huge).is_err());
+        assert!(huge.is_empty());
+
+        // A forged maximal length on a valid identifier fails on metadata,
+        // never by trusting the claimed length.
+        let forged = PersistentRoot::balanced_v2(root.node_id(), LogicalLength::new(u64::MAX));
+        let mut forged_output = Vec::new();
+        let full = SequenceRange::new(LogicalLength::new(0), LogicalLength::new(3)).unwrap();
+        assert!(sequence
+            .read_range(forged, full, &mut forged_output)
+            .is_err());
+        assert!(forged_output.is_empty());
+    }
+
+    #[test]
+    fn balanced_append_rejects_empty_payload() {
+        let mut sequence = balanced_fixture();
+        let root = sequence.append(None, b"abc").unwrap();
+        assert!(sequence.append(Some(root), b"").is_err());
+        assert!(sequence.append(None, b"").is_err());
+        assert_eq!(read_full(&sequence, root), b"abc");
+    }
+
+    #[test]
+    fn balanced_backend_rejects_foreign_representation() {
+        let sequence = balanced_fixture();
+        let legacy = PersistentRoot::legacy_v1(0, LogicalLength::new(3));
+        assert_eq!(
+            sequence.logical_len(legacy),
+            Err(SequenceError::Invalid(
+                "balanced sequence backend received an incompatible root"
+            ))
+        );
+    }
+
+    #[test]
+    fn balanced_work_counters_observe_locality() {
+        let mut sequence = balanced_fixture();
+        let before = sequence.work_counters();
+        let root = sequence.append(None, b"x").unwrap();
+        let after_create = sequence.work_counters();
+        assert_eq!(
+            after_create.payload_bytes_written - before.payload_bytes_written,
+            1
+        );
+        assert!(after_create.nodes_allocated - before.nodes_allocated >= 1);
+        // Creating the root reads no parent bytes: there is nothing to hash.
+        assert_eq!(after_create.nodes_read, before.nodes_read);
+
+        let parent_bytes = vec![b'p'; 4096];
+        let big = sequence.append(None, &parent_bytes).unwrap();
+        let before_append = sequence.work_counters();
+        let child = sequence.append(Some(big), b"delta").unwrap();
+        let after_append = sequence.work_counters();
+        assert_eq!(
+            after_append.payload_bytes_written - before_append.payload_bytes_written,
+            5
+        );
+        // One leaf plus a logarithmic AVL spine: nowhere near a whole-parent
+        // copy of 4096 payload bytes into hundreds of nodes.
+        assert!((after_append.nodes_allocated - before_append.nodes_allocated) <= 8);
+        // The append path performs no counted read traversal of the parent:
+        // this is the regression tripwire for whole-parent reconstruction.
+        assert_eq!(after_append.nodes_read, before_append.nodes_read);
+        assert_eq!(
+            after_append.payload_bytes_read,
+            before_append.payload_bytes_read
+        );
+
+        let before_read = sequence.work_counters();
+        let mut output = Vec::new();
+        let range = SequenceRange::new(LogicalLength::new(0), LogicalLength::new(5)).unwrap();
+        sequence.read_range(child, range, &mut output).unwrap();
+        let after_read = sequence.work_counters();
+        assert_eq!(output, b"ppppp");
+        assert!(after_read.nodes_read > before_read.nodes_read);
+        assert_eq!(
+            after_read.payload_bytes_read - before_read.payload_bytes_read,
+            5
+        );
+
+        let before_verify = sequence.work_counters();
+        sequence.verify(child).unwrap();
+        let after_verify = sequence.work_counters();
+        assert!(after_verify.nodes_read > before_verify.nodes_read);
+
+        assert_eq!(read_full(&sequence, root), b"x");
+        assert_eq!(sequence.logical_len(big).unwrap(), LogicalLength::new(4096));
     }
 }

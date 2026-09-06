@@ -33,7 +33,7 @@ impl V2Commitment {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum V2FormatError {
+pub(crate) enum V2FormatError {
     RecordLength {
         record: &'static str,
         expected: usize,

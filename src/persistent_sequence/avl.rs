@@ -13,7 +13,7 @@ use super::image_v2::{
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum V2AvlError {
+pub(crate) enum V2AvlError {
     Format(V2FormatError),
     Image(V2ImageError),
     Invalid(&'static str),
@@ -129,6 +129,18 @@ impl V2AvlSequence {
         offset: u64,
         length: u64,
     ) -> Result<Vec<u8>, V2AvlError> {
+        Ok(self.read_range_counted(root, offset, length)?.0)
+    }
+
+    /// Returns an exact logical byte range plus the number of arena nodes
+    /// traversed. The count makes future locality regressions observable; it
+    /// does not change traversal semantics.
+    pub(super) fn read_range_counted(
+        &self,
+        root: V2RootRecord,
+        offset: u64,
+        length: u64,
+    ) -> Result<(Vec<u8>, u64), V2AvlError> {
         self.node_for_root(root)?;
         let end = offset
             .checked_add(length)
@@ -140,11 +152,13 @@ impl V2AvlSequence {
             .map_err(|_| V2AvlError::Overflow("v2 range length exceeds usize"))?;
         let mut output = Vec::with_capacity(capacity);
         if length == 0 {
-            return Ok(output);
+            return Ok((output, 0));
         }
 
+        let mut visited = 0u64;
         let mut stack = vec![(root, offset, length)];
         while let Some((current, local_offset, local_length)) = stack.pop() {
+            visited = visited.saturating_add(1);
             match self.node_for_root(current)? {
                 ArenaNode::Leaf {
                     payload_offset,
@@ -189,13 +203,21 @@ impl V2AvlSequence {
                 "v2 range traversal produced an unexpected byte count",
             ));
         }
-        Ok(output)
+        Ok((output, visited))
     }
 
     /// Recomputes every reachable node's metadata and commitment.
     pub(super) fn verify_root(&self, root: V2RootRecord) -> Result<(), V2AvlError> {
-        self.verify_node(root)?;
+        let _ = self.verify_root_counted(root)?;
         Ok(())
+    }
+
+    /// Verifies like [`V2AvlSequence::verify_root`] and reports how many arena
+    /// nodes were revalidated.
+    pub(super) fn verify_root_counted(&self, root: V2RootRecord) -> Result<u64, V2AvlError> {
+        let mut visited = 0u64;
+        self.verify_node(root, &mut visited)?;
+        Ok(visited)
     }
 
     pub(super) fn node_count(&self) -> usize {
@@ -420,7 +442,12 @@ impl V2AvlSequence {
         }
     }
 
-    fn root_for_node_id(&self, node_id: u64) -> Result<V2RootRecord, V2AvlError> {
+    /// Resolves an arena position to its canonical root metadata.
+    ///
+    /// Exposed to the production seam so a [`PersistentRoot`](super::PersistentRoot)
+    /// re-entering the backend resolves against the actual arena node instead
+    /// of trusting caller-supplied metadata.
+    pub(super) fn root_for_node_id(&self, node_id: u64) -> Result<V2RootRecord, V2AvlError> {
         let index = usize::try_from(node_id)
             .map_err(|_| V2AvlError::Overflow("v2 node identifier exceeds usize"))?;
         let node = self.nodes.get(index).ok_or(V2AvlError::Invalid(
@@ -454,7 +481,8 @@ impl V2AvlSequence {
             .ok_or(V2AvlError::Invalid("v2 payload range is outside the arena"))
     }
 
-    fn verify_node(&self, root: V2RootRecord) -> Result<(), V2AvlError> {
+    fn verify_node(&self, root: V2RootRecord, visited: &mut u64) -> Result<(), V2AvlError> {
+        *visited = visited.saturating_add(1);
         match self.node_for_root(root)? {
             ArenaNode::Leaf {
                 payload_offset,
@@ -479,8 +507,8 @@ impl V2AvlSequence {
                 right,
                 record,
             } => {
-                self.verify_node(*left)?;
-                self.verify_node(*right)?;
+                self.verify_node(*left, visited)?;
+                self.verify_node(*right, visited)?;
                 let expected = V2NodeRecord::branch(*left, *right)?;
                 if expected != *record {
                     return Err(V2AvlError::Invalid(
