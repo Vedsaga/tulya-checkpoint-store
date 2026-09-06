@@ -1,0 +1,200 @@
+{
+  "schema": "tulya-format-v2-conformance-v1",
+  "operation_digest_vectors": [
+    {
+      "name": "initial-checkpoint",
+      "checkpoint_no": 1,
+      "thread_id": "thread",
+      "checkpoint_id": "cp-1",
+      "parent_checkpoint_id": null,
+      "identity_version": 0,
+      "state_payload_hex": "616263",
+      "expected_operation_digest_hex": "6e0363445809801219e0a146b177509d7a74ff7cbff1ee35013d94ad433e9eda"
+    },
+    {
+      "name": "identity-version-relocation-does-not-change-digest",
+      "checkpoint_no": 1,
+      "thread_id": "thread",
+      "checkpoint_id": "cp-1",
+      "parent_checkpoint_id": null,
+      "identity_version": 42,
+      "state_payload_hex": "616263",
+      "expected_operation_digest_hex": "6e0363445809801219e0a146b177509d7a74ff7cbff1ee35013d94ad433e9eda"
+    }
+  ],
+  "request_lifecycle_vectors": [
+    {
+      "name": "active-same-digest-is-replay",
+      "active": [
+        {
+          "request_id_hex": "7265712d31",
+          "operation_digest_hex": "6e0363445809801219e0a146b177509d7a74ff7cbff1ee35013d94ad433e9eda",
+          "checkpoint_ordinal": 7
+        }
+      ],
+      "retired": [],
+      "query": {
+        "request_id_hex": "7265712d31",
+        "operation_digest_hex": "6e0363445809801219e0a146b177509d7a74ff7cbff1ee35013d94ad433e9eda"
+      },
+      "expected": "replay",
+      "expected_checkpoint_ordinal": 7,
+      "mutates": false
+    },
+    {
+      "name": "active-different-digest-is-conflict",
+      "active": [
+        {
+          "request_id_hex": "7265712d31",
+          "operation_digest_hex": "6e0363445809801219e0a146b177509d7a74ff7cbff1ee35013d94ad433e9eda",
+          "checkpoint_ordinal": 7
+        }
+      ],
+      "retired": [],
+      "query": {
+        "request_id_hex": "7265712d31",
+        "operation_digest_hex": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "expected": "conflict",
+      "expected_checkpoint_ordinal": null,
+      "mutates": false
+    },
+    {
+      "name": "retired-same-digest-is-nonresurrecting",
+      "active": [],
+      "retired": [
+        {
+          "request_id_hex": "7265712d31",
+          "operation_digest_hex": "6e0363445809801219e0a146b177509d7a74ff7cbff1ee35013d94ad433e9eda"
+        }
+      ],
+      "query": {
+        "request_id_hex": "7265712d31",
+        "operation_digest_hex": "6e0363445809801219e0a146b177509d7a74ff7cbff1ee35013d94ad433e9eda"
+      },
+      "expected": "retired",
+      "expected_checkpoint_ordinal": null,
+      "mutates": false
+    },
+    {
+      "name": "retired-different-digest-is-conflict",
+      "active": [],
+      "retired": [
+        {
+          "request_id_hex": "7265712d31",
+          "operation_digest_hex": "6e0363445809801219e0a146b177509d7a74ff7cbff1ee35013d94ad433e9eda"
+        }
+      ],
+      "query": {
+        "request_id_hex": "7265712d31",
+        "operation_digest_hex": "2222222222222222222222222222222222222222222222222222222222222222"
+      },
+      "expected": "conflict",
+      "expected_checkpoint_ordinal": null,
+      "mutates": false
+    },
+    {
+      "name": "unknown-identity-is-new",
+      "active": [],
+      "retired": [],
+      "query": {
+        "request_id_hex": "7265712d32",
+        "operation_digest_hex": "3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "expected": "new",
+      "expected_checkpoint_ordinal": null,
+      "mutates": false
+    }
+  ],
+  "deletion_vectors": [
+    {
+      "name": "delete-middle-subtree-retains-sibling",
+      "base_state_payload_hex": "616263",
+      "checkpoints": [
+        {
+          "checkpoint_no": 1,
+          "thread_id": "thread",
+          "checkpoint_id": "cp-1",
+          "parent_checkpoint_id": null,
+          "identity_version": 0,
+          "request_id_hex": "7265712d31"
+        },
+        {
+          "checkpoint_no": 2,
+          "thread_id": "thread",
+          "checkpoint_id": "cp-2",
+          "parent_checkpoint_id": "cp-1",
+          "identity_version": 0,
+          "request_id_hex": "7265712d32"
+        },
+        {
+          "checkpoint_no": 3,
+          "thread_id": "thread",
+          "checkpoint_id": "cp-3",
+          "parent_checkpoint_id": "cp-2",
+          "identity_version": 0,
+          "request_id_hex": "7265712d33"
+        },
+        {
+          "checkpoint_no": 4,
+          "thread_id": "thread",
+          "checkpoint_id": "cp-sibling",
+          "parent_checkpoint_id": "cp-1",
+          "identity_version": 0,
+          "request_id_hex": "7265712d34"
+        },
+        {
+          "checkpoint_no": 5,
+          "thread_id": "other-thread",
+          "checkpoint_id": "other-root",
+          "parent_checkpoint_id": null,
+          "identity_version": 0,
+          "request_id_hex": "7265712d35"
+        }
+      ],
+      "delete": {
+        "thread_id": "thread",
+        "checkpoint_id": "cp-2"
+      },
+      "expected_live": [
+        ["thread", "cp-1"],
+        ["thread", "cp-sibling"],
+        ["other-thread", "other-root"]
+      ],
+      "expected_retired_request_ids_hex": ["7265712d32", "7265712d33"],
+      "expected_deleted": [
+        ["thread", "cp-2"],
+        ["thread", "cp-3"]
+      ],
+      "expected_active_request_ordinals": [
+        {"request_id_hex": "7265712d31", "checkpoint_ordinal": 0},
+        {"request_id_hex": "7265712d34", "checkpoint_ordinal": 1},
+        {"request_id_hex": "7265712d35", "checkpoint_ordinal": 2}
+      ],
+      "clear_sequence_geometry": false
+    },
+    {
+      "name": "delete-last-checkpoint-leaves-tombstone-only",
+      "base_state_payload_hex": "616263",
+      "checkpoints": [
+        {
+          "checkpoint_no": 1,
+          "thread_id": "thread",
+          "checkpoint_id": "cp-1",
+          "parent_checkpoint_id": null,
+          "identity_version": 0,
+          "request_id_hex": "7265712d31"
+        }
+      ],
+      "delete": {
+        "thread_id": "thread",
+        "checkpoint_id": "cp-1"
+      },
+      "expected_live": [],
+      "expected_retired_request_ids_hex": ["7265712d31"],
+      "expected_deleted": [["thread", "cp-1"]],
+      "expected_active_request_ordinals": [],
+      "clear_sequence_geometry": true
+    }
+  ]
+}
