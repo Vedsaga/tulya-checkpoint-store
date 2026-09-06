@@ -905,6 +905,31 @@ mod tests {
             },
         }
     }
+    fn checkpoint_only_transaction(
+        checkpoint_no: u32,
+        thread_id: &str,
+        checkpoint_id: &str,
+        parent_checkpoint_id: Option<&str>,
+        identity_version: u32,
+        state: V2StateMetadata,
+    ) -> V2WalTransaction {
+        V2WalTransaction {
+            payload: Vec::new(),
+            nodes: Vec::new(),
+            versions: Vec::new(),
+            checkpoint: V2CheckpointRecord {
+                checkpoint_no,
+                thread_id: thread_id.to_owned(),
+                checkpoint_id: checkpoint_id.to_owned(),
+                parent_checkpoint_id: parent_checkpoint_id.map(str::to_owned),
+                identity_version,
+                messages_version: None,
+                result_version: None,
+                state,
+            },
+        }
+    }
+
 
     #[test]
     fn retry_same_request_is_noop_and_conflicting_reuse_fails() {
@@ -1079,6 +1104,160 @@ mod tests {
             ))
         );
         assert_eq!(state.geometry().unwrap(), base);
+    }
+
+    #[test]
+    fn prepared_subtree_delete_is_atomic_and_remaps_request_ordinals() {
+        let mut state = V2CommittedState::default();
+
+        let first = initial_transaction("cp-1");
+        let first_encoded =
+            encode_v2_commit(V2WalGeometry::default(), &first, Some(b"req-1")).unwrap();
+        apply_v2_commit(&mut state, &first_encoded).unwrap();
+
+        let second_base = state.geometry().unwrap();
+        let second = child_transaction(second_base, false);
+        let second_digest = checkpoint_operation_digest(&second.checkpoint).unwrap();
+        let second_encoded =
+            encode_v2_commit(second_base, &second, Some(b"req-2")).unwrap();
+        apply_v2_commit(&mut state, &second_encoded).unwrap();
+
+        let third_base = state.geometry().unwrap();
+        let third = checkpoint_only_transaction(
+            3,
+            "thread",
+            "cp-3",
+            Some("cp-2"),
+            state.checkpoints[1].identity_version,
+            state.checkpoints[1].state,
+        );
+        let third_digest = checkpoint_operation_digest(&third.checkpoint).unwrap();
+        let third_encoded = encode_v2_commit(third_base, &third, Some(b"req-3")).unwrap();
+        apply_v2_commit(&mut state, &third_encoded).unwrap();
+
+        let other_base = state.geometry().unwrap();
+        let other = checkpoint_only_transaction(
+            4,
+            "other-thread",
+            "other-root",
+            None,
+            state.checkpoints[0].identity_version,
+            state.checkpoints[0].state,
+        );
+        let other_digest = checkpoint_operation_digest(&other.checkpoint).unwrap();
+        let other_encoded = encode_v2_commit(other_base, &other, Some(b"req-4")).unwrap();
+        apply_v2_commit(&mut state, &other_encoded).unwrap();
+
+        let before = state.geometry().unwrap();
+        let prepared = state
+            .prepare_delete_checkpoint_subtree("thread", "cp-2")
+            .unwrap();
+        assert_eq!(prepared.deleted_checkpoint_count(), 2);
+
+        // Preparation owns replacement ledgers and cannot mutate committed state.
+        assert_eq!(state.geometry().unwrap(), before);
+        assert_eq!(state.checkpoints.len(), 4);
+        assert_eq!(
+            state.classify_request(b"req-2", second_digest),
+            Ok(V2RequestStatus::Replay {
+                checkpoint_ordinal: 1
+            })
+        );
+        assert_eq!(
+            state.classify_request(b"req-4", other_digest),
+            Ok(V2RequestStatus::Replay {
+                checkpoint_ordinal: 3
+            })
+        );
+        assert!(state.deleted_checkpoints.is_empty());
+        assert!(state.retired_requests.is_empty());
+
+        state.apply_prepared_delete_checkpoint_subtree(prepared);
+
+        assert_eq!(state.checkpoints.len(), 2);
+        assert_eq!(state.checkpoints[0].checkpoint_id, "cp-1");
+        assert_eq!(state.checkpoints[1].checkpoint_id, "other-root");
+        assert_eq!(
+            state
+                .checkpoint_ordinals
+                .get(&("thread".to_owned(), "cp-1".to_owned())),
+            Some(&0)
+        );
+        assert_eq!(
+            state
+                .checkpoint_ordinals
+                .get(&("other-thread".to_owned(), "other-root".to_owned())),
+            Some(&1)
+        );
+        assert_eq!(
+            state.classify_request(b"req-2", second_digest),
+            Ok(V2RequestStatus::Retired)
+        );
+        assert_eq!(
+            state.classify_request(b"req-3", third_digest),
+            Ok(V2RequestStatus::Retired)
+        );
+        assert_eq!(
+            state.classify_request(b"req-4", other_digest),
+            Ok(V2RequestStatus::Replay {
+                checkpoint_ordinal: 1
+            })
+        );
+        assert!(state
+            .deleted_checkpoints
+            .contains(&("thread".to_owned(), "cp-2".to_owned())));
+        assert!(state
+            .deleted_checkpoints
+            .contains(&("thread".to_owned(), "cp-3".to_owned())));
+
+        let after = state.geometry().unwrap();
+        assert_eq!(after.payload_len, before.payload_len);
+        assert_eq!(after.node_count, before.node_count);
+        assert_eq!(after.version_count, before.version_count);
+        assert_eq!(after.checkpoint_count, 2);
+
+        assert_eq!(
+            apply_v2_commit(&mut state, &second_encoded),
+            Ok(V2ApplyOutcome::RetiredRequest)
+        );
+    }
+
+    #[test]
+    fn delete_prepare_failure_leaves_all_semantic_ledgers_unchanged() {
+        let mut state = V2CommittedState::default();
+        let first = initial_transaction("cp-1");
+        let first_encoded =
+            encode_v2_commit(V2WalGeometry::default(), &first, Some(b"req-1")).unwrap();
+        apply_v2_commit(&mut state, &first_encoded).unwrap();
+
+        let base = state.geometry().unwrap();
+        let second = child_transaction(base, false);
+        let second_encoded = encode_v2_commit(base, &second, Some(b"req-2")).unwrap();
+        apply_v2_commit(&mut state, &second_encoded).unwrap();
+
+        let active = state.request_records.get(b"req-2".as_slice()).unwrap().clone();
+        state.retired_requests.insert(b"req-2".to_vec(), [0x55; 32]);
+        let before = state.geometry().unwrap();
+
+        assert_eq!(
+            state.prepare_delete_checkpoint_subtree("thread", "cp-2"),
+            Err(V2ApplyError::Invalid(
+                "v2 request identity is both active and retired"
+            ))
+        );
+        assert_eq!(state.geometry().unwrap(), before);
+        assert_eq!(
+            state.request_records.get(b"req-2".as_slice()),
+            Some(&active)
+        );
+        assert_eq!(
+            state.retired_requests.get(b"req-2".as_slice()),
+            Some(&[0x55; 32])
+        );
+        assert!(state
+            .checkpoint_ordinals
+            .contains_key(&("thread".to_owned(), "cp-2".to_owned())));
+        assert!(state.deleted_checkpoints.is_empty());
     }
 
     #[test]
