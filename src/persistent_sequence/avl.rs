@@ -231,6 +231,10 @@ impl V2AvlSequence {
         self.nodes.len()
     }
 
+    pub(super) fn is_empty(&self) -> bool {
+        self.payload.is_empty() && self.nodes.is_empty()
+    }
+
     /// Encodes the complete append-only arena plus an explicit retained-root table.
     ///
     /// This is an O(total arena) snapshot operation for sealing/reopen work. It

@@ -208,13 +208,14 @@ pub(crate) trait PersistentSequence {
 pub(crate) enum SequenceError {
     Avl(V2AvlError),
     Invalid(&'static str),
+    Capacity(&'static str),
 }
 
 impl fmt::Display for SequenceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Avl(error) => write!(formatter, "{error}"),
-            Self::Invalid(message) => formatter.write_str(message),
+            Self::Invalid(message) | Self::Capacity(message) => formatter.write_str(message),
         }
     }
 }
@@ -291,6 +292,50 @@ impl BalancedSequence {
     /// Returns a snapshot of the cumulative diagnostic work counters.
     pub(crate) fn work_counters(&self) -> SequenceWorkCounters {
         self.work.get()
+    }
+
+    /// Reports whether the arena holds no payload or nodes.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Encodes the complete arena plus an explicit retained-root table as one
+    /// canonical image. The roots must arrive in the caller's canonical order
+    /// (the snapshot layer uses version order); each resolves against the
+    /// arena exactly like any re-entering root.
+    pub(crate) fn export_image(&self, roots: &[PersistentRoot]) -> Result<Vec<u8>, SequenceError> {
+        let mut canonical = Vec::new();
+        canonical
+            .try_reserve_exact(roots.len())
+            .map_err(|_| SequenceError::Capacity("sequence image root table allocation failed"))?;
+        for root in roots.iter().copied() {
+            canonical.push(self.resolve(root)?);
+        }
+        Ok(self.inner.export_image(&canonical)?)
+    }
+
+    /// Rebuilds a backend from one canonical image, returning the backend
+    /// plus the image's retained roots converted to seam roots. Every node
+    /// revalidates during import; the work counters start empty.
+    pub(crate) fn import_image(bytes: &[u8]) -> Result<(Self, Vec<PersistentRoot>), SequenceError> {
+        let (inner, roots) = avl::V2AvlSequence::import_image(bytes)?;
+        let mut seam_roots = Vec::new();
+        seam_roots
+            .try_reserve_exact(roots.len())
+            .map_err(|_| SequenceError::Capacity("sequence image root table allocation failed"))?;
+        for root in roots {
+            seam_roots.push(PersistentRoot::balanced_v2(
+                root.node_id(),
+                LogicalLength::new(root.logical_len()),
+            ));
+        }
+        Ok((
+            Self {
+                inner,
+                work: Cell::new(SequenceWorkCounters::default()),
+            },
+            seam_roots,
+        ))
     }
 
     fn resolve(&self, root: PersistentRoot) -> Result<V2RootRecord, SequenceError> {

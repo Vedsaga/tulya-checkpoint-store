@@ -34,6 +34,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 pub(crate) mod durable_log;
+pub(crate) mod snapshot;
 use durable_log::{DurableError, DurableHistoryLog, HistoryLogRecord};
 
 /// Domain separator for the generic history operation digest.
@@ -955,6 +956,130 @@ impl PersistentHistoryStore {
             ));
         }
         Ok(record)
+    }
+
+    /// Rebuilds a store from a decoded snapshot, revalidating every active
+    /// digest against freshly read payload bytes.
+    ///
+    /// Decode already enforced wire structure, dense tables, topological
+    /// parents, ordered ledgers, and bounds. Import additionally proves each
+    /// active request digest reproduces from the imported arena, so a
+    /// structurally valid snapshot with tampered payloads still fails closed.
+    pub(crate) fn import_snapshot(
+        snapshot: snapshot::HistorySnapshot,
+    ) -> Result<Self, HistoryError> {
+        let (backend, roots) = if snapshot.versions.is_empty() {
+            if !snapshot.image.is_empty() {
+                return Err(HistoryError::Invalid(
+                    "history snapshot image without versions is malformed",
+                ));
+            }
+            (BalancedSequence::new(), Vec::new())
+        } else {
+            BalancedSequence::import_image(&snapshot.image)?
+        };
+        if roots.len() != snapshot.versions.len() {
+            return Err(HistoryError::Invalid(
+                "history snapshot image roots disagree with its version table",
+            ));
+        }
+        let mut store = Self {
+            backend,
+            histories: HashSet::new(),
+            versions: Vec::new(),
+            next_history_id: snapshot.next_history_id,
+            next_version_id: snapshot.next_version_id,
+            active_requests: HashMap::new(),
+            retired_requests: HashMap::new(),
+            history_bindings: HashMap::new(),
+            version_bindings: HashMap::new(),
+            poisoned: false,
+        };
+        store
+            .histories
+            .try_reserve(snapshot.history_bindings.len())
+            .map_err(|_| HistoryError::Capacity("history snapshot import allocation failed"))?;
+        for (index, binding) in snapshot.history_bindings.iter().enumerate() {
+            let id = HistoryId::new(u64::try_from(index).map_err(|_| {
+                HistoryError::Overflow("history snapshot history identity exceeds u64")
+            })?);
+            let _ = store.histories.insert(id);
+            if let Some(bytes) = binding {
+                store.history_bindings.try_reserve(1).map_err(|_| {
+                    HistoryError::Capacity("history snapshot import allocation failed")
+                })?;
+                let _ = store.history_bindings.insert(id, bytes.clone());
+            }
+        }
+        store
+            .versions
+            .try_reserve(snapshot.versions.len())
+            .map_err(|_| HistoryError::Capacity("history snapshot import allocation failed"))?;
+        for (index, entry) in snapshot.versions.iter().enumerate() {
+            let id = VersionId::new(u64::try_from(index).map_err(|_| {
+                HistoryError::Overflow("history snapshot version identity exceeds u64")
+            })?);
+            store.versions.push(Version {
+                history: entry.history,
+                id,
+                parent: entry.parent,
+                root: roots[index],
+            });
+            if let Some(bytes) = &entry.binding {
+                store.version_bindings.try_reserve(1).map_err(|_| {
+                    HistoryError::Capacity("history snapshot import allocation failed")
+                })?;
+                let _ = store.version_bindings.insert(id, bytes.clone());
+            }
+        }
+        for record in &snapshot.active {
+            // Structural cross-references only: version existence and
+            // coordinate agreement. Operation digests bind commit deltas,
+            // which version content cannot reproduce, so digest authenticity
+            // traces to commit-time and log-replay validation while the
+            // artifact digest protects these bytes.
+            let version = store.version_record(record.version)?;
+            store
+                .active_requests
+                .try_reserve(1)
+                .map_err(|_| HistoryError::Capacity("history snapshot import allocation failed"))?;
+            if store
+                .active_requests
+                .insert(
+                    record.request_id.clone(),
+                    ActiveRequest {
+                        digest: record.digest,
+                        version: version.id(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(HistoryError::Invalid(
+                    "history snapshot active request identity is duplicated",
+                ));
+            }
+        }
+        for record in &snapshot.retired {
+            if store.active_requests.contains_key(&record.request_id) {
+                return Err(HistoryError::Invalid(
+                    "history snapshot request identity is both active and retired",
+                ));
+            }
+            store
+                .retired_requests
+                .try_reserve(1)
+                .map_err(|_| HistoryError::Capacity("history snapshot import allocation failed"))?;
+            if store
+                .retired_requests
+                .insert(record.request_id.clone(), record.digest)
+                .is_some()
+            {
+                return Err(HistoryError::Invalid(
+                    "history snapshot retired request identity is duplicated",
+                ));
+            }
+        }
+        Ok(store)
     }
 }
 
