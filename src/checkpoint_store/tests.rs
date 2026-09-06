@@ -2088,8 +2088,14 @@ fn candidate_durable_history_survives_reopen_without_legacy_write(
     assert!(store.read_checkpoint("thread-a", "cp-1").is_err());
     drop(store);
 
-    // Candidate files coexist with (and never disturb) the legacy store.
-    assert!(temp.path().join("history.wal").exists());
+    // Candidate files coexist with (and never disturb) the legacy store:
+    // the generation-0 hot log holds the commits under the manifest
+    // authority, and legacy reads see nothing.
+    assert!(temp
+        .path()
+        .join("history-00000000000000000000.wal")
+        .exists());
+    assert!(!temp.path().join("history-manifest.json").exists());
     let reopened = CheckpointStore::open(temp.path(), config)?;
     let history = reopened.history_store();
     let first = history.lookup_version(crate::persistent_history::VersionId::new(0))?;
@@ -2103,11 +2109,149 @@ fn candidate_durable_history_survives_reopen_without_legacy_write(
     assert_eq!(output, b"hello world");
     history.verify(first)?;
     history.verify(second)?;
-    // Adapter maps are memory-only in P1.3 (persisted in a later slice), so a
-    // reopened adapter addresses versions through the generic lookup.
-    assert!(matches!(
-        reopened.read_candidate_message("thread-a", "cp-1", 0, 1, &mut Vec::new()),
-        Err(CheckpointStoreError::CheckpointNotFound)
-    ));
+    // Adapter maps are rebuilt from durable bindings on reopen: the adapter
+    // addresses checkpoints without re-inserting anything.
+    let mut output = Vec::new();
+    reopened.read_candidate_message("thread-a", "cp-1", 0, 5, &mut output)?;
+    assert_eq!(output, b"hello");
+    output.clear();
+    reopened.read_candidate_message("thread-a", "cp-2", 0, 11, &mut output)?;
+    assert_eq!(output, b"hello world");
+    Ok(())
+}
+
+#[test]
+fn candidate_first_use_retry_cannot_duplicate_history(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // A crash between the durable history creation and the in-memory map
+    // insert must not duplicate the lineage: the next open rebuilds the
+    // maps from bindings, and first use resolves the existing history.
+    let temp = tempfile::tempdir()?;
+    let config = CheckpointStoreConfig {
+        wal_segment_bytes: 1024 * 1024,
+        preinit_chunk_bytes: 64 * 1024,
+        sealed_block_size: 4096,
+        zstd_level: 1,
+        recovery_mode: CheckpointStoreRecoveryMode::ReusePayload,
+    };
+    let mut store = CheckpointStore::open(temp.path(), config)?;
+    store.append_candidate_message("thread-a", "cp-1", None, b"hello")?;
+    drop(store);
+
+    let mut reopened = CheckpointStore::open(temp.path(), config)?;
+    assert_eq!(reopened.history_ids.len(), 1);
+    reopened.append_candidate_message("thread-a", "cp-2", Some("cp-1"), b" world")?;
+    assert_eq!(reopened.history_ids.len(), 1);
+    assert_eq!(reopened.history_store().all_histories().len(), 1);
+    let mut output = Vec::new();
+    reopened.read_candidate_message("thread-a", "cp-2", 0, 11, &mut output)?;
+    assert_eq!(output, b"hello world");
+    // Duplicate checkpoint identity stays rejected across the reopen.
+    assert!(reopened
+        .append_candidate_message("thread-a", "cp-1", None, b"again")
+        .is_err());
+    Ok(())
+}
+
+#[test]
+fn candidate_seal_recycles_and_bounds_reopen(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let config = CheckpointStoreConfig {
+        wal_segment_bytes: 1024 * 1024,
+        preinit_chunk_bytes: 64 * 1024,
+        sealed_block_size: 4096,
+        zstd_level: 1,
+        recovery_mode: CheckpointStoreRecoveryMode::ReusePayload,
+    };
+    let mut store = CheckpointStore::open(temp.path(), config)?;
+    store.append_candidate_message("thread-a", "cp-1", None, b"hello")?;
+    store.append_candidate_message("thread-a", "cp-2", Some("cp-1"), b" world")?;
+
+    let summary = store.seal_candidate_history()?;
+    assert_eq!(summary.generation, 1);
+    assert!(summary.recycled_hot);
+    assert!(!temp
+        .path()
+        .join("history-00000000000000000000.wal")
+        .exists());
+    let stats = store.candidate_history_open_stats();
+    assert_eq!(stats.snapshot_versions, 2);
+    assert_eq!(stats.suffix_bytes, 0);
+
+    // Post-seal appends land in the generation-1 hot log; reopen replays
+    // exactly the snapshot plus the bounded suffix with stable identities.
+    store.append_candidate_message("thread-a", "cp-3", Some("cp-2"), b"!!!")?;
+    drop(store);
+    let reopened = CheckpointStore::open(temp.path(), config)?;
+    let stats = reopened.candidate_history_open_stats();
+    assert_eq!(stats.snapshot_versions, 2);
+    let hot_len = std::fs::metadata(
+        temp.path()
+            .join("history-00000000000000000001.wal"),
+    )?
+    .len();
+    assert!(hot_len > 0);
+    assert_eq!(stats.suffix_bytes, hot_len);
+    let history = reopened.history_store();
+    assert_eq!(history.version_count(), 3);
+    let third = history.lookup_version(crate::persistent_history::VersionId::new(2))?;
+    assert_eq!(
+        third.parent(),
+        Some(crate::persistent_history::VersionId::new(1))
+    );
+    let mut output = Vec::new();
+    reopened.read_candidate_message("thread-a", "cp-3", 0, 14, &mut output)?;
+    assert_eq!(output, b"hello world!!!");
+    Ok(())
+}
+
+#[test]
+fn candidate_legacy_genesis_wal_is_adopted_once(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // A P1.3-era genesis `history.wal` (valid frames, bound adapter
+    // material) is adopted into generation zero on open and never read
+    // again afterwards.
+    use crate::persistent_history::durable_log::DurableHistoryLog;
+    use crate::persistent_history::{CommitOutcome, PersistentHistoryStore};
+
+    let temp = tempfile::tempdir()?;
+    let config = CheckpointStoreConfig {
+        wal_segment_bytes: 1024 * 1024,
+        preinit_chunk_bytes: 64 * 1024,
+        sealed_block_size: 4096,
+        zstd_level: 1,
+        recovery_mode: CheckpointStoreRecoveryMode::ReusePayload,
+    };
+    {
+        let mut core = PersistentHistoryStore::new();
+        let mut log = DurableHistoryLog::open(&temp.path().join("history.wal"))?;
+        let history = core.create_history_durable_with_binding(&mut log, b"thread-a")?;
+        let binding = encode_candidate_version_binding("thread-a", "cp-1");
+        match core.commit_durable(&mut log, history, None, b"hello", None, Some(&binding))? {
+            CommitOutcome::Committed(_) => {}
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("genesis commit must create")
+            }
+        }
+        log.sync()?;
+    }
+    let reopened = CheckpointStore::open(temp.path(), config)?;
+    // Adoption renames exactly once: the genesis name is gone, the
+    // generation-0 hot log owns the bytes.
+    assert!(!temp.path().join("history.wal").exists());
+    assert!(temp
+        .path()
+        .join("history-00000000000000000000.wal")
+        .exists());
+    let mut output = Vec::new();
+    reopened.read_candidate_message("thread-a", "cp-1", 0, 5, &mut output)?;
+    assert_eq!(output, b"hello");
+    // A second open is stable: nothing left to adopt, maps rebuild again.
+    drop(reopened);
+    let again = CheckpointStore::open(temp.path(), config)?;
+    let mut output = Vec::new();
+    again.read_candidate_message("thread-a", "cp-1", 0, 5, &mut output)?;
+    assert_eq!(output, b"hello");
     Ok(())
 }

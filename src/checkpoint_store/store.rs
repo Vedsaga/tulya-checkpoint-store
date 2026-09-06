@@ -1,6 +1,8 @@
 use super::*;
 use crate::persistent_history::{
-    durable_log::{recover_history_store, DurableError, DurableHistoryLog},
+    authority::{open_history_authority, seal_history_generation, OpenedHistoryStats, SealSummary},
+    durable_log::{DurableError, DurableHistoryLog},
+    manifest::{history_wal_filename, HISTORY_MANIFEST_FILE},
     CommitOutcome, HistoryError, PersistentHistoryStore, Version,
 };
 use crate::persistent_sequence::{
@@ -12,9 +14,9 @@ const MESSAGE_CANONICAL_PREFIX: &[u8] = b"{\"identity\":null,\"messages\":[";
 const MESSAGE_CANONICAL_SUFFIX: &[u8] = b"]}";
 const LEGACY_V1_HASH_STREAM_CHUNK_BYTES: u64 = 64 * 1024;
 
-/// Candidate history hot-log filename. Additive to the legacy file set and
-/// invisible to legacy reclaim; adapter identity maps stay memory-only until
-/// a later slice persists them.
+/// P1.3 genesis candidate history log. Superseded by generation-named hot
+/// logs once the manifest authority exists; `open` adopts it one way into
+/// generation zero and never writes it again.
 const HISTORY_WAL_FILE: &str = "history.wal";
 
 impl CheckpointStore {
@@ -99,18 +101,19 @@ impl CheckpointStore {
             apply_prepared_transaction(&mut state, prepared);
         }
         let hot = HotWal::open_at(&hot_path, normalized_tail, config)?;
-        // Candidate history authority replays independently of the legacy
-        // state above. Adapter identity maps stay memory-only (a later slice
-        // persists them); the generic history itself must reopen exactly. A
-        // corrupt candidate log fails the whole open closed: delete
-        // history.wal to return to legacy-only use.
-        let mut history = PersistentHistoryStore::new();
-        let history_wal_path = dir.join(HISTORY_WAL_FILE);
-        if history_wal_path.exists() {
-            let mut history_log = DurableHistoryLog::open(&history_wal_path)?;
-            let history_bytes = history_log.read_all()?;
-            history = recover_history_store(&history_bytes).map_err(Self::history_error)?;
-        }
+        // Candidate history authority opens through the generic manifest
+        // authority: sealed snapshot plus bounded hot suffix. Adapter maps
+        // are derived from durable bindings on every open, never persisted
+        // separately, so they cannot desynchronize from the log. A corrupt
+        // candidate authority fails the whole open closed: delete the
+        // history-manifest/history-* files to return to legacy-only use.
+        Self::adopt_legacy_history_wal(&dir)?;
+        let opened = open_history_authority(&dir)
+            .map_err(|error| Self::durable_history_error(&dir, error))?;
+        let history_generation = opened.generation;
+        let history_open_stats = opened.stats;
+        let history = opened.store;
+        let (history_ids, history_versions) = Self::rebuild_history_maps(&history)?;
         let store = Self {
             dir,
             config,
@@ -122,8 +125,10 @@ impl CheckpointStore {
             lazy_base,
             range_sizes: RefCell::new(Vec::new()),
             history,
-            history_ids: HashMap::new(),
-            history_versions: HashMap::new(),
+            history_ids,
+            history_versions,
+            history_generation,
+            history_open_stats,
         };
         if store.lazy_base.is_none() {
             let roots = store
@@ -599,12 +604,17 @@ impl CheckpointStore {
     /// Candidate release-path append through the generic history core.
     ///
     /// Durability authority belongs to the generic history core alone: this
-    /// writes only the candidate history log, never a legacy transaction.
-    /// Checkpoint thread maps to generic history, checkpoint id maps to
-    /// generic version, and the message payload commits as opaque bytes with
-    /// no whole-parent XXH3 reconstruction. The legacy state remains
-    /// authoritative for legacy operations; seal and tombstones arrive in
-    /// later slices.
+    /// writes only the current-generation candidate hot log, never a legacy
+    /// transaction. Checkpoint thread maps to generic history, checkpoint id
+    /// maps to generic version, and the message payload commits as opaque
+    /// bytes with no whole-parent XXH3 reconstruction. The legacy state
+    /// remains authoritative for legacy operations.
+    ///
+    /// Both mappings are recorded as durable opaque bindings, so a crash
+    /// between the log append and the in-memory map insert cannot
+    /// desynchronize the adapter: the next open rebuilds the maps from the
+    /// bindings. First use is idempotent by thread binding: a retry after a
+    /// crash resolves the existing history instead of duplicating it.
     ///
     /// # Errors
     ///
@@ -612,8 +622,8 @@ impl CheckpointStore {
     /// within a thread, unknown parent identity, an empty payload, or any
     /// durability outcome including indeterminate barriers.
     ///
-    /// Staged P1.3 candidate path: seal/reopen integration in P1.4+ makes this
-    /// live; remove the allowance then.
+    /// Staged P1.4 candidate path: remove the allowance when the legacy
+    /// write path migrates onto the candidate authority.
     #[allow(dead_code)]
     pub(crate) fn append_candidate_message(
         &mut self,
@@ -635,10 +645,11 @@ impl CheckpointStore {
         let history = match self.history_ids.get(thread_id) {
             Some(id) => *id,
             None => {
-                let mut history_log = DurableHistoryLog::open(&self.dir.join(HISTORY_WAL_FILE))?;
+                let mut history_log =
+                    DurableHistoryLog::open(&self.candidate_hot_path())?;
                 let id = self
                     .history
-                    .create_history_durable(&mut history_log)
+                    .create_history_durable_with_binding(&mut history_log, thread_id.as_bytes())
                     .map_err(|error| Self::durable_history_error(&self.dir, error))?;
                 self.history_ids.insert(thread_id.to_owned(), id);
                 id
@@ -652,10 +663,18 @@ impl CheckpointStore {
                     .ok_or(CheckpointStoreError::CheckpointNotFound)
             })
             .transpose()?;
-        let mut history_log = DurableHistoryLog::open(&self.dir.join(HISTORY_WAL_FILE))?;
+        let binding = encode_candidate_version_binding(thread_id, checkpoint_id);
+        let mut history_log = DurableHistoryLog::open(&self.candidate_hot_path())?;
         let version = self
             .history
-            .commit_durable(&mut history_log, history, parent, payload, None, None)
+            .commit_durable(
+                &mut history_log,
+                history,
+                parent,
+                payload,
+                None,
+                Some(&binding),
+            )
             .map_err(|error| Self::durable_history_error(&self.dir, error))?;
         let version = match version {
             CommitOutcome::Committed(version) => version,
@@ -705,11 +724,136 @@ impl CheckpointStore {
     /// Borrows the staged history core for adapter-level verification and
     /// diagnostic inspection.
     ///
-    /// Staged P1.2 candidate path: durability wiring in P1.3+ makes this
-    /// live; remove the allowance then.
+    /// Staged P1.4 candidate path: remove the allowance when the legacy
+    /// write path migrates onto the candidate authority.
     #[allow(dead_code)]
     pub(crate) fn history_store(&self) -> &PersistentHistoryStore {
         &self.history
+    }
+
+    /// Reports the bounded-reopen evidence captured when the candidate
+    /// authority opened: snapshot versions plus replayed hot suffix bytes.
+    ///
+    /// Staged P1.4 candidate path: remove the allowance when the legacy
+    /// write path migrates onto the candidate authority.
+    #[allow(dead_code)]
+    pub(crate) fn candidate_history_open_stats(&self) -> OpenedHistoryStats {
+        self.history_open_stats
+    }
+
+    /// Seals the candidate history authority: persists a snapshot covering
+    /// the live candidate state, publishes the next manifest generation, and
+    /// recycles the superseded hot log. The store then reopens the authority
+    /// so generation tracking, the write path, and the adapter maps follow
+    /// the new generation exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for any durability outcome; a rejection before
+    /// manifest publication leaves the previous authority complete.
+    ///
+    /// Staged P1.4 candidate path: remove the allowance when the legacy
+    /// write path migrates onto the candidate authority.
+    #[allow(dead_code)]
+    pub(crate) fn seal_candidate_history(&mut self) -> Result<SealSummary, CheckpointStoreError> {
+        self.ensure_mutation_allowed()?;
+        let summary = seal_history_generation(&self.history, &self.dir)
+            .map_err(|error| Self::durable_history_error(&self.dir, error))?;
+        let opened = open_history_authority(&self.dir)
+            .map_err(|error| Self::durable_history_error(&self.dir, error))?;
+        self.history_generation = opened.generation;
+        self.history_open_stats = opened.stats;
+        self.history = opened.store;
+        let (history_ids, history_versions) = Self::rebuild_history_maps(&self.history)?;
+        self.history_ids = history_ids;
+        self.history_versions = history_versions;
+        Ok(summary)
+    }
+
+    /// Resolves the current-generation candidate hot log path.
+    fn candidate_hot_path(&self) -> PathBuf {
+        self.dir.join(history_wal_filename(self.history_generation))
+    }
+
+    /// Adopts the P1.3 genesis `history.wal` into the generation authority
+    /// exactly once: when no manifest was ever published and no generation-0
+    /// hot log exists yet, the genesis file is atomically renamed into
+    /// generation zero. Every later open goes through the manifest
+    /// authority, which never reads `history.wal` again.
+    fn adopt_legacy_history_wal(dir: &Path) -> Result<(), CheckpointStoreError> {
+        if dir.join(HISTORY_MANIFEST_FILE).exists() {
+            return Ok(());
+        }
+        let legacy = dir.join(HISTORY_WAL_FILE);
+        if !legacy.exists() {
+            return Ok(());
+        }
+        let generation_zero = dir.join(history_wal_filename(0));
+        if generation_zero.exists() {
+            return Ok(());
+        }
+        std::fs::rename(&legacy, &generation_zero)?;
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Rebuilds the adapter identity maps from durable bindings. Maps are
+    /// derived, never independently persisted: whatever the log holds is
+    /// what the adapter sees, so a crash cannot desynchronize them.
+    ///
+    /// Histories without a binding stay invisible to the adapter rather than
+    /// failing the open. Every other disagreement — a malformed binding, a
+    /// duplicate thread binding, a bound version without a binding, or a
+    /// version whose history disagrees with its bound thread — fails closed.
+    fn rebuild_history_maps(
+        history: &PersistentHistoryStore,
+    ) -> Result<
+        (
+            HashMap<String, HistoryId>,
+            HashMap<(String, String), VersionId>,
+        ),
+        CheckpointStoreError,
+    > {
+        let mut history_ids = HashMap::new();
+        for id in history.all_histories() {
+            let Some(binding) = history.history_binding(id) else {
+                continue;
+            };
+            let thread = std::str::from_utf8(binding)
+                .map_err(|_| format_error("reopened history binding is not valid UTF-8"))?;
+            if history_ids.insert(thread.to_owned(), id).is_some() {
+                return Err(format_error(
+                    "duplicate adapter thread binding in reopened history",
+                ));
+            }
+        }
+        let mut history_versions = HashMap::new();
+        for version in history.all_versions() {
+            let thread = history_ids
+                .iter()
+                .find_map(|(thread, id)| (*id == version.history()).then_some(thread));
+            let Some(thread) = thread else { continue };
+            let Some(binding) = history.version_binding(version.id()) else {
+                return Err(format_error(
+                    "reopened version is missing its adapter binding",
+                ));
+            };
+            let (bound_thread, checkpoint) = decode_candidate_version_binding(binding)?;
+            if bound_thread != *thread {
+                return Err(format_error(
+                    "reopened version binding disagrees with its history",
+                ));
+            }
+            if history_versions
+                .insert((bound_thread, checkpoint), version.id())
+                .is_some()
+            {
+                return Err(format_error(
+                    "duplicate adapter checkpoint binding in reopened history",
+                ));
+            }
+        }
+        Ok((history_ids, history_versions))
     }
 
     /// Staged P1.2 candidate path: durability wiring in P1.3+ makes this

@@ -920,6 +920,32 @@ impl PersistentHistoryStore {
         self.versions.len()
     }
 
+    /// Lists committed history identities in stable numeric order for
+    /// adapter map reconstruction. The order is deterministic so reopened
+    /// adapters rebuild identical maps on every open.
+    pub(crate) fn all_histories(&self) -> Vec<HistoryId> {
+        let mut histories: Vec<HistoryId> = self.histories.iter().copied().collect();
+        histories.sort_by_key(|id| id.id());
+        histories
+    }
+
+    /// Borrows the opaque adapter binding recorded for a history, if any.
+    /// Histories created without a binding stay invisible to adapters.
+    pub(crate) fn history_binding(&self, id: HistoryId) -> Option<&[u8]> {
+        self.history_bindings.get(&id).map(Vec::as_slice)
+    }
+
+    /// Lists committed versions in identity order for adapter map
+    /// reconstruction. The dense table is already identity-ordered.
+    pub(crate) fn all_versions(&self) -> Vec<Version> {
+        self.versions.clone()
+    }
+
+    /// Borrows the opaque adapter binding recorded for a version, if any.
+    pub(crate) fn version_binding(&self, id: VersionId) -> Option<&[u8]> {
+        self.version_bindings.get(&id).map(Vec::as_slice)
+    }
+
     /// Resolves a version identity within an expected history for adapter
     /// reads. The returned root always comes from the committed table, so a
     /// fabricated value fails closed in [`PersistentHistoryStore::read`].

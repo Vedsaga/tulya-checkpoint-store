@@ -38,6 +38,7 @@ use crate::error_classification::{
 };
 use crate::hot_wal_commit::{FileHotWalCommitIo, HotWalCommitter};
 use crate::persistent_history::{HistoryId, PersistentHistoryStore, VersionId};
+use crate::persistent_history::authority::OpenedHistoryStats;
 
 mod storage_format;
 use storage_format::*;
@@ -85,6 +86,50 @@ pub enum CheckpointStoreError {
 
 fn format_error(message: impl Into<String>) -> CheckpointStoreError {
     CheckpointStoreError::Format(message.into())
+}
+
+/// Encodes a checkpoint `(thread, id)` pair as an opaque core version
+/// binding: `[thread_len: u32 BE][thread bytes][checkpoint bytes]`.
+/// Length framing keeps identifiers containing separator bytes unambiguous;
+/// the core treats these bytes as opaque and echoes them back on reopen for
+/// adapter map reconstruction.
+fn encode_candidate_version_binding(thread_id: &str, checkpoint_id: &str) -> Vec<u8> {
+    let thread = thread_id.as_bytes();
+    let checkpoint = checkpoint_id.as_bytes();
+    let mut binding = Vec::with_capacity(4 + thread.len() + checkpoint.len());
+    binding.extend_from_slice(&(thread.len() as u32).to_be_bytes());
+    binding.extend_from_slice(thread);
+    binding.extend_from_slice(checkpoint);
+    binding
+}
+
+/// Decodes an opaque core version binding back into its checkpoint
+/// `(thread, id)` pair, failing closed on any structural disagreement.
+fn decode_candidate_version_binding(
+    binding: &[u8],
+) -> Result<(String, String), CheckpointStoreError> {
+    if binding.len() < 4 {
+        return Err(format_error(
+            "reopened version binding is shorter than its length prefix",
+        ));
+    }
+    let thread_len = u32::from_be_bytes([binding[0], binding[1], binding[2], binding[3]]) as usize;
+    let Some(thread) = binding.get(4..4 + thread_len) else {
+        return Err(format_error(
+            "reopened version binding thread length exceeds its bytes",
+        ));
+    };
+    let Some(checkpoint) = binding.get(4 + thread_len..) else {
+        return Err(format_error("reopened version binding is truncated"));
+    };
+    if thread.is_empty() || checkpoint.is_empty() {
+        return Err(format_error("reopened version binding holds an empty identifier"));
+    }
+    let thread = std::str::from_utf8(thread)
+        .map_err(|_| format_error("reopened version binding thread is not valid UTF-8"))?;
+    let checkpoint = std::str::from_utf8(checkpoint)
+        .map_err(|_| format_error("reopened version binding checkpoint is not valid UTF-8"))?;
+    Ok((thread.to_owned(), checkpoint.to_owned()))
 }
 
 /// Opaque persistent identity for one logical checkpoint store.
@@ -769,11 +814,22 @@ pub struct CheckpointStore {
     #[allow(dead_code)]
     history: PersistentHistoryStore,
     /// Adapter mapping: checkpoint thread to generic history identity.
+    /// Derived from durable bindings on every open, never persisted
+    /// separately, so a crash cannot desynchronize it from the log.
     #[allow(dead_code)]
     history_ids: HashMap<String, HistoryId>,
     /// Adapter mapping: checkpoint (thread, id) to generic version identity.
+    /// Derived from durable bindings on every open, like `history_ids`.
     #[allow(dead_code)]
     history_versions: HashMap<(String, String), VersionId>,
+    /// Manifest generation the candidate history authority opened at.
+    /// Candidate appends write this generation's hot log; sealing advances it.
+    #[allow(dead_code)]
+    history_generation: u64,
+    /// Bounded-reopen evidence from the candidate authority open: snapshot
+    /// versions plus hot suffix bytes that were replayed.
+    #[allow(dead_code)]
+    history_open_stats: OpenedHistoryStats,
 }
 
 mod store;
