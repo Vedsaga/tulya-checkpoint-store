@@ -9,8 +9,7 @@ use super::commit_v2::{
 };
 use super::format_v2::{encode_v2_node, V2FormatError, V2NodeRecord, V2RootRecord};
 use super::publication_v2::{
-    checkpoint_state_metadata, V2CheckpointRecord, V2PublicationError, V2StateMetadata,
-    V2VersionRecord,
+    checkpoint_state_metadata, V2CheckpointRecord, V2PublicationError, V2VersionRecord,
 };
 use super::transaction_v2::{V2WalGeometry, V2WalTransaction};
 use std::collections::{HashMap, HashSet};
@@ -852,6 +851,7 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, V2ApplyError> {
 mod tests {
     use super::super::commit_v2::{checkpoint_operation_digest, encode_v2_commit};
     use super::super::format_v2::{decode_v2_node, decode_v2_root, encode_v2_root};
+    use super::super::publication_v2::V2StateMetadata;
     use super::*;
 
     fn initial_transaction(checkpoint_id: &str) -> V2WalTransaction {
