@@ -74,7 +74,7 @@ impl LogicalLength {
 
 /// Physical representation used by one persistent root.
 ///
-/// `LegacyV1` names the released left-deep DAG representation. It does not
+/// `LegacyV1` names the pre-release left-deep DAG representation. It does not
 /// claim the balanced-tree or persisted-subtree-length guarantees required by
 /// the production locality gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -96,7 +96,7 @@ pub(crate) struct PersistentRoot {
 }
 
 impl PersistentRoot {
-    /// Adapts a released Format-v1 root without changing its on-disk meaning.
+    /// Adapts a pre-release Format-v1 root without changing its on-disk meaning.
     pub(crate) const fn legacy_v1(node_id: u64, logical_len: LogicalLength) -> Self {
         Self {
             node_id,

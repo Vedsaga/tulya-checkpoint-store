@@ -1,5 +1,13 @@
 # Tulya checkpoint format
 
+> PRE-USER RELEASE DECISION (2026-09-06): the on-disk format described below
+> is the pre-release development format. It carries no compatibility promise:
+> there are no external users and no external stores. The staged balanced
+> persistent-sequence design becomes the first released Format v1 with no
+> migration from the bytes described here. This document will be rewritten to
+> describe only the released contract when the release fixture freezes (see
+> docs/HN_LAUNCH_EXECUTION_HANDOFF.md Phase 1).
+
 Tulya has one public on-disk format. Users do not choose among format
 versions. Every manifest carries `"format":"tulya-checkpoint-store"` and
 `"format_version":1` so readers can reject incompatible bytes safely; that

@@ -51,3 +51,10 @@ and v2 is staged behind `persistent_sequence`.  A v1-to-v2 migration and
 dual-version recovery are therefore deferred product work, not a current
 release gate; they become necessary only when v2 is selected as the public
 writable format or existing v1 stores must be upgraded.
+
+> PRE-USER RELEASE DECISION (2026-09-06): per docs/HN_LAUNCH_EXECUTION_HANDOFF.md
+> there are no external v1 stores, so no v1-to-v2 migration is required at all;
+> pre-release v1 bytes fail explicitly as unsupported.  The `v1`/`v2` tags above
+> are internal staging names: at release-format freeze the staged balanced
+> design becomes release Format v1 in one deliberate naming/wire cleanup, and
+> this document follows that rename.

@@ -105,6 +105,13 @@ not downgrade or upgrade the store.
 
 ## Migration authority rule
 
+> SUPERSEDED PRE-USER (2026-09-06): Tulya has no external persisted-format
+> users, so no v1 -> v2 migration is required for the first supported release
+> (see docs/PRODUCTION_READINESS.md and docs/HN_LAUNCH_EXECUTION_HANDOFF.md).
+> Pre-release v1 directories fail explicitly as unsupported. The ordering
+> principle below — new authority durable before it becomes authoritative —
+> still governs every future authority publication.
+
 A later v1 -> v2 migration must publish the v2 manifest only after all bytes
 required for a valid v2 authoritative state are durable. Until that manifest
 publication succeeds, the old v1 manifest remains authoritative and recovery
