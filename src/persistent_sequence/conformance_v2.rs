@@ -13,8 +13,8 @@ use super::publication_v2::{
 };
 use super::recovery_v2::{recover_v2_hot_wal, V2RecoveryStop};
 use super::snapshot_v2::{
-    decode_v2_sealed_snapshot, encode_v2_sealed_snapshot, V2ActiveRequestRecord,
-    V2DeletedCheckpointRecord, V2RetiredRequestRecord, V2SealedSnapshot,
+    decode_v2_sealed_snapshot, encode_v2_sealed_snapshot, snapshot_digest_input,
+    V2ActiveRequestRecord, V2DeletedCheckpointRecord, V2RetiredRequestRecord, V2SealedSnapshot,
 };
 use super::transaction_v2::{V2WalGeometry, V2WalTransaction};
 use serde_json::Value;
@@ -563,6 +563,24 @@ fn snapshot_vectors_match_canonical_schema2_bytes_and_reopen() {
             "snapshot digest vector {} disagrees",
             string(vector, "name")
         );
+        if let Some(expected_input) = vector
+            .get("expected_digest_input_hex")
+            .and_then(Value::as_str)
+        {
+            let input = snapshot_digest_input(&encoded[..64], &encoded[96..]);
+            assert_eq!(
+                input.len(),
+                number(vector, "expected_digest_input_length") as usize,
+                "snapshot digest-input length vector {} disagrees",
+                string(vector, "name")
+            );
+            assert_eq!(
+                encode_hex(&input),
+                expected_input,
+                "snapshot digest-input vector {} disagrees",
+                string(vector, "name")
+            );
+        }
         assert_eq!(
             decode_v2_sealed_snapshot(&encoded).unwrap(),
             snapshot,

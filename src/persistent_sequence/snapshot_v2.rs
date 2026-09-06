@@ -976,11 +976,17 @@ fn decode_header(bytes: &[u8]) -> Result<V2SnapshotHeader, V2SnapshotError> {
     })
 }
 
+pub(super) fn snapshot_digest_input(prefix: &[u8], body: &[u8]) -> Vec<u8> {
+    let mut input = Vec::with_capacity(V2_SNAPSHOT_DOMAIN.len() + prefix.len() + body.len());
+    input.extend_from_slice(V2_SNAPSHOT_DOMAIN);
+    input.extend_from_slice(prefix);
+    input.extend_from_slice(body);
+    input
+}
+
 fn snapshot_digest(prefix: &[u8], body: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(V2_SNAPSHOT_DOMAIN);
-    hasher.update(prefix);
-    hasher.update(body);
+    hasher.update(snapshot_digest_input(prefix, body));
     let digest = hasher.finalize();
     let mut output = [0u8; 32];
     output.copy_from_slice(&digest);

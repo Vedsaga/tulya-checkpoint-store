@@ -10,6 +10,8 @@ conformance_v2.rs parses it with serde_json and checks:
 - dense compaction remapping that preserves live checkpoint identities and
   operation digests;
 - canonical T2S2 live-ledger and tombstone-only snapshot bytes plus reopen;
+- the tombstone-only 128-byte SHA-256 input, including the domain separator,
+  64-byte header prefix, and `T2X2` record;
 - complete-frame and torn-final-frame hot-WAL recovery outcomes;
 - fail-closed recovery for reserve garbage, bare structural records,
   corrupted complete frames, and duplicate physical retries;
@@ -29,7 +31,9 @@ conformance_v2.rs parses it with serde_json and checks:
 
 The fixture schema is intentionally narrow.  Lean's
 PersistentAVLV2RequestLedger.lean provides the symbolic request-ledger
-semantics and theorems; it does not claim to compute Rust's SHA-256 bytes.
+semantics and theorems.  PersistentAVLV2SnapshotWireReference.lean
+reconstructs the exact tombstone-only snapshot digest input and its geometry;
+it does not claim to compute Rust's SHA-256 bytes.
 The runner therefore proves finite executable agreement for these cases, not
 full Rust refinement or filesystem durability.
 
@@ -40,3 +44,10 @@ checkpoint-store Format v1 is unchanged.
 
 This fixture is a conformance boundary and test artifact, not a format
 migration.
+
+There are currently no external Format-v2 consumers.  The `v1`/`v2` names are
+internal on-disk authority boundaries: v1 is the current public implementation
+and v2 is staged behind `persistent_sequence`.  A v1-to-v2 migration and
+dual-version recovery are therefore deferred product work, not a current
+release gate; they become necessary only when v2 is selected as the public
+writable format or existing v1 stores must be upgraded.
