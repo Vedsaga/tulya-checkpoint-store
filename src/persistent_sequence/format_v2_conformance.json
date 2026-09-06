@@ -22,6 +22,100 @@
       "expected_operation_digest_hex": "6e0363445809801219e0a146b177509d7a74ff7cbff1ee35013d94ad433e9eda"
     }
   ],
+  "commit_envelope_vectors": [
+    {
+      "name": "requestless-commit-has-zero-operation-digest",
+      "request_id_hex": null,
+      "expected_operation_digest_hex": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "requestful-commit-binds-logical-operation-digest",
+      "request_id_hex": "7265712d31",
+      "expected_operation_digest_hex": "6e0363445809801219e0a146b177509d7a74ff7cbff1ee35013d94ad433e9eda"
+    }
+  ],
+  "recovery_vectors": [
+    {
+      "name": "complete-frames-stop-at-zero-reserve",
+      "kind": "two-frames-zero-reserve",
+      "expected_commit_count": 2,
+      "expected_stop": "zero_reserve",
+      "expected_checkpoint_count": 2
+    },
+    {
+      "name": "torn-final-frame-is-uncommitted",
+      "kind": "torn-second-frame",
+      "expected_commit_count": 1,
+      "expected_stop": "torn_final_commit",
+      "expected_checkpoint_count": 1
+    }
+  ],
+  "recovery_invalid_vectors": [
+    {
+      "name": "nonzero-byte-after-zero-reserve-is-rejected",
+      "kind": "reserve-garbage",
+      "expected": "reject"
+    },
+    {
+      "name": "bare-structural-transaction-is-rejected",
+      "kind": "bare-structural",
+      "expected": "reject"
+    },
+    {
+      "name": "corrupted-complete-frame-is-rejected",
+      "kind": "corrupt-complete-frame",
+      "expected": "reject"
+    },
+    {
+      "name": "duplicate-physical-retry-is-rejected",
+      "kind": "duplicate-physical-retry",
+      "expected": "reject"
+    }
+  ],
+  "snapshot_vectors": [
+    {
+      "name": "one-checkpoint-active-ledger",
+      "kind": "one-checkpoint",
+      "expected_length": 530,
+      "expected_digest_hex": "ae8abba06121c8c689ed2b3cf822fc750b184f373e0b947a9c0ab9ad448d0cfc"
+    },
+    {
+      "name": "tombstone-only-deleted-checkpoint",
+      "kind": "tombstone-only",
+      "thread_id": "thread",
+      "checkpoint_id": "cp-old",
+      "expected_length": 124,
+      "expected_digest_hex": "6a63a9f5cace063e835d3f61b4886d2a4a3fd6a95ac6f34162baf4c149825782"
+    }
+  ],
+  "structural_commitment_vectors": [
+    {
+      "name": "leaf-abc",
+      "kind": "leaf",
+      "node_id": 7,
+      "payload_offset": 9,
+      "payload_hex": "616263",
+      "expected_node_hex": "54324e32010001000300000000000000090000000000000003000000000000000000000000000000631a198b7685ef4dfb1032c761262dc81d3f1c2b1e5e740f81f056e1b847d068",
+      "expected_root_hex": "543252320100010007000000000000000300000000000000631a198b7685ef4dfb1032c761262dc81d3f1c2b1e5e740f81f056e1b847d068"
+    },
+    {
+      "name": "branch-abc-xyz",
+      "kind": "branch",
+      "left": {
+        "node_id": 7,
+        "payload_offset": 9,
+        "payload_hex": "616263"
+      },
+      "right": {
+        "node_id": 8,
+        "payload_offset": 12,
+        "payload_hex": "58595a"
+      },
+      "root_node_id": 9,
+      "expected_node_hex": "54324e320200020006000000000000000700000000000000080000000000000003000000000000004f6f4fc9213f22b2b4eb2e67e47f4ead5e75beddd8bcaa3abb257193323ed3a7",
+      "expected_root_hex": "5432523201000200090000000000000006000000000000004f6f4fc9213f22b2b4eb2e67e47f4ead5e75beddd8bcaa3abb257193323ed3a7"
+    }
+  ],
   "request_lifecycle_vectors": [
     {
       "name": "active-same-digest-is-replay",
@@ -104,6 +198,13 @@
       "expected": "new",
       "expected_checkpoint_ordinal": null,
       "mutates": false
+    }
+  ],
+  "invalid_snapshot_vectors": [
+    {
+      "name": "active-retired-request-overlap-is-rejected",
+      "kind": "active-retired-overlap",
+      "expected": "reject"
     }
   ],
   "deletion_vectors": [
