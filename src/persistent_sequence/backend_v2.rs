@@ -527,7 +527,10 @@ mod tests {
 
         let tombstone_snapshot = export_v2_sealed_state(&reopened.state).unwrap().unwrap();
         let final_reopen = recover_v2_backend(Some(&tombstone_snapshot), &[]).unwrap();
-        assert_eq!(final_reopen.state.geometry().unwrap(), V2WalGeometry::default());
+        assert_eq!(
+            final_reopen.state.geometry().unwrap(),
+            V2WalGeometry::default()
+        );
         assert!(final_reopen
             .state
             .deleted_checkpoints
