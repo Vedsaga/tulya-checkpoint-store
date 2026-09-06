@@ -216,9 +216,25 @@ pub(super) fn decode_v2_version(
     })
 }
 
-pub(super) fn encode_v2_checkpoint(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct V2CheckpointEncodingGeometry {
+    record_len: usize,
+    record_len_u32: u32,
+    thread_len: u32,
+    checkpoint_len: u32,
+    parent_len: u32,
+}
+
+pub(super) fn validate_v2_checkpoint_record(
     record: &V2CheckpointRecord,
-) -> Result<Vec<u8>, V2PublicationError> {
+) -> Result<(), V2PublicationError> {
+    let _ = checkpoint_encoding_geometry(record)?;
+    Ok(())
+}
+
+fn checkpoint_encoding_geometry(
+    record: &V2CheckpointRecord,
+) -> Result<V2CheckpointEncodingGeometry, V2PublicationError> {
     validate_identifier(&record.thread_id, "v2 checkpoint thread id is invalid")?;
     validate_identifier(&record.checkpoint_id, "v2 checkpoint id is invalid")?;
     if let Some(parent) = record.parent_checkpoint_id.as_deref() {
@@ -253,6 +269,27 @@ pub(super) fn encode_v2_checkpoint(
         .map_err(|_| V2PublicationError::Overflow("v2 checkpoint id length exceeds u32"))?;
     let parent_len = u32::try_from(parent.len())
         .map_err(|_| V2PublicationError::Overflow("v2 checkpoint parent length exceeds u32"))?;
+    Ok(V2CheckpointEncodingGeometry {
+        record_len,
+        record_len_u32,
+        thread_len,
+        checkpoint_len,
+        parent_len,
+    })
+}
+
+pub(super) fn encode_v2_checkpoint(
+    record: &V2CheckpointRecord,
+) -> Result<Vec<u8>, V2PublicationError> {
+    let geometry = checkpoint_encoding_geometry(record)?;
+    let parent = record.parent_checkpoint_id.as_deref().unwrap_or("");
+    let V2CheckpointEncodingGeometry {
+        record_len,
+        record_len_u32,
+        thread_len,
+        checkpoint_len,
+        parent_len,
+    } = geometry;
 
     let mut output = Vec::with_capacity(record_len);
     output.extend_from_slice(&V2_CHECKPOINT_MAGIC);
