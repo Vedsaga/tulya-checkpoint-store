@@ -313,24 +313,6 @@ impl V2CommittedState {
                     "v2 checkpoint table contains duplicate identity",
                 ));
             }
-            let expected_ordinal = u64::try_from(index)
-                .map_err(|_| V2ApplyError::Overflow("v2 checkpoint ordinal exceeds u64"))?;
-            let indexed_ordinal = self
-                .checkpoint_ordinals
-                .iter()
-                .find_map(|((thread, checkpoint_id), ordinal)| {
-                    (thread == &checkpoint.thread_id
-                        && checkpoint_id == &checkpoint.checkpoint_id)
-                        .then_some(*ordinal)
-                })
-                .ok_or(V2ApplyError::Invalid(
-                    "v2 live checkpoint is absent from the index",
-                ))?;
-            if indexed_ordinal != expected_ordinal {
-                return Err(V2ApplyError::Invalid(
-                    "v2 checkpoint index disagrees with checkpoint table",
-                ));
-            }
             if let Some(parent) = checkpoint.parent_checkpoint_id.as_deref() {
                 let parent_index = positions
                     .get(&(checkpoint.thread_id.as_str(), parent))
@@ -343,6 +325,22 @@ impl V2CommittedState {
                         "v2 live checkpoint parent is not topologically prior",
                     ));
                 }
+            }
+        }
+
+        for ((thread_id, checkpoint_id), ordinal) in &self.checkpoint_ordinals {
+            let index = positions
+                .get(&(thread_id.as_str(), checkpoint_id.as_str()))
+                .copied()
+                .ok_or(V2ApplyError::Invalid(
+                    "v2 checkpoint index contains an identity absent from the checkpoint table",
+                ))?;
+            let expected_ordinal = u64::try_from(index)
+                .map_err(|_| V2ApplyError::Overflow("v2 checkpoint ordinal exceeds u64"))?;
+            if *ordinal != expected_ordinal {
+                return Err(V2ApplyError::Invalid(
+                    "v2 checkpoint index disagrees with checkpoint table",
+                ));
             }
         }
 
