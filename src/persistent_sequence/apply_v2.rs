@@ -428,7 +428,14 @@ impl V2CommittedState {
 
         let mut next_ordinal = 0u64;
         for (index, checkpoint) in self.checkpoints.iter().enumerate() {
-            if delete_mask.get(index).copied().unwrap_or(1) != 0 {
+            let deleted = delete_mask
+                .get(index)
+                .copied()
+                .ok_or(V2ApplyError::Invalid(
+                    "v2 checkpoint is outside the deletion mask",
+                ))?
+                != 0;
+            if deleted {
                 let key = try_clone_checkpoint_key(&checkpoint.thread_id, &checkpoint.checkpoint_id)?;
                 let _ = deleted_checkpoints.insert(key);
             } else {
@@ -443,18 +450,23 @@ impl V2CommittedState {
             }
         }
 
-        let retire_count = self
-            .request_records
-            .values()
-            .filter(|record| {
-                usize::try_from(record.checkpoint_ordinal)
-                    .ok()
-                    .and_then(|index| delete_mask.get(index))
-                    .copied()
-                    .unwrap_or(0)
-                    != 0
-            })
-            .count();
+        let mut retire_count = 0usize;
+        for record in self.request_records.values() {
+            let old_index = usize::try_from(record.checkpoint_ordinal)
+                .map_err(|_| V2ApplyError::Overflow("v2 request checkpoint ordinal exceeds usize"))?;
+            if delete_mask
+                .get(old_index)
+                .copied()
+                .ok_or(V2ApplyError::Invalid(
+                    "v2 active request checkpoint ordinal is outside the deletion mask",
+                ))?
+                != 0
+            {
+                retire_count = retire_count
+                    .checked_add(1)
+                    .ok_or(V2ApplyError::Overflow("v2 retired request count exceeds usize"))?;
+            }
+        }
         let retained_request_count = self
             .request_records
             .len()
@@ -525,7 +537,6 @@ impl V2CommittedState {
             deleted_checkpoint_count,
         })
     }
-}
 }
 
 pub(super) fn apply_v2_commit(
