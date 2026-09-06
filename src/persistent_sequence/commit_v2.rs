@@ -5,7 +5,9 @@
 //! `T2W2` bytes remain unchanged; a future production v2 WAL publishes the
 //! complete `T2C2` record as the authoritative unit.
 
-use super::publication_v2::{encode_v2_checkpoint, V2CheckpointRecord, V2PublicationError};
+use super::publication_v2::{
+    validate_v2_checkpoint_record, V2CheckpointRecord, V2PublicationError,
+};
 use super::transaction_v2::{
     decode_v2_wal_transaction, encode_v2_wal_transaction, V2DecodedWalTransaction, V2WalError,
     V2WalGeometry, V2WalTransaction,
@@ -69,10 +71,10 @@ pub(super) struct V2DecodedCommit {
 pub(super) fn checkpoint_operation_digest(
     checkpoint: &V2CheckpointRecord,
 ) -> Result<[u8; 32], V2CommitError> {
-    // Reuse the canonical checkpoint encoder as the fail-closed field validator,
-    // but do not hash its physical version identifiers. Retry identity is bound
-    // to the logical checkpoint operation, not allocator watermarks.
-    encode_v2_checkpoint(checkpoint)?;
+    // Reuse the canonical checkpoint field validator, but do not allocate or
+    // hash physical version identifiers. Retry identity is bound to the logical
+    // checkpoint operation, not allocator watermarks.
+    validate_v2_checkpoint_record(checkpoint)?;
 
     let parent = checkpoint.parent_checkpoint_id.as_deref().unwrap_or("");
     let mut hasher = Sha256::new();
