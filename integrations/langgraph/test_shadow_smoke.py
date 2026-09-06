@@ -48,6 +48,10 @@ class TulyaShadowSmokeTest(unittest.TestCase):
 
             self.assertEqual(shadow.shadow_failures, ())
             self.assertEqual(shadow.shadow_stats()["checkpoint_count"], 3)
+            metrics = shadow.shadow_metrics()
+            self.assertGreaterEqual(metrics["mirror_callbacks_total"], 3)
+            self.assertEqual(metrics["mirror_callback_failures"], 0)
+            self.assertGreater(metrics["mirror_callback_latency_ns"]["p95"], 0)
 
             # Recreate both adapter and graph, then continue from an old
             # branch point. The parent mapping must come from durable Tulya
@@ -62,6 +66,9 @@ class TulyaShadowSmokeTest(unittest.TestCase):
             restarted_graph.invoke({"messages": ["after-restart"]}, root_config)
             self.assertEqual(restarted.shadow_failures, ())
             self.assertEqual(restarted.shadow_stats()["checkpoint_count"], 4)
+            self.assertGreaterEqual(
+                restarted.shadow_metrics()["mirror_callbacks_total"], 1
+            )
             self.assertEqual(restarted.verify_shadow()["failures"], 0)
             restarted.seal_shadow()
             self.assertEqual(restarted.verify_shadow()["failures"], 0)
@@ -92,6 +99,9 @@ class TulyaShadowAsyncSmokeTest(unittest.IsolatedAsyncioTestCase):
             await graph.ainvoke({"messages": ["async-root"]}, config)
             self.assertEqual(shadow.shadow_failures, ())
             self.assertEqual(shadow.shadow_stats()["checkpoint_count"], 1)
+            self.assertGreaterEqual(
+                shadow.shadow_metrics()["mirror_callbacks_total"], 1
+            )
             self.assertEqual(shadow.verify_shadow()["failures"], 0)
 
 
