@@ -1153,9 +1153,22 @@ mod tests {
         let third_encoded = encode_v2_commit(third_base, &third, Some(b"req-3")).unwrap();
         apply_v2_commit(&mut state, &third_encoded).unwrap();
 
+        let sibling_base = state.geometry().unwrap();
+        let sibling = checkpoint_only_transaction(
+            4,
+            "thread",
+            "cp-sibling",
+            Some("cp-1"),
+            state.checkpoints[0].identity_version,
+            state.checkpoints[0].state,
+        );
+        let sibling_digest = checkpoint_operation_digest(&sibling.checkpoint).unwrap();
+        let sibling_encoded = encode_v2_commit(sibling_base, &sibling, Some(b"req-4")).unwrap();
+        apply_v2_commit(&mut state, &sibling_encoded).unwrap();
+
         let other_base = state.geometry().unwrap();
         let other = checkpoint_only_transaction(
-            4,
+            5,
             "other-thread",
             "other-root",
             None,
@@ -1163,7 +1176,7 @@ mod tests {
             state.checkpoints[0].state,
         );
         let other_digest = checkpoint_operation_digest(&other.checkpoint).unwrap();
-        let other_encoded = encode_v2_commit(other_base, &other, Some(b"req-4")).unwrap();
+        let other_encoded = encode_v2_commit(other_base, &other, Some(b"req-5")).unwrap();
         apply_v2_commit(&mut state, &other_encoded).unwrap();
 
         let before = state.geometry().unwrap();
@@ -1174,7 +1187,7 @@ mod tests {
 
         // Preparation owns replacement ledgers and cannot mutate committed state.
         assert_eq!(state.geometry().unwrap(), before);
-        assert_eq!(state.checkpoints.len(), 4);
+        assert_eq!(state.checkpoints.len(), 5);
         assert_eq!(
             state.classify_request(b"req-2", second_digest),
             Ok(V2RequestStatus::Replay {
@@ -1182,9 +1195,15 @@ mod tests {
             })
         );
         assert_eq!(
-            state.classify_request(b"req-4", other_digest),
+            state.classify_request(b"req-4", sibling_digest),
             Ok(V2RequestStatus::Replay {
                 checkpoint_ordinal: 3
+            })
+        );
+        assert_eq!(
+            state.classify_request(b"req-5", other_digest),
+            Ok(V2RequestStatus::Replay {
+                checkpoint_ordinal: 4
             })
         );
         assert!(state.deleted_checkpoints.is_empty());
@@ -1192,9 +1211,10 @@ mod tests {
 
         state.apply_prepared_delete_checkpoint_subtree(prepared);
 
-        assert_eq!(state.checkpoints.len(), 2);
+        assert_eq!(state.checkpoints.len(), 3);
         assert_eq!(state.checkpoints[0].checkpoint_id, "cp-1");
-        assert_eq!(state.checkpoints[1].checkpoint_id, "other-root");
+        assert_eq!(state.checkpoints[1].checkpoint_id, "cp-sibling");
+        assert_eq!(state.checkpoints[2].checkpoint_id, "other-root");
         assert_eq!(
             state
                 .checkpoint_ordinals
@@ -1204,8 +1224,14 @@ mod tests {
         assert_eq!(
             state
                 .checkpoint_ordinals
-                .get(&("other-thread".to_owned(), "other-root".to_owned())),
+                .get(&("thread".to_owned(), "cp-sibling".to_owned())),
             Some(&1)
+        );
+        assert_eq!(
+            state
+                .checkpoint_ordinals
+                .get(&("other-thread".to_owned(), "other-root".to_owned())),
+            Some(&2)
         );
         assert_eq!(
             state.classify_request(b"req-2", second_digest),
@@ -1216,9 +1242,15 @@ mod tests {
             Ok(V2RequestStatus::Retired)
         );
         assert_eq!(
-            state.classify_request(b"req-4", other_digest),
+            state.classify_request(b"req-4", sibling_digest),
             Ok(V2RequestStatus::Replay {
                 checkpoint_ordinal: 1
+            })
+        );
+        assert_eq!(
+            state.classify_request(b"req-5", other_digest),
+            Ok(V2RequestStatus::Replay {
+                checkpoint_ordinal: 2
             })
         );
         assert!(state
@@ -1232,7 +1264,7 @@ mod tests {
         assert_eq!(after.payload_len, before.payload_len);
         assert_eq!(after.node_count, before.node_count);
         assert_eq!(after.version_count, before.version_count);
-        assert_eq!(after.checkpoint_count, 2);
+        assert_eq!(after.checkpoint_count, 3);
 
         assert_eq!(
             apply_v2_commit(&mut state, &second_encoded),
