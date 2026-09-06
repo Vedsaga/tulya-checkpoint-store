@@ -574,6 +574,7 @@ fn apply_recovered_record(
 
 /// Append-only file handle for one history log, tracking the replayed logical
 /// tail so appends truncate any torn tail before writing.
+#[derive(Debug)]
 pub(crate) struct DurableHistoryLog {
     file: File,
     path: PathBuf,
@@ -626,7 +627,6 @@ impl DurableHistoryLog {
             .create(true)
             .truncate(false)
             .open(path)?;
-        file.try_lock_exclusive()?;
         file.try_lock_exclusive()?;
         let mut log = Self {
             file,

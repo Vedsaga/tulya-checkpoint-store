@@ -111,8 +111,19 @@ pub(crate) fn open_history_authority(dir: &Path) -> Result<OpenedHistory, Durabl
     };
     let snapshot_versions = store.version_count();
     let hot_path = dir.join(history_wal_filename(generation));
+    // A published generation always owns its hot file: the seal creates and
+    // syncs the empty next-generation log before the manifest rename, so a
+    // missing hot file after publication means external deletion, and
+    // treating it as empty would silently drop post-seal versions.
     let suffix = match fs::read(&hot_path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if manifest.is_some() {
+                return Err(DurableError::Rejected(HistoryError::Invalid(
+                    "history hot log for the published generation is missing",
+                )));
+            }
+            Vec::new()
+        }
         Err(_) => {
             return Err(DurableError::Rejected(HistoryError::Invalid(
                 "history hot log read failed",
@@ -291,6 +302,7 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::super::durable_log::DurableHistoryLog;
+    use super::super::manifest::ManifestSealed;
     use super::super::{CommitOutcome, HistoryId, VersionId};
     use super::*;
 
@@ -310,6 +322,338 @@ mod tests {
                 panic!("fixture commit must create")
             }
         }
+    }
+
+    fn durable_committed(
+        store: &mut PersistentHistoryStore,
+        log: &mut DurableHistoryLog,
+        history: HistoryId,
+        parent: Option<VersionId>,
+        payload: &[u8],
+    ) -> VersionId {
+        match store
+            .commit_durable(log, history, parent, payload, None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version.id(),
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("fixture durable commit must create")
+            }
+        }
+    }
+
+    /// Builds a store whose commits are genuinely durable in the generation-0
+    /// hot log: three versions across two histories, one bound.
+    fn durable_fixture(dir: &Path) -> PersistentHistoryStore {
+        let mut store = PersistentHistoryStore::new();
+        let mut log = DurableHistoryLog::open(&dir.join(history_wal_filename(0))).unwrap();
+        let first = store
+            .create_history_durable_with_binding(&mut log, b"thread-a")
+            .unwrap();
+        let second = store.create_history_durable(&mut log).unwrap();
+        let v0 = durable_committed(&mut store, &mut log, first, None, b"aaa");
+        let _v1 = durable_committed(&mut store, &mut log, first, Some(v0), b"aaabbb");
+        let _v2 = durable_committed(&mut store, &mut log, second, None, b"eee");
+        store
+    }
+
+    fn assert_same_authority(expected: &PersistentHistoryStore, actual: &PersistentHistoryStore) {
+        assert_eq!(actual.versions.len(), expected.versions.len());
+        assert_eq!(actual.histories, expected.histories);
+        assert_eq!(actual.next_history_id, expected.next_history_id);
+        assert_eq!(actual.next_version_id, expected.next_version_id);
+        assert_eq!(actual.active_requests, expected.active_requests);
+        assert_eq!(actual.retired_requests, expected.retired_requests);
+        assert_eq!(actual.history_bindings, expected.history_bindings);
+        assert_eq!(actual.version_bindings, expected.version_bindings);
+        for version in &expected.versions {
+            let reopened = actual.lookup_version(version.id()).unwrap();
+            assert_eq!(reopened, *version);
+            let mut expected_bytes = Vec::new();
+            let mut actual_bytes = Vec::new();
+            expected
+                .read(
+                    *version,
+                    0,
+                    version.root().logical_len().get(),
+                    &mut expected_bytes,
+                )
+                .unwrap();
+            actual
+                .read(
+                    reopened,
+                    0,
+                    reopened.root().logical_len().get(),
+                    &mut actual_bytes,
+                )
+                .unwrap();
+            assert_eq!(actual_bytes, expected_bytes);
+        }
+    }
+
+    #[test]
+    fn crash_before_any_publication_recovers_genesis_hot() {
+        let temp = fixture_dir();
+        let store = durable_fixture(temp.path());
+
+        let opened = open_history_authority(temp.path()).unwrap();
+        assert_eq!(opened.generation, 0);
+        assert_eq!(opened.stats.snapshot_versions, 0);
+        let hot_len = std::fs::metadata(temp.path().join(history_wal_filename(0)))
+            .unwrap()
+            .len();
+        assert_eq!(opened.stats.suffix_bytes, hot_len);
+        assert_same_authority(&store, &opened.store);
+    }
+
+    #[test]
+    fn stray_tmp_files_are_ignored_before_rename() {
+        let temp = fixture_dir();
+        let store = durable_fixture(temp.path());
+        // A crash between the tmp write and its rename leaves stray files
+        // that must never confer authority.
+        std::fs::write(
+            temp.path()
+                .join(format!("{}.tmp", history_snapshot_filename(1))),
+            b"incomplete snapshot bytes",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join(format!("{HISTORY_MANIFEST_FILE}.tmp")),
+            b"incomplete manifest bytes",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join(format!("{}.tmp", history_wal_filename(1))),
+            b"incomplete hot bytes",
+        )
+        .unwrap();
+
+        let opened = open_history_authority(temp.path()).unwrap();
+        assert_eq!(opened.generation, 0);
+        assert_same_authority(&store, &opened.store);
+    }
+
+    #[test]
+    fn published_snapshot_without_manifest_stays_on_old_authority() {
+        let temp = fixture_dir();
+        let store = durable_fixture(temp.path());
+        // A sealed file alone is not authority: only the manifest moves it.
+        // Garbage bytes prove the file is never even opened pre-publication.
+        std::fs::write(
+            temp.path().join(history_snapshot_filename(1)),
+            b"forged snapshot without manifest",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join(history_wal_filename(1)), b"").unwrap();
+
+        let opened = open_history_authority(temp.path()).unwrap();
+        assert_eq!(opened.generation, 0);
+        assert_same_authority(&store, &opened.store);
+    }
+
+    #[test]
+    fn superseded_hot_is_ignored_after_publication() {
+        let temp = fixture_dir();
+        let store = durable_fixture(temp.path());
+        let summary = seal_history_generation(&store, temp.path()).unwrap();
+        assert_eq!(summary.generation, 1);
+        assert!(summary.recycled_hot);
+        // Resurrect the superseded hot file with plausible bytes: the new
+        // authority must never read it again.
+        std::fs::write(
+            temp.path().join(history_wal_filename(0)),
+            b"resurrected hot",
+        )
+        .unwrap();
+
+        let opened = open_history_authority(temp.path()).unwrap();
+        assert_eq!(opened.generation, 1);
+        assert_eq!(opened.stats.snapshot_versions, 3);
+        assert_eq!(opened.stats.suffix_bytes, 0);
+        assert_same_authority(&store, &opened.store);
+    }
+
+    #[test]
+    fn missing_new_hot_fails_closed() {
+        let temp = fixture_dir();
+        let store = durable_fixture(temp.path());
+        seal_history_generation(&store, temp.path()).unwrap();
+        std::fs::remove_file(temp.path().join(history_wal_filename(1))).unwrap();
+
+        let error = open_history_authority(temp.path()).unwrap_err();
+        assert!(matches!(error, DurableError::Rejected(_)));
+    }
+
+    #[test]
+    fn sealed_snapshot_missing_fails_closed() {
+        let temp = fixture_dir();
+        let store = durable_fixture(temp.path());
+        seal_history_generation(&store, temp.path()).unwrap();
+        std::fs::remove_file(temp.path().join(history_snapshot_filename(1))).unwrap();
+
+        let error = open_history_authority(temp.path()).unwrap_err();
+        assert!(matches!(error, DurableError::Rejected(_)));
+    }
+
+    #[test]
+    fn torn_manifest_fails_closed() {
+        let temp = fixture_dir();
+        let store = durable_fixture(temp.path());
+        seal_history_generation(&store, temp.path()).unwrap();
+        let manifest_path = temp.path().join(HISTORY_MANIFEST_FILE);
+        let bytes = std::fs::read(&manifest_path).unwrap();
+
+        std::fs::write(&manifest_path, &bytes[..3]).unwrap();
+        assert!(matches!(
+            open_history_authority(temp.path()).unwrap_err(),
+            DurableError::Rejected(_)
+        ));
+
+        std::fs::write(&manifest_path, b"{}").unwrap();
+        assert!(matches!(
+            open_history_authority(temp.path()).unwrap_err(),
+            DurableError::Rejected(_)
+        ));
+
+        let mut flipped = bytes.clone();
+        let last = flipped.len() - 1;
+        flipped[last] ^= 0xff;
+        std::fs::write(&manifest_path, &flipped).unwrap();
+        assert!(matches!(
+            open_history_authority(temp.path()).unwrap_err(),
+            DurableError::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn snapshot_length_mismatch_fails_closed() {
+        let temp = fixture_dir();
+        let store = durable_fixture(temp.path());
+        seal_history_generation(&store, temp.path()).unwrap();
+        let snap_path = temp.path().join(history_snapshot_filename(1));
+        let mut bytes = std::fs::read(&snap_path).unwrap();
+        bytes.push(0x00);
+        std::fs::write(&snap_path, &bytes).unwrap();
+
+        let error = open_history_authority(temp.path()).unwrap_err();
+        assert!(matches!(error, DurableError::Rejected(_)));
+    }
+
+    #[test]
+    fn snapshot_byte_flip_fails_closed_on_digest() {
+        let temp = fixture_dir();
+        let store = durable_fixture(temp.path());
+        seal_history_generation(&store, temp.path()).unwrap();
+        let snap_path = temp.path().join(history_snapshot_filename(1));
+        let mut bytes = std::fs::read(&snap_path).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0x01;
+        std::fs::write(&snap_path, &bytes).unwrap();
+
+        let error = open_history_authority(temp.path()).unwrap_err();
+        assert!(matches!(error, DurableError::Rejected(_)));
+    }
+
+    #[test]
+    fn snapshot_generation_mismatch_fails_closed() {
+        let temp = fixture_dir();
+        let store = durable_fixture(temp.path());
+        // A well-formed snapshot for generation 9, published under manifest
+        // generation 1 with a matching digest: length and digest agree, so
+        // only the generation cross-check can catch it.
+        let forged = encode_history_snapshot(&store, 9, 0).unwrap();
+        let snap_path = temp.path().join(history_snapshot_filename(1));
+        write_file_synced(&snap_path, &forged).unwrap();
+        let manifest = HistoryManifest::for_generation(
+            1,
+            Some(ManifestSealed::for_snapshot(forged.len() as u64, &forged)),
+        );
+        write_file_synced(
+            &temp.path().join(HISTORY_MANIFEST_FILE),
+            &encode_history_manifest(&manifest),
+        )
+        .unwrap();
+        std::fs::write(temp.path().join(history_wal_filename(1)), b"").unwrap();
+
+        let error = open_history_authority(temp.path()).unwrap_err();
+        assert!(matches!(error, DurableError::Rejected(_)));
+    }
+
+    #[test]
+    fn corrupt_complete_hot_frame_fails_closed() {
+        let temp = fixture_dir();
+        let mut store = durable_fixture(temp.path());
+        seal_history_generation(&store, temp.path()).unwrap();
+        let mut log = DurableHistoryLog::open(&temp.path().join(history_wal_filename(1))).unwrap();
+        let history = HistoryId::new(0);
+        durable_committed(
+            &mut store,
+            &mut log,
+            history,
+            Some(VersionId::new(1)),
+            b"fff",
+        );
+        drop(log);
+        // Corrupt the frame magic: a complete-but-invalid frame must fail,
+        // never be mistaken for a torn tail.
+        let hot_path = temp.path().join(history_wal_filename(1));
+        let mut bytes = std::fs::read(&hot_path).unwrap();
+        assert!(!bytes.is_empty());
+        bytes[0] ^= 0xff;
+        std::fs::write(&hot_path, &bytes).unwrap();
+
+        let error = open_history_authority(temp.path()).unwrap_err();
+        assert!(matches!(error, DurableError::Rejected(_)));
+    }
+
+    #[test]
+    fn second_writer_is_rejected_with_contention() {
+        let temp = fixture_dir();
+        let path = temp.path().join(history_wal_filename(0));
+        let first = DurableHistoryLog::open_write(&path).unwrap();
+        let error = DurableHistoryLog::open_write(&path).unwrap_err();
+        assert!(DurableHistoryLog::is_lock_contention(&error));
+        drop(first);
+        // Releasing the handle releases the lock: the next writer proceeds.
+        let _reopened = DurableHistoryLog::open_write(&path).unwrap();
+    }
+
+    #[test]
+    fn reopen_reports_bounded_restart_inputs() {
+        let temp = fixture_dir();
+        let mut store = durable_fixture(temp.path());
+        seal_history_generation(&store, temp.path()).unwrap();
+        let mut log = DurableHistoryLog::open(&temp.path().join(history_wal_filename(1))).unwrap();
+        let history = HistoryId::new(0);
+        durable_committed(
+            &mut store,
+            &mut log,
+            history,
+            Some(VersionId::new(1)),
+            b"fff",
+        );
+        durable_committed(
+            &mut store,
+            &mut log,
+            history,
+            Some(VersionId::new(3)),
+            b"ggg",
+        );
+        drop(log);
+
+        let opened = open_history_authority(temp.path()).unwrap();
+        assert_eq!(opened.generation, 1);
+        // Restart cost is exactly snapshot versions plus hot suffix bytes:
+        // both are reported so callers can bound reopen work with seal
+        // policy instead of trusting it.
+        assert_eq!(opened.stats.snapshot_versions, 3);
+        let hot_len = std::fs::metadata(temp.path().join(history_wal_filename(1)))
+            .unwrap()
+            .len();
+        assert!(hot_len > 0);
+        assert_eq!(opened.stats.suffix_bytes, hot_len);
+        assert_same_authority(&store, &opened.store);
     }
 
     fn sealed_fixture(dir: &Path) -> PersistentHistoryStore {

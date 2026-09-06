@@ -655,7 +655,7 @@ impl CheckpointStore {
         let mut history_log = DurableHistoryLog::open(&self.dir.join(HISTORY_WAL_FILE))?;
         let version = self
             .history
-            .commit_durable(&mut history_log, history, parent, payload, None)
+            .commit_durable(&mut history_log, history, parent, payload, None, None)
             .map_err(|error| Self::durable_history_error(&self.dir, error))?;
         let version = match version {
             CommitOutcome::Committed(version) => version,
