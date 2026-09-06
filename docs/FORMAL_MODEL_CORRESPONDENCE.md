@@ -78,12 +78,20 @@ rule. The full production interface remains an acceptance target in
 
 ### Compatibility rule
 
-Format-v1 bytes and their meaning are frozen. The first adapter must preserve
-all current v1 reads, writes, recovery behavior, hashes, and fixtures.
+The repository has no supported external stores and the first public release
+has not yet been cut. The existing left-deep prototype format is therefore not
+a release compatibility promise.
 
-If persisted subtree lengths, balancing metadata, or a new commitment scheme
-cannot be encoded without changing v1 semantics, the writable redesign must be
-Format v2.
+For the first public release, the staged balanced design currently called v2
+will become **release Format v1**. Prototype bytes do not require migration or
+downgrade support.
+
+After the first public release, the released Format-v1 bytes and meaning become
+frozen. Any later incompatible change must use a new format version and an
+explicit upgrade/migration policy.
+
+This one-time reset is the authoritative decision in
+docs/PRODUCTION_READINESS.md and docs/HN_LAUNCH_EXECUTION_HANDOFF.md.
 
 ### Commitment rule
 
@@ -95,23 +103,21 @@ commitment strategy (or explicitly separate structural commitment from an
 optional full-byte verification hash), persist the required metadata, and test
 failure-closed decoding.
 
-### Format-v1 message-append compatibility step
+### Prototype message-append compatibility step
 
-The Format-v1 message append path now derives child logical length from persisted
-`CheckpointInfo.logical_state_len` and feeds the legacy whole-state XXH3 through
-bounded checkpoint-range chunks. It no longer reconstructs the complete parent
-canonical JSON in one temporary vector merely to derive the child metadata.
+The current prototype message append path derives child logical length from
+persisted `CheckpointInfo.logical_state_len` and feeds the prototype whole-state
+XXH3 through bounded checkpoint-range chunks. It no longer reconstructs the
+complete parent canonical JSON in one temporary vector merely to derive child
+metadata.
 
-This is a bounded-incremental-RAM compatibility improvement, **not** completion
-of the append-locality gate. Format v1 still persists one XXH3-64 over the full
-canonical checkpoint. Because that value is not a composable commitment for
-concatenation, preserving released v1 hash semantics still requires O(parent)
-read/hash work for a child append.
+This is a bounded-RAM prototype improvement, **not** completion of the release
+append-locality gate. The prototype still requires O(parent) read/hash work.
 
-Accordingly, the production locality redesign requires a new writable format
-with persisted subtree lengths plus a composable structural/content commitment.
-That is a Format-v2 concern; the existing v1 `state_hash` field must not be
-reinterpreted as such a commitment.
+The first released writable format must instead use the staged balanced design
+with persisted subtree lengths and a sound structural/content commitment. The
+prototype XXH3 field is not a release compatibility constraint and must not
+dictate the new format.
 
 ### Complexity rule
 
@@ -125,22 +131,24 @@ that is not linear in unchanged parent size.
 
 ## Planned implementation sequence
 
-1. Compile the internal sequence contract without changing Format-v1 bytes.
-2. Adapt existing v1 root lookup, logical-length discovery, and range reads to
-   typed `PersistentRoot` / `LogicalLength` boundaries.
-3. Bound Format-v1 message-append temporary materialization while preserving its
-   exact whole-state XXH3 semantics; this step does not satisfy append locality.
-4. Design the writable Format-v2 root/node metadata and composable commitment,
-   then add the real sequence append operation with its checkpoint caller.
-5. Add structural tests that expose the current left-deep depth as a legacy
-   property rather than an accepted production invariant.
-6. Implement the balanced representation with persisted subtree lengths and
-   Format-v2 commitment metadata.
-7. Add bounded streaming and structural verification to the sequence boundary
-   as their production implementations land.
-8. Add balancing, historical-preservation, range-locality, reopen, corruption,
-   and scaling evidence before checking the corresponding production-readiness
-   gates.
+The operational work order now lives in
+`docs/HN_LAUNCH_EXECUTION_HANDOFF.md`.
+
+At this level, the correspondence sequence is:
+
+1. integrate the staged balanced persistent sequence into the real
+   `CheckpointStore`;
+2. make the staged design the first released Format v1 rather than preserving
+   the unreleased prototype bytes;
+3. close the Lean/Rust boundary with deterministic canonical vectors for the
+   release format;
+4. preserve the Lean-proved logical invariants: historical stability,
+   logarithmic/local access, old-or-new recovery, durable request identity,
+   safe reclamation, and bounded restart;
+5. validate concrete Rust/filesystem behavior with fault, crash, corruption,
+   locality, and reopen tests;
+6. keep Rust/Lean implementation-refinement claims out of documentation unless a
+   real refinement artifact is completed.
 
 ## Claim discipline
 
