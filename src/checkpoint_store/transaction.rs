@@ -1,4 +1,5 @@
 use super::*;
+use crate::error_classification::capacity_error;
 
 pub(super) fn read_u32(data: &[u8], offset: usize) -> Result<u32, CheckpointStoreError> {
     let end = offset
@@ -1281,56 +1282,183 @@ pub(super) fn validate_new_nodes(
     Ok(())
 }
 
-pub(super) fn apply_transaction(
+fn try_clone_string(value: &str, message: &'static str) -> Result<String, CheckpointStoreError> {
+    let mut output = String::new();
+    output
+        .try_reserve_exact(value.len())
+        .map_err(|_| capacity_error(message))?;
+    output.push_str(value);
+    Ok(output)
+}
+
+fn try_clone_bytes(value: &[u8], message: &'static str) -> Result<Vec<u8>, CheckpointStoreError> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(value.len())
+        .map_err(|_| capacity_error(message))?;
+    output.extend_from_slice(value);
+    Ok(output)
+}
+
+pub(super) struct PreparedTransactionApply {
+    tx: ParsedTransaction,
+    new_thread: Option<(String, String, u32)>,
+    checkpoint_key: (String, String),
+    request_record: Option<(Vec<u8>, RequestRecord)>,
+}
+
+pub(super) fn prepare_transaction_apply(
     state: &mut StoreState,
-    tx: &ParsedTransaction,
-) -> Result<(), CheckpointStoreError> {
+    tx: ParsedTransaction,
+) -> Result<PreparedTransactionApply, CheckpointStoreError> {
+    let checkpoint_count = tx
+        .checkpoint_count
+        .checked_sub(1)
+        .ok_or_else(|| format_error("transaction checkpoint count underflow"))?;
     if Geometry::from_state(state)?
         != (Geometry {
             byte_len: tx.byte_start,
             node_count: tx.node_start,
             wide_count: tx.wide_start,
             version_count: tx.version_start,
-            checkpoint_count: tx.checkpoint_count - 1,
+            checkpoint_count,
         })
     {
         return Err(format_error(
             "transaction does not append to current state geometry",
         ));
     }
-    validate_transaction_against_state(state, tx)?;
-    state.arena_bytes.extend_from_slice(&tx.bytes);
-    state.compact_nodes.extend_from_slice(&tx.compact_nodes);
-    state.wide_nodes.extend_from_slice(&tx.wide_nodes);
-    state.versions.extend_from_slice(&tx.roots);
-    state.parents.extend_from_slice(&tx.parents);
-    if !state.thread_ordinals.contains_key(&tx.checkpoint.thread_id) {
+    validate_transaction_against_state(state, &tx)?;
+
+    state
+        .arena_bytes
+        .try_reserve(tx.bytes.len())
+        .map_err(|_| capacity_error("arena allocation reserve failed before WAL commit"))?;
+    state
+        .compact_nodes
+        .try_reserve(tx.compact_nodes.len())
+        .map_err(|_| capacity_error("compact-node allocation reserve failed before WAL commit"))?;
+    state
+        .wide_nodes
+        .try_reserve(tx.wide_nodes.len())
+        .map_err(|_| capacity_error("wide-node allocation reserve failed before WAL commit"))?;
+    state
+        .versions
+        .try_reserve(tx.roots.len())
+        .map_err(|_| capacity_error("version allocation reserve failed before WAL commit"))?;
+    state.parents.try_reserve(tx.parents.len()).map_err(|_| {
+        capacity_error("version-parent allocation reserve failed before WAL commit")
+    })?;
+    state
+        .checkpoints
+        .try_reserve(1)
+        .map_err(|_| capacity_error("checkpoint allocation reserve failed before WAL commit"))?;
+    state.checkpoint_ordinals.try_reserve(1).map_err(|_| {
+        capacity_error("checkpoint-index allocation reserve failed before WAL commit")
+    })?;
+
+    let new_thread = if state.thread_ordinals.contains_key(&tx.checkpoint.thread_id) {
+        None
+    } else {
         let ordinal = u32::try_from(state.threads.len())
             .map_err(|_| format_error("thread ordinal exceeds u32"))?;
         state
-            .thread_ordinals
-            .insert(tx.checkpoint.thread_id.clone(), ordinal);
-        state.threads.push(tx.checkpoint.thread_id.clone());
-    }
-    state.checkpoint_ordinals.insert(
-        (
-            tx.checkpoint.thread_id.clone(),
-            tx.checkpoint.checkpoint_id.clone(),
-        ),
-        tx.checkpoint.ordinal,
+            .threads
+            .try_reserve(1)
+            .map_err(|_| capacity_error("thread allocation reserve failed before WAL commit"))?;
+        state.thread_ordinals.try_reserve(1).map_err(|_| {
+            capacity_error("thread-index allocation reserve failed before WAL commit")
+        })?;
+        Some((
+            try_clone_string(
+                &tx.checkpoint.thread_id,
+                "thread-index key allocation failed before WAL commit",
+            )?,
+            try_clone_string(
+                &tx.checkpoint.thread_id,
+                "thread value allocation failed before WAL commit",
+            )?,
+            ordinal,
+        ))
+    };
+
+    let checkpoint_key = (
+        try_clone_string(
+            &tx.checkpoint.thread_id,
+            "checkpoint-index thread allocation failed before WAL commit",
+        )?,
+        try_clone_string(
+            &tx.checkpoint.checkpoint_id,
+            "checkpoint-index id allocation failed before WAL commit",
+        )?,
     );
-    if let Some(request_id) = tx.request_id.as_ref() {
-        state.request_records.insert(
-            request_id.clone(),
+    let request_record = if let Some(request_id) = tx.request_id.as_ref() {
+        state.request_records.try_reserve(1).map_err(|_| {
+            capacity_error("request-index allocation reserve failed before WAL commit")
+        })?;
+        Some((
+            try_clone_bytes(
+                request_id,
+                "request-index key allocation failed before WAL commit",
+            )?,
             RequestRecord {
-                key: request_id.clone(),
+                key: try_clone_bytes(
+                    request_id,
+                    "request-record key allocation failed before WAL commit",
+                )?,
                 operation_digest: tx.operation_digest,
                 checkpoint_ordinal: tx.checkpoint.ordinal,
             },
-        );
+        ))
+    } else {
+        None
+    };
+
+    Ok(PreparedTransactionApply {
+        tx,
+        new_thread,
+        checkpoint_key,
+        request_record,
+    })
+}
+
+pub(super) fn apply_prepared_transaction(
+    state: &mut StoreState,
+    prepared: PreparedTransactionApply,
+) {
+    let PreparedTransactionApply {
+        tx,
+        new_thread,
+        checkpoint_key,
+        request_record,
+    } = prepared;
+    let ParsedTransaction {
+        bytes,
+        compact_nodes,
+        wide_nodes,
+        roots,
+        parents,
+        checkpoint,
+        ..
+    } = tx;
+    let checkpoint_ordinal = checkpoint.ordinal;
+
+    state.arena_bytes.extend_from_slice(&bytes);
+    state.compact_nodes.extend_from_slice(&compact_nodes);
+    state.wide_nodes.extend_from_slice(&wide_nodes);
+    state.versions.extend_from_slice(&roots);
+    state.parents.extend_from_slice(&parents);
+    if let Some((thread_key, thread_value, ordinal)) = new_thread {
+        let _ = state.thread_ordinals.insert(thread_key, ordinal);
+        state.threads.push(thread_value);
     }
-    state.checkpoints.push(tx.checkpoint.clone());
-    Ok(())
+    let _ = state
+        .checkpoint_ordinals
+        .insert(checkpoint_key, checkpoint_ordinal);
+    if let Some((request_id, record)) = request_record {
+        let _ = state.request_records.insert(request_id, record);
+    }
+    state.checkpoints.push(checkpoint);
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -435,7 +435,7 @@ pub(super) fn ensure_format_v1_manifest(
     if manifest.store_id.is_none() {
         manifest.store_id = Some(StoreId::generate()?);
     }
-    staged_write_new(&path, &manifest_bytes(&manifest)?)?;
+    staged_write_manifest(&path, &manifest_bytes(&manifest)?)?;
     Ok(manifest)
 }
 

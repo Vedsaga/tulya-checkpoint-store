@@ -1,0 +1,353 @@
+{
+  "schema": "tulya-format-v2-conformance-v1",
+  "operation_digest_vectors": [
+    {
+      "name": "initial-checkpoint",
+      "checkpoint_no": 1,
+      "thread_id": "thread",
+      "checkpoint_id": "cp-1",
+      "parent_checkpoint_id": null,
+      "identity_version": 0,
+      "state_payload_hex": "616263",
+      "expected_operation_digest_hex": "6e0363445809801219e0a146b177509d7a74ff7cbff1ee35013d94ad433e9eda"
+    },
+    {
+      "name": "identity-version-relocation-does-not-change-digest",
+      "checkpoint_no": 1,
+      "thread_id": "thread",
+      "checkpoint_id": "cp-1",
+      "parent_checkpoint_id": null,
+      "identity_version": 42,
+      "state_payload_hex": "616263",
+      "expected_operation_digest_hex": "6e0363445809801219e0a146b177509d7a74ff7cbff1ee35013d94ad433e9eda"
+    }
+  ],
+  "commit_envelope_vectors": [
+    {
+      "name": "requestless-commit-has-zero-operation-digest",
+      "request_id_hex": null,
+      "expected_operation_digest_hex": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "requestful-commit-binds-logical-operation-digest",
+      "request_id_hex": "7265712d31",
+      "expected_operation_digest_hex": "6e0363445809801219e0a146b177509d7a74ff7cbff1ee35013d94ad433e9eda"
+    }
+  ],
+  "recovery_vectors": [
+    {
+      "name": "complete-frames-stop-at-zero-reserve",
+      "kind": "two-frames-zero-reserve",
+      "expected_commit_count": 2,
+      "expected_stop": "zero_reserve",
+      "expected_checkpoint_count": 2
+    },
+    {
+      "name": "torn-final-frame-is-uncommitted",
+      "kind": "torn-second-frame",
+      "expected_commit_count": 1,
+      "expected_stop": "torn_final_commit",
+      "expected_checkpoint_count": 1
+    }
+  ],
+  "recovery_invalid_vectors": [
+    {
+      "name": "nonzero-byte-after-zero-reserve-is-rejected",
+      "kind": "reserve-garbage",
+      "expected": "reject"
+    },
+    {
+      "name": "bare-structural-transaction-is-rejected",
+      "kind": "bare-structural",
+      "expected": "reject"
+    },
+    {
+      "name": "corrupted-complete-frame-is-rejected",
+      "kind": "corrupt-complete-frame",
+      "expected": "reject"
+    },
+    {
+      "name": "duplicate-physical-retry-is-rejected",
+      "kind": "duplicate-physical-retry",
+      "expected": "reject"
+    }
+  ],
+  "snapshot_vectors": [
+    {
+      "name": "one-checkpoint-active-ledger",
+      "kind": "one-checkpoint",
+      "expected_length": 530,
+      "expected_digest_hex": "ae8abba06121c8c689ed2b3cf822fc750b184f373e0b947a9c0ab9ad448d0cfc"
+    },
+    {
+      "name": "tombstone-only-deleted-checkpoint",
+      "kind": "tombstone-only",
+      "thread_id": "thread",
+      "checkpoint_id": "cp-old",
+      "expected_length": 124,
+      "expected_digest_hex": "6a63a9f5cace063e835d3f61b4886d2a4a3fd6a95ac6f34162baf4c149825782",
+      "expected_digest_input_length": 128,
+      "expected_digest_input_hex": "74756c79612d636865636b706f696e742d76322f7365616c65642d736e617073686f740054325332020000007c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000543258321c000000060000000600000074687265616463702d6f6c64"
+    }
+  ],
+  "structural_commitment_vectors": [
+    {
+      "name": "leaf-abc",
+      "kind": "leaf",
+      "node_id": 7,
+      "payload_offset": 9,
+      "payload_hex": "616263",
+      "expected_node_hex": "54324e32010001000300000000000000090000000000000003000000000000000000000000000000631a198b7685ef4dfb1032c761262dc81d3f1c2b1e5e740f81f056e1b847d068",
+      "expected_root_hex": "543252320100010007000000000000000300000000000000631a198b7685ef4dfb1032c761262dc81d3f1c2b1e5e740f81f056e1b847d068"
+    },
+    {
+      "name": "branch-abc-xyz",
+      "kind": "branch",
+      "left": {
+        "node_id": 7,
+        "payload_offset": 9,
+        "payload_hex": "616263"
+      },
+      "right": {
+        "node_id": 8,
+        "payload_offset": 12,
+        "payload_hex": "58595a"
+      },
+      "root_node_id": 9,
+      "expected_node_hex": "54324e320200020006000000000000000700000000000000080000000000000003000000000000004f6f4fc9213f22b2b4eb2e67e47f4ead5e75beddd8bcaa3abb257193323ed3a7",
+      "expected_root_hex": "5432523201000200090000000000000006000000000000004f6f4fc9213f22b2b4eb2e67e47f4ead5e75beddd8bcaa3abb257193323ed3a7"
+    }
+  ],
+  "structural_history_vectors": [
+    {
+      "name": "historical-parent-root-remains-unchanged",
+      "kind": "historical-parent-preserved",
+      "base_payload_hex": "726f6f74",
+      "left_append_hex": "2d6c656674",
+      "right_append_hex": "2d7269676874",
+      "expected_parent_hex": "726f6f74",
+      "expected_left_hex": "726f6f742d6c656674",
+      "expected_right_hex": "726f6f742d7269676874"
+    },
+    {
+      "name": "sibling-branch-commitments-are-independent",
+      "kind": "sibling-independent",
+      "base_payload_hex": "6c656674",
+      "left_append_hex": "2d61",
+      "right_append_hex": "2d62",
+      "expected_parent_hex": "6c656674",
+      "expected_left_hex": "6c6566742d61",
+      "expected_right_hex": "6c6566742d62"
+    }
+  ],
+  "structural_invalid_vectors": [
+    {
+      "name": "noncanonical-node-height-is-rejected",
+      "kind": "node-height",
+      "expected": "reject"
+    },
+    {
+      "name": "noncanonical-root-flags-are-rejected",
+      "kind": "root-flags",
+      "expected": "reject"
+    }
+  ],
+  "compaction_vectors": [
+    {
+      "name": "deleted-middle-history-compacts-with-logical-digests-preserved",
+      "kind": "deleted-middle-subtree",
+      "expected_compact_payload_hex": "616161646464656565",
+      "expected_compact_node_count": 5,
+      "expected_compact_version_count": 3,
+      "expected_compact_checkpoint_count": 3,
+      "expected_identity_versions": [0, 1, 2],
+      "expected_live": [
+        ["thread", "cp-1"],
+        ["thread", "cp-sibling"],
+        ["other-thread", "other-root"]
+      ]
+    }
+  ],
+  "request_lifecycle_vectors": [
+    {
+      "name": "active-same-digest-is-replay",
+      "active": [
+        {
+          "request_id_hex": "7265712d31",
+          "operation_digest_hex": "6e0363445809801219e0a146b177509d7a74ff7cbff1ee35013d94ad433e9eda",
+          "checkpoint_ordinal": 7
+        }
+      ],
+      "retired": [],
+      "query": {
+        "request_id_hex": "7265712d31",
+        "operation_digest_hex": "6e0363445809801219e0a146b177509d7a74ff7cbff1ee35013d94ad433e9eda"
+      },
+      "expected": "replay",
+      "expected_checkpoint_ordinal": 7,
+      "mutates": false
+    },
+    {
+      "name": "active-different-digest-is-conflict",
+      "active": [
+        {
+          "request_id_hex": "7265712d31",
+          "operation_digest_hex": "6e0363445809801219e0a146b177509d7a74ff7cbff1ee35013d94ad433e9eda",
+          "checkpoint_ordinal": 7
+        }
+      ],
+      "retired": [],
+      "query": {
+        "request_id_hex": "7265712d31",
+        "operation_digest_hex": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "expected": "conflict",
+      "expected_checkpoint_ordinal": null,
+      "mutates": false
+    },
+    {
+      "name": "retired-same-digest-is-nonresurrecting",
+      "active": [],
+      "retired": [
+        {
+          "request_id_hex": "7265712d31",
+          "operation_digest_hex": "6e0363445809801219e0a146b177509d7a74ff7cbff1ee35013d94ad433e9eda"
+        }
+      ],
+      "query": {
+        "request_id_hex": "7265712d31",
+        "operation_digest_hex": "6e0363445809801219e0a146b177509d7a74ff7cbff1ee35013d94ad433e9eda"
+      },
+      "expected": "retired",
+      "expected_checkpoint_ordinal": null,
+      "mutates": false
+    },
+    {
+      "name": "retired-different-digest-is-conflict",
+      "active": [],
+      "retired": [
+        {
+          "request_id_hex": "7265712d31",
+          "operation_digest_hex": "6e0363445809801219e0a146b177509d7a74ff7cbff1ee35013d94ad433e9eda"
+        }
+      ],
+      "query": {
+        "request_id_hex": "7265712d31",
+        "operation_digest_hex": "2222222222222222222222222222222222222222222222222222222222222222"
+      },
+      "expected": "conflict",
+      "expected_checkpoint_ordinal": null,
+      "mutates": false
+    },
+    {
+      "name": "unknown-identity-is-new",
+      "active": [],
+      "retired": [],
+      "query": {
+        "request_id_hex": "7265712d32",
+        "operation_digest_hex": "3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "expected": "new",
+      "expected_checkpoint_ordinal": null,
+      "mutates": false
+    }
+  ],
+  "invalid_snapshot_vectors": [
+    {
+      "name": "active-retired-request-overlap-is-rejected",
+      "kind": "active-retired-overlap",
+      "expected": "reject"
+    }
+  ],
+  "deletion_vectors": [
+    {
+      "name": "delete-middle-subtree-retains-sibling",
+      "base_state_payload_hex": "616263",
+      "checkpoints": [
+        {
+          "checkpoint_no": 1,
+          "thread_id": "thread",
+          "checkpoint_id": "cp-1",
+          "parent_checkpoint_id": null,
+          "identity_version": 0,
+          "request_id_hex": "7265712d31"
+        },
+        {
+          "checkpoint_no": 2,
+          "thread_id": "thread",
+          "checkpoint_id": "cp-2",
+          "parent_checkpoint_id": "cp-1",
+          "identity_version": 0,
+          "request_id_hex": "7265712d32"
+        },
+        {
+          "checkpoint_no": 3,
+          "thread_id": "thread",
+          "checkpoint_id": "cp-3",
+          "parent_checkpoint_id": "cp-2",
+          "identity_version": 0,
+          "request_id_hex": "7265712d33"
+        },
+        {
+          "checkpoint_no": 4,
+          "thread_id": "thread",
+          "checkpoint_id": "cp-sibling",
+          "parent_checkpoint_id": "cp-1",
+          "identity_version": 0,
+          "request_id_hex": "7265712d34"
+        },
+        {
+          "checkpoint_no": 5,
+          "thread_id": "other-thread",
+          "checkpoint_id": "other-root",
+          "parent_checkpoint_id": null,
+          "identity_version": 0,
+          "request_id_hex": "7265712d35"
+        }
+      ],
+      "delete": {
+        "thread_id": "thread",
+        "checkpoint_id": "cp-2"
+      },
+      "expected_live": [
+        ["thread", "cp-1"],
+        ["thread", "cp-sibling"],
+        ["other-thread", "other-root"]
+      ],
+      "expected_retired_request_ids_hex": ["7265712d32", "7265712d33"],
+      "expected_deleted": [
+        ["thread", "cp-2"],
+        ["thread", "cp-3"]
+      ],
+      "expected_active_request_ordinals": [
+        {"request_id_hex": "7265712d31", "checkpoint_ordinal": 0},
+        {"request_id_hex": "7265712d34", "checkpoint_ordinal": 1},
+        {"request_id_hex": "7265712d35", "checkpoint_ordinal": 2}
+      ],
+      "clear_sequence_geometry": false
+    },
+    {
+      "name": "delete-last-checkpoint-leaves-tombstone-only",
+      "base_state_payload_hex": "616263",
+      "checkpoints": [
+        {
+          "checkpoint_no": 1,
+          "thread_id": "thread",
+          "checkpoint_id": "cp-1",
+          "parent_checkpoint_id": null,
+          "identity_version": 0,
+          "request_id_hex": "7265712d31"
+        }
+      ],
+      "delete": {
+        "thread_id": "thread",
+        "checkpoint_id": "cp-1"
+      },
+      "expected_live": [],
+      "expected_retired_request_ids_hex": ["7265712d31"],
+      "expected_deleted": [["thread", "cp-1"]],
+      "expected_active_request_ordinals": [],
+      "clear_sequence_geometry": true
+    }
+  ]
+}

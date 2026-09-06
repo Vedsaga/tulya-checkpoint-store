@@ -48,6 +48,12 @@ struct AppendInput {
     messages: Vec<Value>,
 }
 
+#[derive(Debug)]
+struct DeleteInput {
+    thread_id: String,
+    checkpoint_id: String,
+}
+
 #[derive(Debug, Default)]
 struct ImportReport {
     checkpoint_count: u64,
@@ -293,6 +299,43 @@ fn route(
                 }),
             ))
         }
+        (Method::Post, "/api/delete") => {
+            let body = read_body_limited(request, MAX_JSON_BODY_BYTES)?;
+            let value: Value = serde_json::from_slice(&body)
+                .map_err(|error| ApiError::bad_request(format!("invalid JSON: {error}")))?;
+            let input = parse_delete_input(value)?;
+            let report = store
+                .delete_checkpoint_subtree(&input.thread_id, &input.checkpoint_id)
+                .map_err(append_store_error)?;
+            Ok(Reply::json(
+                200,
+                json!({
+                    "ok": true,
+                    "operation": "delete-subtree",
+                    "thread_id": input.thread_id,
+                    "checkpoint_id": input.checkpoint_id,
+                    "generation": report.generation,
+                    "deleted_checkpoint_count": report.deleted_checkpoint_count,
+                    "retained_checkpoint_count": report.retained_checkpoint_count,
+                    "rewritten_bytes": report.rewritten_bytes,
+                    "before": {
+                        "file_length_bytes": report.before.file_length_bytes,
+                        "allocated_bytes": report.before.allocated_bytes,
+                        "file_count": report.before.file_count
+                    },
+                    "coexistence": {
+                        "file_length_bytes": report.coexistence.file_length_bytes,
+                        "allocated_bytes": report.coexistence.allocated_bytes,
+                        "file_count": report.coexistence.file_count
+                    },
+                    "reclaimed": {
+                        "file_length_bytes": report.reclaimed.file_length_bytes,
+                        "allocated_bytes": report.reclaimed.allocated_bytes,
+                        "file_count": report.reclaimed.file_count
+                    }
+                }),
+            ))
+        }
         (Method::Post, "/api/import") => {
             let body = read_body_limited(request, MAX_IMPORT_BODY_BYTES)?;
             metrics.import_requests_total = metrics.import_requests_total.saturating_add(1);
@@ -437,6 +480,25 @@ fn parse_read_input(value: Value) -> Result<(String, String), ApiError> {
     let thread_id = take_string(&mut object, "thread_id")?;
     let checkpoint_id = take_string(&mut object, "checkpoint_id")?;
     Ok((thread_id, checkpoint_id))
+}
+
+fn parse_delete_input(value: Value) -> Result<DeleteInput, ApiError> {
+    let mut object = value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| ApiError::bad_request("delete body must be a JSON object"))?;
+    reject_unknown_fields(&object, &["thread_id", "checkpoint_id", "confirm"])?;
+    let thread_id = take_string(&mut object, "thread_id")?;
+    let checkpoint_id = take_string(&mut object, "checkpoint_id")?;
+    match object.remove("confirm") {
+        Some(Value::String(value)) if value == "delete-subtree" => Ok(DeleteInput {
+            thread_id,
+            checkpoint_id,
+        }),
+        _ => Err(ApiError::bad_request(
+            "confirm must equal \"delete-subtree\"",
+        )),
+    }
 }
 
 fn reject_unknown_fields(object: &Map<String, Value>, allowed: &[&str]) -> Result<(), ApiError> {
@@ -867,6 +929,53 @@ mod tests {
         }))
         .unwrap_err();
         assert!(error.message.contains("unknown field"));
+    }
+
+    #[test]
+    fn delete_input_requires_explicit_subtree_confirmation() {
+        let error = parse_delete_input(json!({
+            "thread_id": "t",
+            "checkpoint_id": "c",
+            "confirm": true
+        }))
+        .unwrap_err();
+        assert!(error.message.contains("delete-subtree"));
+
+        let input = parse_delete_input(json!({
+            "thread_id": "t",
+            "checkpoint_id": "c",
+            "confirm": "delete-subtree"
+        }))
+        .map_err(|error| error.message)
+        .unwrap();
+        assert_eq!(input.thread_id, "t");
+        assert_eq!(input.checkpoint_id, "c");
+    }
+
+    #[test]
+    fn delete_route_contract_preserves_tombstone_and_reclaims_subtree() -> Result<(), Box<dyn Error>>
+    {
+        let (_dir, mut store) = test_store()?;
+        store.append_messages_checkpoint("t", "root", 0, None, &[json!("root")])?;
+        store.append_messages_checkpoint("t", "child", 1, Some("root"), &[json!("child")])?;
+        store.seal_through(2)?;
+
+        let input = parse_delete_input(json!({
+            "thread_id": "t",
+            "checkpoint_id": "child",
+            "confirm": "delete-subtree"
+        }))
+        .map_err(|error| error.message)?;
+        let report = store.delete_checkpoint_subtree(&input.thread_id, &input.checkpoint_id)?;
+        assert_eq!(report.deleted_checkpoint_count, 1);
+        assert_eq!(report.retained_checkpoint_count, 1);
+        assert_eq!(store.checkpoint_count(), 1);
+        assert!(matches!(
+            store.read_checkpoint("t", "child"),
+            Err(CheckpointStoreError::CheckpointDeleted)
+        ));
+        assert_eq!(store.verify_all()?.failures, 0);
+        Ok(())
     }
 
     #[test]

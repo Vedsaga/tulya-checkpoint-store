@@ -58,6 +58,7 @@ ordered batches for a larger evaluation.
 | `POST` | `/api/checkpoints` | Append one checkpoint using the JSONL object schema. |
 | `POST` | `/api/import` | Import append-delta JSONL. |
 | `POST` | `/api/read` | Reconstruct one checkpoint from `thread_id` and `checkpoint_id`. |
+| `POST` | `/api/delete` | Delete one checkpoint subtree after explicit confirmation; requires a sealed store. |
 | `POST` | `/api/verify` | Reconstruct and hash-check every committed checkpoint. |
 | `POST` | `/api/seal` | Seal all currently committed checkpoints. |
 
@@ -130,6 +131,24 @@ policies without labeling the difference.
 
 The pilot fails correctness if any mirrored checkpoint differs. Storage or
 latency savings cannot compensate for an exactness failure.
+
+### Destructive retention test
+
+The evaluator can exercise the retention boundary after sealing a store. The
+confirmation string is deliberate because this operation permanently removes
+the selected live subtree and leaves durable tombstones that block accidental
+identity reuse:
+
+```bash
+curl --fail --silent --show-error \
+  -H 'content-type: application/json' \
+  --data '{"thread_id":"case-42","checkpoint_id":"retry-a","confirm":"delete-subtree"}' \
+  http://127.0.0.1:3210/api/delete | jq
+```
+
+The response reports deleted/retained checkpoint counts and storage before,
+during, and after compaction. Run `/api/verify` and read an unaffected sibling
+afterward; a deleted identity must return `404` and must not be reusable.
 
 ## Decision
 
