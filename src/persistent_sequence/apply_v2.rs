@@ -9,7 +9,8 @@ use super::commit_v2::{
 };
 use super::format_v2::{encode_v2_node, V2FormatError, V2NodeRecord, V2RootRecord};
 use super::publication_v2::{
-    checkpoint_state_metadata, V2CheckpointRecord, V2PublicationError, V2VersionRecord,
+    checkpoint_state_metadata, V2CheckpointRecord, V2PublicationError, V2StateMetadata,
+    V2VersionRecord,
 };
 use super::transaction_v2::{V2WalGeometry, V2WalTransaction};
 use std::collections::{HashMap, HashSet};
@@ -1239,12 +1240,12 @@ mod tests {
         state.retired_requests.insert(b"req-2".to_vec(), [0x55; 32]);
         let before = state.geometry().unwrap();
 
-        assert_eq!(
+        assert!(matches!(
             state.prepare_delete_checkpoint_subtree("thread", "cp-2"),
             Err(V2ApplyError::Invalid(
                 "v2 request identity is both active and retired"
             ))
-        );
+        ));
         assert_eq!(state.geometry().unwrap(), before);
         assert_eq!(
             state.request_records.get(b"req-2".as_slice()),
