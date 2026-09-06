@@ -42,6 +42,10 @@ const HISTORY_OPERATION_DOMAIN: &[u8] = b"tulya-history/v1/commit\0";
 /// Maximum request-identity byte length accepted by the history core.
 const MAX_HISTORY_REQUEST_ID_BYTES: usize = 4096;
 
+/// Maximum opaque adapter-binding byte length. Bindings identify adapter
+/// objects for crash-safe remapping, not bulk data.
+const MAX_HISTORY_BINDING_BYTES: usize = 4096;
+
 /// Opaque core-assigned history/object identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct HistoryId(u64);
@@ -142,16 +146,17 @@ impl From<SequenceError> for HistoryError {
 
 /// Computes the generic operation digest for one exact semantic operation.
 ///
-/// The digest binds history, parent, and payload bytes — the complete logical
-/// coordinates of the operation, deliberately excluding the assigned version
-/// identity (which is a consequence, not an input) and the request identity
-/// (which binds to the digest at the ledger). A request bound to one digest
-/// therefore replays only the identical operation and conflicts with any
-/// different history/parent/payload.
+/// The digest binds history, parent, payload, and the opaque adapter binding
+/// — the complete logical coordinates of the operation, deliberately
+/// excluding the assigned version identity (which is a consequence, not an
+/// input) and the request identity (which binds to the digest at the ledger).
+/// A request bound to one digest therefore replays only the identical
+/// operation and conflicts with any different history/parent/payload/binding.
 pub(crate) fn history_operation_digest(
     history: HistoryId,
     parent: Option<VersionId>,
     payload: &[u8],
+    binding: Option<&[u8]>,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(HISTORY_OPERATION_DOMAIN);
@@ -172,6 +177,16 @@ pub(crate) fn history_operation_digest(
             .to_le_bytes(),
     );
     hasher.update(payload);
+    match binding {
+        Some(bytes) => {
+            hasher.update([1u8]);
+            hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+            hasher.update(bytes);
+        }
+        None => {
+            hasher.update([0u8]);
+        }
+    }
     let digest = hasher.finalize();
     let mut output = [0u8; 32];
     output.copy_from_slice(&digest);
@@ -235,6 +250,7 @@ struct PreparedCommit<'a> {
     parent_root: Option<PersistentRoot>,
     payload: &'a [u8],
     request_id: Option<&'a [u8]>,
+    binding: Option<&'a [u8]>,
     digest: [u8; 32],
 }
 
@@ -255,6 +271,8 @@ pub(crate) struct PersistentHistoryStore {
     next_version_id: u64,
     active_requests: HashMap<Vec<u8>, ActiveRequest>,
     retired_requests: HashMap<Vec<u8>, [u8; 32]>,
+    history_bindings: HashMap<HistoryId, Vec<u8>>,
+    version_bindings: HashMap<VersionId, Vec<u8>>,
     poisoned: bool,
 }
 
@@ -268,6 +286,8 @@ impl PersistentHistoryStore {
             next_version_id: 0,
             active_requests: HashMap::new(),
             retired_requests: HashMap::new(),
+            history_bindings: HashMap::new(),
+            version_bindings: HashMap::new(),
             poisoned: false,
         }
     }
@@ -292,6 +312,35 @@ impl PersistentHistoryStore {
         Ok(id)
     }
 
+    /// Creates a history bound to opaque adapter bytes, idempotently: if the
+    /// exact binding already exists, its history is returned instead of
+    /// allocating a duplicate lineage.
+    ///
+    /// This is the crash-safe first-use primitive. An adapter that crashes
+    /// after its create observes success retries with the same binding and
+    /// resolves the existing logical history rather than orphaning a second
+    /// one. Bindings are unique across histories by construction.
+    pub(crate) fn create_history_with_binding(
+        &mut self,
+        binding: &[u8],
+    ) -> Result<HistoryId, HistoryError> {
+        self.require_unpoisoned()?;
+        validate_binding(binding)?;
+        if let Some(existing) = self
+            .history_bindings
+            .iter()
+            .find_map(|(id, bound)| (bound.as_slice() == binding).then_some(*id))
+        {
+            return Ok(existing);
+        }
+        let id = self.create_history()?;
+        self.history_bindings
+            .try_reserve(1)
+            .map_err(|_| HistoryError::Capacity("persistent history binding allocation failed"))?;
+        let _ = self.history_bindings.insert(id, binding.to_vec());
+        Ok(id)
+    }
+
     /// Commits `payload` as a new version of `history` under `parent`.
     ///
     /// `None` parent creates a root version. The backend append preserves all
@@ -301,14 +350,19 @@ impl PersistentHistoryStore {
     /// identity commits; a bound identity with the same operation digest
     /// replays its committed version with no second mutation; a different
     /// digest conflicts; a retired identity never resurrects.
+    ///
+    /// `binding` carries opaque adapter material recorded alongside the
+    /// version and covered by the operation digest, so adapters rebuild their
+    /// maps from the core itself after reopen.
     pub(crate) fn commit(
         &mut self,
         history: HistoryId,
         parent: Option<VersionId>,
         payload: &[u8],
         request_id: Option<&[u8]>,
+        binding: Option<&[u8]>,
     ) -> Result<CommitOutcome, HistoryError> {
-        match self.preview_commit(history, parent, payload, request_id)? {
+        match self.preview_commit(history, parent, payload, request_id, binding)? {
             CommitPreview::Replayed(version) => Ok(CommitOutcome::Replayed(version)),
             CommitPreview::Retired => Ok(CommitOutcome::Retired),
             CommitPreview::Fresh(prepared) => self.apply_prepared_commit(&prepared),
@@ -325,6 +379,7 @@ impl PersistentHistoryStore {
         parent: Option<VersionId>,
         payload: &'a [u8],
         request_id: Option<&'a [u8]>,
+        binding: Option<&'a [u8]>,
     ) -> Result<CommitPreview<'a>, HistoryError> {
         self.require_unpoisoned()?;
         if !self.histories.contains(&history) {
@@ -340,6 +395,9 @@ impl PersistentHistoryStore {
                 "persistent commit payload must be non-empty",
             ));
         }
+        if let Some(bytes) = binding {
+            validate_binding(bytes)?;
+        }
         let parent_root = match parent {
             None => None,
             Some(id) => {
@@ -352,7 +410,7 @@ impl PersistentHistoryStore {
                 Some(record.root())
             }
         };
-        let digest = history_operation_digest(history, parent, payload);
+        let digest = history_operation_digest(history, parent, payload, binding);
         if let Some(request) = request_id {
             validate_request_identity(request)?;
             if let Some(active) = self.active_requests.get(request) {
@@ -375,6 +433,7 @@ impl PersistentHistoryStore {
             parent_root,
             payload,
             request_id,
+            binding,
             digest,
         }))
     }
@@ -416,6 +475,12 @@ impl PersistentHistoryStore {
                     version: id,
                 },
             );
+        }
+        if let Some(binding) = prepared.binding {
+            self.version_bindings.try_reserve(1).map_err(|_| {
+                HistoryError::Capacity("persistent version binding allocation failed")
+            })?;
+            let _ = self.version_bindings.insert(id, binding.to_vec());
         }
         Ok(CommitOutcome::Committed(version))
     }
@@ -466,14 +531,25 @@ impl PersistentHistoryStore {
         self.poisoned = true;
     }
 
-    /// Replays one logged history creation during recovery, requiring the
-    /// logged identity to match the dense replay order.
-    pub(crate) fn replay_create(&mut self, history: HistoryId) -> Result<(), HistoryError> {
+    /// Replays one logged history creation during recovery, restoring its
+    /// adapter binding exactly.
+    pub(crate) fn replay_create(
+        &mut self,
+        history: HistoryId,
+        binding: Option<&[u8]>,
+    ) -> Result<(), HistoryError> {
         let assigned = self.create_history()?;
         if assigned != history {
             return Err(HistoryError::Invalid(
                 "history log history identity disagrees with replay order",
             ));
+        }
+        if let Some(bytes) = binding {
+            validate_binding(bytes)?;
+            self.history_bindings.try_reserve(1).map_err(|_| {
+                HistoryError::Capacity("persistent history binding allocation failed")
+            })?;
+            let _ = self.history_bindings.insert(history, bytes.to_vec());
         }
         Ok(())
     }
@@ -488,6 +564,7 @@ impl PersistentHistoryStore {
         parent: Option<VersionId>,
         payload: &[u8],
         request_id: Option<&[u8]>,
+        binding: Option<&[u8]>,
         digest: [u8; 32],
     ) -> Result<VersionId, HistoryError> {
         if !self.histories.contains(&history) {
@@ -507,10 +584,13 @@ impl PersistentHistoryStore {
                 Some(record.root())
             }
         };
-        if history_operation_digest(history, parent, payload) != digest {
+        if history_operation_digest(history, parent, payload, binding) != digest {
             return Err(HistoryError::Invalid(
                 "history log commit digest disagrees with its operation",
             ));
+        }
+        if let Some(bytes) = binding {
+            validate_binding(bytes)?;
         }
         let id = VersionId(self.next_version_id);
         if id != version {
@@ -553,6 +633,13 @@ impl PersistentHistoryStore {
                     version: id,
                 },
             );
+        }
+        if let Some(binding) = binding {
+            validate_binding(binding)?;
+            self.version_bindings.try_reserve(1).map_err(|_| {
+                HistoryError::Capacity("persistent version binding allocation failed")
+            })?;
+            let _ = self.version_bindings.insert(id, binding.to_vec());
         }
         Ok(id)
     }
@@ -604,13 +691,64 @@ impl PersistentHistoryStore {
             .ok_or(DurableError::Rejected(HistoryError::Overflow(
                 "persistent history count exceeds u64",
             )))?;
-        let record = HistoryLogRecord::CreateHistory { history: id };
+        let record = HistoryLogRecord::CreateHistory {
+            history: id,
+            binding: None,
+        };
         let frame = durable_log::encode_history_log_frame(
             &durable_log::encode_history_log_record(&record).map_err(DurableError::Rejected)?,
         )
         .map_err(DurableError::Rejected)?;
         self.write_and_sync(log, &frame)?;
         let assigned = self.create_history().map_err(DurableError::Rejected)?;
+        if assigned != id {
+            self.set_poisoned();
+            return Err(DurableError::Indeterminate {
+                operation: DurabilityOperation::FileSyncAll,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "history identity diverged after durable write",
+                ),
+            });
+        }
+        Ok(id)
+    }
+
+    /// Durably creates a history bound to opaque adapter bytes, idempotently:
+    /// a retry with the same binding resolves the existing history instead of
+    /// allocating a duplicate lineage, before or after any crash.
+    pub(crate) fn create_history_durable_with_binding(
+        &mut self,
+        log: &mut DurableHistoryLog,
+        binding: &[u8],
+    ) -> Result<HistoryId, DurableError> {
+        self.require_unpoisoned_durable()?;
+        validate_binding(binding).map_err(DurableError::Rejected)?;
+        if let Some(existing) = self
+            .history_bindings
+            .iter()
+            .find_map(|(id, bound)| (bound.as_slice() == binding).then_some(*id))
+        {
+            return Ok(existing);
+        }
+        let id = HistoryId(self.next_history_id);
+        self.next_history_id
+            .checked_add(1)
+            .ok_or(DurableError::Rejected(HistoryError::Overflow(
+                "persistent history count exceeds u64",
+            )))?;
+        let record = HistoryLogRecord::CreateHistory {
+            history: id,
+            binding: Some(binding.to_vec()),
+        };
+        let frame = durable_log::encode_history_log_frame(
+            &durable_log::encode_history_log_record(&record).map_err(DurableError::Rejected)?,
+        )
+        .map_err(DurableError::Rejected)?;
+        self.write_and_sync(log, &frame)?;
+        let assigned = self
+            .create_history_with_binding(binding)
+            .map_err(DurableError::Rejected)?;
         if assigned != id {
             self.set_poisoned();
             return Err(DurableError::Indeterminate {
@@ -634,10 +772,11 @@ impl PersistentHistoryStore {
         parent: Option<VersionId>,
         payload: &[u8],
         request_id: Option<&[u8]>,
+        binding: Option<&[u8]>,
     ) -> Result<CommitOutcome, DurableError> {
         self.require_unpoisoned_durable()?;
         let prepared = match self
-            .preview_commit(history, parent, payload, request_id)
+            .preview_commit(history, parent, payload, request_id, binding)
             .map_err(DurableError::Rejected)?
         {
             CommitPreview::Replayed(version) => return Ok(CommitOutcome::Replayed(version)),
@@ -650,6 +789,7 @@ impl PersistentHistoryStore {
             parent: prepared.parent,
             payload: prepared.payload.to_vec(),
             request_id: prepared.request_id.map(<[u8]>::to_vec),
+            binding: prepared.binding.map(<[u8]>::to_vec),
             digest: prepared.digest,
         };
         let frame = durable_log::encode_history_log_frame(
@@ -827,6 +967,15 @@ fn validate_request_identity(request_id: &[u8]) -> Result<(), HistoryError> {
     Ok(())
 }
 
+fn validate_binding(binding: &[u8]) -> Result<(), HistoryError> {
+    if binding.is_empty() || binding.len() > MAX_HISTORY_BINDING_BYTES {
+        return Err(HistoryError::Invalid(
+            "persistent adapter binding is empty or exceeds the byte limit",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::durable_log::recover_history_store;
@@ -844,7 +993,7 @@ mod tests {
         parent: Option<VersionId>,
         payload: &[u8],
     ) -> Version {
-        let outcome = store.commit(history, parent, payload, None).unwrap();
+        let outcome = store.commit(history, parent, payload, None, None).unwrap();
         assert!(matches!(outcome, CommitOutcome::Committed(_)));
         outcome.version().unwrap()
     }
@@ -869,20 +1018,20 @@ mod tests {
 
         // Cross-history grafts fail closed.
         assert_eq!(
-            store.commit(second, Some(root_a.id()), b"nope", None),
+            store.commit(second, Some(root_a.id()), b"nope", None, None),
             Err(HistoryError::Invalid(
                 "persistent parent version belongs to a different history"
             ))
         );
         // Unknown history and unknown parent fail closed.
         assert_eq!(
-            store.commit(HistoryId(999), None, b"nope", None),
+            store.commit(HistoryId(999), None, b"nope", None, None),
             Err(HistoryError::Invalid(
                 "persistent commit targets an unknown history"
             ))
         );
         assert_eq!(
-            store.commit(first, Some(VersionId(999)), b"nope", None),
+            store.commit(first, Some(VersionId(999)), b"nope", None, None),
             Err(HistoryError::Invalid("persistent version is unknown"))
         );
         // Failures record no versions.
@@ -953,7 +1102,7 @@ mod tests {
     fn empty_commit_payload_is_rejected_without_recording() {
         let mut store = PersistentHistoryStore::new();
         let history = store.create_history().unwrap();
-        assert!(store.commit(history, None, b"", None).is_err());
+        assert!(store.commit(history, None, b"", None, None).is_err());
         assert_eq!(store.versions.len(), 0);
     }
 
@@ -961,20 +1110,29 @@ mod tests {
     fn operation_digest_binds_exact_semantic_operation() {
         let history = HistoryId(3);
         let parent = Some(VersionId(2));
-        let first = history_operation_digest(history, parent, b"payload");
-        assert_eq!(first, history_operation_digest(history, parent, b"payload"));
+        let first = history_operation_digest(history, parent, b"payload", None);
+        assert_eq!(
+            first,
+            history_operation_digest(history, parent, b"payload", None)
+        );
         // Any differing coordinate changes the digest: same request bound to
         // one digest can never replay a different operation.
         assert_ne!(
             first,
-            history_operation_digest(HistoryId(4), parent, b"payload")
+            history_operation_digest(HistoryId(4), parent, b"payload", None)
         );
         assert_ne!(
             first,
-            history_operation_digest(history, Some(VersionId(8)), b"payload")
+            history_operation_digest(history, Some(VersionId(8)), b"payload", None)
         );
-        assert_ne!(first, history_operation_digest(history, None, b"payload"));
-        assert_ne!(first, history_operation_digest(history, parent, b"other"));
+        assert_ne!(
+            first,
+            history_operation_digest(history, None, b"payload", None)
+        );
+        assert_ne!(
+            first,
+            history_operation_digest(history, parent, b"other", None)
+        );
     }
 
     #[test]
@@ -1055,7 +1213,7 @@ mod tests {
         let history = store.create_history().unwrap();
 
         let first = match store
-            .commit(history, None, b"payload", Some(b"req-1"))
+            .commit(history, None, b"payload", Some(b"req-1"), None)
             .unwrap()
         {
             CommitOutcome::Committed(version) => version,
@@ -1067,19 +1225,19 @@ mod tests {
 
         // Same request and same operation replays with no second mutation.
         assert_eq!(
-            store.commit(history, None, b"payload", Some(b"req-1")),
+            store.commit(history, None, b"payload", Some(b"req-1"), None),
             Ok(CommitOutcome::Replayed(first))
         );
         assert_eq!(store.versions.len(), 1);
 
         // Same request with a different payload conflicts.
         assert_eq!(
-            store.commit(history, None, b"other", Some(b"req-1")),
+            store.commit(history, None, b"other", Some(b"req-1"), None),
             Err(HistoryError::RequestConflict)
         );
         // Same request with a different parent conflicts.
         assert_eq!(
-            store.commit(history, Some(first.id()), b"payload", Some(b"req-1")),
+            store.commit(history, Some(first.id()), b"payload", Some(b"req-1"), None),
             Err(HistoryError::RequestConflict)
         );
         assert_eq!(store.versions.len(), 1);
@@ -1087,11 +1245,11 @@ mod tests {
         // Retirement then resurrection attempt.
         store.retire_request(b"req-1").unwrap();
         assert_eq!(
-            store.commit(history, None, b"payload", Some(b"req-1")),
+            store.commit(history, None, b"payload", Some(b"req-1"), None),
             Ok(CommitOutcome::Retired)
         );
         assert_eq!(
-            store.commit(history, None, b"other", Some(b"req-1")),
+            store.commit(history, None, b"other", Some(b"req-1"), None),
             Err(HistoryError::RequestConflict)
         );
         assert_eq!(store.versions.len(), 1);
@@ -1110,7 +1268,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            store.commit(history, None, b"x", Some(b"")),
+            store.commit(history, None, b"x", Some(b""), None),
             Err(HistoryError::Invalid(
                 "persistent request identity is empty or exceeds the byte limit"
             ))
@@ -1124,7 +1282,7 @@ mod tests {
         let version = commit_new(&mut store, history, None, b"data");
         store.set_poisoned();
         assert_eq!(
-            store.commit(history, None, b"more", None),
+            store.commit(history, None, b"more", None, None),
             Err(HistoryError::Poisoned)
         );
         assert_eq!(store.retire_request(b"req-1"), Err(HistoryError::Poisoned));
@@ -1148,7 +1306,7 @@ mod tests {
         let first_history = store.create_history_durable(&mut log).unwrap();
         let second_history = store.create_history_durable(&mut log).unwrap();
         let v1 = match store
-            .commit_durable(&mut log, first_history, None, b"aaa", None)
+            .commit_durable(&mut log, first_history, None, b"aaa", None, None)
             .unwrap()
         {
             CommitOutcome::Committed(version) => version,
@@ -1163,6 +1321,7 @@ mod tests {
                 Some(v1.id()),
                 b"bbb",
                 Some(b"req-1"),
+                None,
             )
             .unwrap()
         {
@@ -1181,7 +1340,8 @@ mod tests {
                     first_history,
                     Some(v1.id()),
                     b"bbb",
-                    Some(b"req-1")
+                    Some(b"req-1"),
+                    None,
                 )
                 .unwrap(),
             CommitOutcome::Replayed(v2)
@@ -1195,7 +1355,8 @@ mod tests {
                 first_history,
                 Some(v1.id()),
                 b"other",
-                Some(b"req-1")
+                Some(b"req-1"),
+                None,
             ),
             Err(DurableError::Rejected(HistoryError::RequestConflict))
         ));
@@ -1209,7 +1370,8 @@ mod tests {
                     first_history,
                     Some(v1.id()),
                     b"bbb",
-                    Some(b"req-1")
+                    Some(b"req-1"),
+                    None,
                 )
                 .unwrap(),
             CommitOutcome::Retired
@@ -1241,7 +1403,7 @@ mod tests {
         let mut store = PersistentHistoryStore::new();
         let history = store.create_history_durable(&mut log).unwrap();
         let first = match store
-            .commit_durable(&mut log, history, None, b"one", None)
+            .commit_durable(&mut log, history, None, b"one", None, None)
             .unwrap()
         {
             CommitOutcome::Committed(version) => version,
@@ -1255,7 +1417,14 @@ mod tests {
         let mut reopened_log = DurableHistoryLog::open(&path).unwrap();
         let mut reopened = recover_history_store(&reopened_log.read_all().unwrap()).unwrap();
         let second = match reopened
-            .commit_durable(&mut reopened_log, history, Some(first.id()), b"two", None)
+            .commit_durable(
+                &mut reopened_log,
+                history,
+                Some(first.id()),
+                b"two",
+                None,
+                None,
+            )
             .unwrap()
         {
             CommitOutcome::Committed(version) => version,
@@ -1278,7 +1447,7 @@ mod tests {
         let mut store = PersistentHistoryStore::new();
         let history = store.create_history_durable(&mut log).unwrap();
         match store
-            .commit_durable(&mut log, history, None, b"stable", None)
+            .commit_durable(&mut log, history, None, b"stable", None, None)
             .unwrap()
         {
             CommitOutcome::Committed(_) => {}
@@ -1294,10 +1463,12 @@ mod tests {
                 parent: Some(crate::persistent_history::VersionId(0)),
                 payload: b"lost".to_vec(),
                 request_id: None,
+                binding: None,
                 digest: crate::persistent_history::history_operation_digest(
                     history,
                     Some(crate::persistent_history::VersionId(0)),
                     b"lost",
+                    None,
                 ),
             })
             .unwrap(),
@@ -1332,6 +1503,7 @@ mod tests {
                 Some(crate::persistent_history::VersionId(0)),
                 b"healed",
                 None,
+                None,
             )
             .unwrap()
         {
@@ -1352,7 +1524,7 @@ mod tests {
         let mut store = PersistentHistoryStore::new();
         let history = store.create_history_durable(&mut log).unwrap();
         match store
-            .commit_durable(&mut log, history, None, b"stable", None)
+            .commit_durable(&mut log, history, None, b"stable", None, None)
             .unwrap()
         {
             CommitOutcome::Committed(_) => {}
@@ -1377,12 +1549,12 @@ mod tests {
         // Rejection happens in preview: no frame is written, nothing is
         // synced, and the store is not poisoned.
         assert!(matches!(
-            store.commit_durable(&mut log, history, None, b"", None),
+            store.commit_durable(&mut log, history, None, b"", None, None),
             Err(DurableError::Rejected(_))
         ));
         assert_eq!(log.read_all().unwrap().len(), len_before);
         match store
-            .commit_durable(&mut log, history, None, b"after", None)
+            .commit_durable(&mut log, history, None, b"after", None, None)
             .unwrap()
         {
             CommitOutcome::Committed(_) => {}
@@ -1405,12 +1577,127 @@ mod tests {
             Err(DurableError::RecoveryRequired)
         ));
         assert!(matches!(
-            store.commit_durable(&mut log, HistoryId(0), None, b"x", None),
+            store.commit_durable(&mut log, HistoryId(0), None, b"x", None, None),
             Err(DurableError::RecoveryRequired)
         ));
         assert!(matches!(
             store.retire_durable(&mut log, b"req-1"),
             Err(DurableError::RecoveryRequired)
         ));
+    }
+
+    #[test]
+    fn bound_history_creation_is_idempotent_and_validated() {
+        let mut store = PersistentHistoryStore::new();
+        let first = store.create_history_with_binding(b"thread-a").unwrap();
+        // Retrying the same binding resolves the existing history: no second
+        // lineage is allocated even though creation is attempted twice.
+        assert_eq!(
+            store.create_history_with_binding(b"thread-a").unwrap(),
+            first
+        );
+        assert_eq!(store.histories.len(), 1);
+        assert_eq!(store.next_history_id, 1);
+
+        let second = store.create_history_with_binding(b"thread-b").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            store.history_bindings.get(&first),
+            Some(&b"thread-a".to_vec())
+        );
+
+        assert_eq!(
+            store.create_history_with_binding(b""),
+            Err(HistoryError::Invalid(
+                "persistent adapter binding is empty or exceeds the byte limit"
+            ))
+        );
+        assert!(store
+            .create_history_with_binding(&vec![0xAA; 4097])
+            .is_err());
+    }
+
+    #[test]
+    fn commit_binding_is_recorded_and_digest_bound() {
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let plain = history_operation_digest(history, None, b"data", None);
+        let bound = history_operation_digest(history, None, b"data", Some(b"thread-a/cp-1"));
+        assert_ne!(plain, bound);
+
+        let version = match store
+            .commit(history, None, b"data", None, Some(b"thread-a/cp-1"))
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("bound commit must create")
+            }
+        };
+        assert_eq!(
+            store.version_bindings.get(&version.id()),
+            Some(&b"thread-a/cp-1".to_vec())
+        );
+        // Same request and coordinates but a different binding address a
+        // different operation, so the bound request conflicts instead of
+        // replaying the first version.
+        let other = store
+            .commit(history, None, b"data", Some(b"req-b"), None)
+            .unwrap()
+            .version()
+            .unwrap();
+        assert_eq!(
+            store.commit(history, None, b"data", Some(b"req-b"), Some(b"other")),
+            Err(HistoryError::RequestConflict)
+        );
+        assert_eq!(store.version_bindings.get(&other.id()), None);
+    }
+
+    #[test]
+    fn durable_bindings_survive_reopen_exactly() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut log = DurableHistoryLog::open(&test_log_path(temp.path())).unwrap();
+        let mut store = PersistentHistoryStore::new();
+        let history = store
+            .create_history_durable_with_binding(&mut log, b"thread-a")
+            .unwrap();
+        // Crash-retry before the adapter observes success resolves the same id.
+        assert_eq!(
+            store
+                .create_history_durable_with_binding(&mut log, b"thread-a")
+                .unwrap(),
+            history
+        );
+        let version = match store
+            .commit_durable(
+                &mut log,
+                history,
+                None,
+                b"data",
+                None,
+                Some(b"thread-a/cp-1"),
+            )
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("bound durable commit must create")
+            }
+        };
+        drop(log);
+        drop(store);
+
+        let mut reopened_log = DurableHistoryLog::open(&test_log_path(temp.path())).unwrap();
+        let reopened = recover_history_store(&reopened_log.read_all().unwrap()).unwrap();
+        assert_eq!(
+            reopened.history_bindings.get(&history),
+            Some(&b"thread-a".to_vec())
+        );
+        assert_eq!(
+            reopened.version_bindings.get(&version.id()),
+            Some(&b"thread-a/cp-1".to_vec())
+        );
+        // The adapter rebuilds its maps from bindings alone: no legacy state.
+        let _ = reopened_log;
     }
 }

@@ -34,7 +34,8 @@
 //! first, so a torn tail can never strand garbage mid-file.
 
 use super::{
-    HistoryError, HistoryId, PersistentHistoryStore, VersionId, MAX_HISTORY_REQUEST_ID_BYTES,
+    HistoryError, HistoryId, PersistentHistoryStore, VersionId, MAX_HISTORY_BINDING_BYTES,
+    MAX_HISTORY_REQUEST_ID_BYTES,
 };
 use crate::error_classification::DurabilityOperation;
 use sha2::{Digest, Sha256};
@@ -58,6 +59,7 @@ const NO_PARENT: u64 = u64::MAX;
 pub(crate) enum HistoryLogRecord {
     CreateHistory {
         history: HistoryId,
+        binding: Option<Vec<u8>>,
     },
     Commit {
         history: HistoryId,
@@ -65,6 +67,7 @@ pub(crate) enum HistoryLogRecord {
         parent: Option<VersionId>,
         payload: Vec<u8>,
         request_id: Option<Vec<u8>>,
+        binding: Option<Vec<u8>>,
         digest: [u8; 32],
     },
     Retire {
@@ -124,9 +127,21 @@ pub(crate) fn encode_history_log_record(
         .try_reserve_exact(encoded_record_len(record)?)
         .map_err(|_| HistoryError::Capacity("history log record allocation failed"))?;
     match record {
-        HistoryLogRecord::CreateHistory { history } => {
+        HistoryLogRecord::CreateHistory { history, binding } => {
             output.push(RECORD_CREATE_HISTORY);
             output.extend_from_slice(&history.id().to_le_bytes());
+            match binding {
+                Some(bytes) => {
+                    if bytes.len() > MAX_HISTORY_BINDING_BYTES {
+                        return Err(HistoryError::Invalid(
+                            "history log binding exceeds the byte limit",
+                        ));
+                    }
+                    put_u64(&mut output, bytes.len() as u64 + 1);
+                    output.extend_from_slice(bytes);
+                }
+                None => put_u64(&mut output, 0),
+            }
         }
         HistoryLogRecord::Commit {
             history,
@@ -134,6 +149,7 @@ pub(crate) fn encode_history_log_record(
             parent,
             payload,
             request_id,
+            binding,
             digest,
         } => {
             output.push(RECORD_COMMIT);
@@ -150,6 +166,18 @@ pub(crate) fn encode_history_log_record(
                     }
                     put_u64(&mut output, id.len() as u64);
                     output.extend_from_slice(id);
+                }
+                None => put_u64(&mut output, 0),
+            }
+            match binding {
+                Some(bytes) => {
+                    if bytes.len() > MAX_HISTORY_BINDING_BYTES {
+                        return Err(HistoryError::Invalid(
+                            "history log binding exceeds the byte limit",
+                        ));
+                    }
+                    put_u64(&mut output, bytes.len() as u64 + 1);
+                    output.extend_from_slice(bytes);
                 }
                 None => put_u64(&mut output, 0),
             }
@@ -172,12 +200,17 @@ pub(crate) fn encode_history_log_record(
 
 fn encoded_record_len(record: &HistoryLogRecord) -> Result<usize, HistoryError> {
     let len = match record {
-        HistoryLogRecord::CreateHistory { .. } => 1usize.checked_add(8).ok_or(
-            HistoryError::Overflow("history log record length exceeds usize"),
-        )?,
+        HistoryLogRecord::CreateHistory { binding, .. } => 1usize
+            .checked_add(8)
+            .and_then(|value| value.checked_add(8))
+            .and_then(|value| value.checked_add(binding.as_ref().map_or(0, Vec::len)))
+            .ok_or(HistoryError::Overflow(
+                "history log record length exceeds usize",
+            ))?,
         HistoryLogRecord::Commit {
             payload,
             request_id,
+            binding,
             ..
         } => 1usize
             .checked_add(8)
@@ -187,6 +220,8 @@ fn encoded_record_len(record: &HistoryLogRecord) -> Result<usize, HistoryError> 
             .and_then(|value| value.checked_add(payload.len()))
             .and_then(|value| value.checked_add(8))
             .and_then(|value| value.checked_add(request_id.as_ref().map_or(0, Vec::len)))
+            .and_then(|value| value.checked_add(8))
+            .and_then(|value| value.checked_add(binding.as_ref().map_or(0, Vec::len)))
             .and_then(|value| value.checked_add(32))
             .ok_or(HistoryError::Overflow(
                 "history log record length exceeds usize",
@@ -217,7 +252,8 @@ pub(crate) fn decode_history_log_record(bytes: &[u8]) -> Result<HistoryLogRecord
     let record = match kind {
         RECORD_CREATE_HISTORY => {
             let history = HistoryId(cursor.take_u64()?);
-            HistoryLogRecord::CreateHistory { history }
+            let binding = decode_optional_binding(&mut cursor)?;
+            HistoryLogRecord::CreateHistory { history, binding }
         }
         RECORD_COMMIT => {
             let history = HistoryId(cursor.take_u64()?);
@@ -242,6 +278,7 @@ pub(crate) fn decode_history_log_record(bytes: &[u8]) -> Result<HistoryLogRecord
                 let bytes = cursor.take_bytes(request_len)?;
                 Some(bytes.to_vec())
             };
+            let binding = decode_optional_binding(&mut cursor)?;
             let digest = cursor.take_array::<32>()?;
             HistoryLogRecord::Commit {
                 history,
@@ -249,6 +286,7 @@ pub(crate) fn decode_history_log_record(bytes: &[u8]) -> Result<HistoryLogRecord
                 parent,
                 payload: payload.to_vec(),
                 request_id,
+                binding,
                 digest,
             }
         }
@@ -280,6 +318,25 @@ pub(crate) fn decode_history_log_record(bytes: &[u8]) -> Result<HistoryLogRecord
 struct LogCursor<'a> {
     bytes: &'a [u8],
     pos: usize,
+}
+
+/// Decodes the length-prefixed optional binding: zero means absent, otherwise
+/// stored length plus one. Empty bindings are rejected: present bindings are
+/// always meaningful adapter identity material.
+fn decode_optional_binding(cursor: &mut LogCursor<'_>) -> Result<Option<Vec<u8>>, HistoryError> {
+    let stored = cursor.take_u64()?;
+    if stored == 0 {
+        return Ok(None);
+    }
+    let len = stored.checked_sub(1).ok_or(HistoryError::Invalid(
+        "history log binding length underflow",
+    ))?;
+    if len == 0 || len > MAX_HISTORY_BINDING_BYTES as u64 {
+        return Err(HistoryError::Invalid(
+            "history log binding is outside bounds",
+        ));
+    }
+    Ok(Some(cursor.take_bytes(len)?.to_vec()))
 }
 
 impl<'a> LogCursor<'a> {
@@ -460,13 +517,8 @@ pub(crate) fn recover_history_store(bytes: &[u8]) -> Result<PersistentHistorySto
     let mut store = PersistentHistoryStore::new();
     for record in &records {
         match record {
-            HistoryLogRecord::CreateHistory { history } => {
-                let assigned = store.create_history()?;
-                if assigned != *history {
-                    return Err(HistoryError::Invalid(
-                        "history log history identity disagrees with replay order",
-                    ));
-                }
+            HistoryLogRecord::CreateHistory { history, binding } => {
+                store.replay_create(*history, binding.as_deref())?;
             }
             HistoryLogRecord::Commit {
                 history,
@@ -474,6 +526,7 @@ pub(crate) fn recover_history_store(bytes: &[u8]) -> Result<PersistentHistorySto
                 parent,
                 payload,
                 request_id,
+                binding,
                 digest,
             } => {
                 let assigned = store.replay_commit(
@@ -482,6 +535,7 @@ pub(crate) fn recover_history_store(bytes: &[u8]) -> Result<PersistentHistorySto
                     *parent,
                     payload,
                     request_id.as_deref(),
+                    binding.as_deref(),
                     *digest,
                 )?;
                 if assigned != *version {
@@ -581,6 +635,7 @@ mod tests {
             parent: Some(VersionId(4)),
             payload: b"payload-bytes".to_vec(),
             request_id: Some(b"req-1".to_vec()),
+            binding: Some(b"bind-1".to_vec()),
             digest: [0x33; 32],
         }
     }
@@ -590,6 +645,11 @@ mod tests {
         for record in [
             HistoryLogRecord::CreateHistory {
                 history: HistoryId(7),
+                binding: Some(b"thread-a".to_vec()),
+            },
+            HistoryLogRecord::CreateHistory {
+                history: HistoryId(8),
+                binding: None,
             },
             commit_record(),
             HistoryLogRecord::Commit {
@@ -598,6 +658,7 @@ mod tests {
                 parent: None,
                 payload: Vec::new(),
                 request_id: None,
+                binding: None,
                 digest: [0x00; 32],
             },
             HistoryLogRecord::Retire {
@@ -652,6 +713,7 @@ mod tests {
         let second = encode_history_log_frame(
             &encode_history_log_record(&HistoryLogRecord::CreateHistory {
                 history: HistoryId(1),
+                binding: None,
             })
             .unwrap(),
         )
