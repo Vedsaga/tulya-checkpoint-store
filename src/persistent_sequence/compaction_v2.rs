@@ -1943,23 +1943,25 @@ mod tests {
         let leaf = V2NodeRecord::leaf(0, payload).unwrap();
         let first_root = V2RootRecord::from_node(0, leaf).unwrap();
         let second_root = V2RootRecord::from_node(1, leaf).unwrap();
-        let mut duplicate = V2CommittedState::default();
-        duplicate.payload = payload.to_vec();
-        duplicate.nodes = vec![leaf, leaf];
-        duplicate.versions = vec![
-            V2VersionRecord::new(0, None, first_root).unwrap(),
-            V2VersionRecord::new(1, Some(0), second_root).unwrap(),
-        ];
-        duplicate.checkpoints = vec![V2CheckpointRecord {
-            checkpoint_no: 1,
-            thread_id: "thread".to_owned(),
-            checkpoint_id: "cp-1".to_owned(),
-            parent_checkpoint_id: None,
-            identity_version: 1,
-            messages_version: None,
-            result_version: None,
-            state: checkpoint_state_metadata(second_root, None, None).unwrap(),
-        }];
+        let duplicate = V2CommittedState {
+            payload: payload.to_vec(),
+            nodes: vec![leaf, leaf],
+            versions: vec![
+                V2VersionRecord::new(0, None, first_root).unwrap(),
+                V2VersionRecord::new(1, Some(0), second_root).unwrap(),
+            ],
+            checkpoints: vec![V2CheckpointRecord {
+                checkpoint_no: 1,
+                thread_id: "thread".to_owned(),
+                checkpoint_id: "cp-1".to_owned(),
+                parent_checkpoint_id: None,
+                identity_version: 1,
+                messages_version: None,
+                result_version: None,
+                state: checkpoint_state_metadata(second_root, None, None).unwrap(),
+            }],
+            ..Default::default()
+        };
         assert!(plan_v2_compaction(&duplicate).is_ok());
         assert_eq!(
             prepare_v2_compaction(&duplicate),

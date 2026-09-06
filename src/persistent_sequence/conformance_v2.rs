@@ -101,7 +101,7 @@ fn decode_digest(value: &str) -> [u8; 32] {
         .unwrap_or_else(|_| panic!("conformance operation digest must be 32 bytes"))
 }
 
-fn string_pair<'a>(value: &'a Value) -> (&'a str, &'a str) {
+fn string_pair(value: &Value) -> (&str, &str) {
     let values = value
         .as_array()
         .unwrap_or_else(|| panic!("conformance identity must be a two-item array"));
