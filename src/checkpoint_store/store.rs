@@ -2,7 +2,6 @@ use super::*;
 use tulya_core::persistent_history::{
     authority::{OpenedHistoryStats, SealSummary, WritableHistoryAuthority},
     durable_log::DurableError,
-    manifest::{history_wal_filename, HISTORY_MANIFEST_FILE},
     CommitOutcome, HistoryError, PersistentHistoryStore, Version,
 };
 use tulya_core::persistent_sequence::{
@@ -13,11 +12,6 @@ const MESSAGE_IDENTITY_NULL_PREFIX: &[u8] = b"{\"identity\":null,";
 const MESSAGE_CANONICAL_PREFIX: &[u8] = b"{\"identity\":null,\"messages\":[";
 const MESSAGE_CANONICAL_SUFFIX: &[u8] = b"]}";
 const LEGACY_V1_HASH_STREAM_CHUNK_BYTES: u64 = 64 * 1024;
-
-/// P1.3 genesis candidate history log. Superseded by generation-named hot
-/// logs once the manifest authority exists; `open` adopts it one way into
-/// generation zero and never writes it again.
-const HISTORY_WAL_FILE: &str = "history.wal";
 
 impl CheckpointStore {
     /// Opens or creates a checkpoint store and reconstructs its complete
@@ -108,8 +102,8 @@ impl CheckpointStore {
         // never persisted separately, so they cannot desynchronize from the
         // log. A corrupt candidate authority fails the whole open closed:
         // delete the history-manifest/history-* files to return to
-        // legacy-only use.
-        Self::adopt_legacy_history_wal(&dir)?;
+        // legacy-only use. (The pre-E2 `history.wal` adoption shim is gone:
+        // the splice-grammar epoch carries no append-record compatibility.)
         let history_authority = WritableHistoryAuthority::open(&dir)
             .map_err(|error| Self::durable_history_error(&dir, error))?;
         let (history_ids, history_versions) =
@@ -663,7 +657,7 @@ impl CheckpointStore {
         let binding = encode_candidate_version_binding(thread_id, checkpoint_id);
         let version = self
             .history_authority
-            .commit(history, parent, payload, None, Some(&binding))
+            .append(history, parent, payload, None, Some(&binding))
             .map_err(|error| Self::durable_history_error(&self.dir, error))?;
         let version = match version {
             CommitOutcome::Committed(version) => version,
@@ -756,28 +750,6 @@ impl CheckpointStore {
         self.history_ids = history_ids;
         self.history_versions = history_versions;
         Ok(summary)
-    }
-
-    /// Adopts the P1.3 genesis `history.wal` into the generation authority
-    /// exactly once: when no manifest was ever published and no generation-0
-    /// hot log exists yet, the genesis file is atomically renamed into
-    /// generation zero. Every later open goes through the manifest
-    /// authority, which never reads `history.wal` again.
-    fn adopt_legacy_history_wal(dir: &Path) -> Result<(), CheckpointStoreError> {
-        if dir.join(HISTORY_MANIFEST_FILE).exists() {
-            return Ok(());
-        }
-        let legacy = dir.join(HISTORY_WAL_FILE);
-        if !legacy.exists() {
-            return Ok(());
-        }
-        let generation_zero = dir.join(history_wal_filename(0));
-        if generation_zero.exists() {
-            return Ok(());
-        }
-        std::fs::rename(&legacy, &generation_zero)?;
-        std::fs::File::open(dir)?.sync_all()?;
-        Ok(())
     }
 
     /// Rebuilds the adapter identity maps from durable bindings. Maps are

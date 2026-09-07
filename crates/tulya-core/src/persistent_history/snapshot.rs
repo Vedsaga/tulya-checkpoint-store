@@ -11,7 +11,7 @@
 //! ```text
 //! magic[4] = THS1
 //! total_len[u64]          (exact byte length of the whole artifact)
-//! schema[u32] = 1
+//! schema[u32] = 2         (staging epoch: 1 = pre-E2 append grammar, rejected)
 //! generation[u64]
 //! represented_wal_end[u64](exact hot-log prefix byte length represented)
 //! history_count[u64]
@@ -43,7 +43,11 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
 const HISTORY_SNAPSHOT_MAGIC: [u8; 4] = *b"THS1";
-const HISTORY_SNAPSHOT_SCHEMA: u32 = 1;
+/// Staging snapshot schema epoch: 2 covers the splice operation grammar.
+/// Schema-1 snapshots carry append-grammar request digests and fail closed
+/// at decode; there is deliberately no migration (zero external users).
+/// NOT a release format version; E9 freezes release Format v1.
+const HISTORY_SNAPSHOT_SCHEMA: u32 = 2;
 const HISTORY_SNAPSHOT_HEADER_SIZE: usize = 88;
 const HISTORY_SNAPSHOT_DIGEST_DOMAIN: &[u8] = b"tulya-history/v1/snapshot\0";
 const NO_PARENT: u64 = u64::MAX;
@@ -685,7 +689,7 @@ mod tests {
     fn snapshot_codec_rejects_truncation_and_digest_corruption() {
         let mut store = PersistentHistoryStore::new();
         let history = store.create_history().unwrap();
-        store.commit(history, None, b"data", None, None).unwrap();
+        store.append(history, None, b"data", None, None).unwrap();
         let bytes = encode_history_snapshot(&store, 3, 128).unwrap();
         for end in [0, 1, 7, 88, 89, bytes.len() - 33, bytes.len() - 1] {
             assert!(
@@ -726,7 +730,7 @@ mod tests {
         let first = store.create_history_with_binding(b"history-a").unwrap();
         let second = store.create_history().unwrap();
         let v0 = match store
-            .commit(first, None, b"aaa", Some(b"req-a"), Some(b"bind-a0"))
+            .append(first, None, b"aaa", Some(b"req-a"), Some(b"bind-a0"))
             .unwrap()
         {
             crate::persistent_history::CommitOutcome::Committed(version) => version,
@@ -736,9 +740,9 @@ mod tests {
             }
         };
         store
-            .commit(first, Some(v0.id()), b"bbb", Some(b"req-b"), None)
+            .append(first, Some(v0.id()), b"bbb", Some(b"req-b"), None)
             .unwrap();
-        store.commit(second, None, b"zzz", None, None).unwrap();
+        store.append(second, None, b"zzz", None, None).unwrap();
         store.retire_request(b"req-a").unwrap();
         store
     }
@@ -783,7 +787,7 @@ mod tests {
         let history = HistoryId::new(0);
         let parent = imported.lookup_version(VersionId::new(1)).unwrap();
         let next = match imported
-            .commit(history, Some(parent.id()), b"ccc", None, None)
+            .append(history, Some(parent.id()), b"ccc", None, None)
             .unwrap()
         {
             crate::persistent_history::CommitOutcome::Committed(version) => version,
@@ -851,8 +855,8 @@ mod tests {
         let mut store = PersistentHistoryStore::new();
         let first = store.create_history().unwrap();
         let second = store.create_history().unwrap();
-        store.commit(first, None, b"aaa", None, None).unwrap();
-        store.commit(second, None, b"bbb", None, None).unwrap();
+        store.append(first, None, b"aaa", None, None).unwrap();
+        store.append(second, None, b"bbb", None, None).unwrap();
         let bytes = encode_history_snapshot(&store, 1, 64).unwrap();
         let honest = decode_history_snapshot(&bytes).unwrap();
         assert_eq!(honest.versions.len(), 2);

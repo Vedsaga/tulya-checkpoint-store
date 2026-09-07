@@ -259,6 +259,9 @@ pub trait PersistentSequenceAppend {
 
     /// Appends `bytes` to `parent` (or creates a root for `None`) without
     /// mutating any retained history, and returns the new root.
+    ///
+    /// Convenience over [`splice`](PersistentSequenceSplice::splice) at the
+    /// parent end: one canonical mutation, one implementation.
     fn append(
         &mut self,
         parent: Option<PersistentRoot>,
@@ -267,6 +270,46 @@ pub trait PersistentSequenceAppend {
 
     /// Recomputes every reachable node's metadata and commitment.
     fn verify(&self, root: PersistentRoot) -> Result<(), Self::Error>;
+}
+
+/// Result of one persistent splice: the new root plus exact work accounting.
+///
+/// `payload_bytes_allocated` covers every new payload byte including bounded
+/// boundary-leaf copies, so locality regressions cannot hide copied bytes
+/// outside the inserted payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpliceResult {
+    /// The new logical root; all older roots remain exact.
+    pub root: PersistentRoot,
+    /// Arena nodes allocated (insertion leaves plus copied path nodes).
+    pub nodes_allocated: u64,
+    /// Arena-node resolutions performed (descent, validation, reassembly).
+    pub nodes_inspected: u64,
+    /// Payload bytes appended to the arena (insert plus boundary copies).
+    pub payload_bytes_allocated: u64,
+}
+
+/// Persistent local-splice capability: replace one logical range with new
+/// bytes through structural sharing, preserving all historical roots.
+///
+/// This is the canonical content-mutation seam. Reference semantics follow
+/// Lean `PersistentAVLEdit.edit` (split / split / drop / build / concat);
+/// the Rust implementation is byte-oriented with bounded leaves and is not
+/// claimed to formally refine the Lean proof.
+pub trait PersistentSequenceSplice {
+    type Error;
+
+    /// Replaces `source[offset..offset+delete_len]` with `insert`, where the
+    /// source is `parent` (`None` creates a root and requires zero offset and
+    /// delete length with non-empty insert). Zero-effect and zero-result
+    /// splices are rejected; the result is always non-empty.
+    fn splice(
+        &mut self,
+        parent: Option<PersistentRoot>,
+        offset: LogicalLength,
+        delete_len: LogicalLength,
+        insert: &[u8],
+    ) -> Result<SpliceResult, Self::Error>;
 }
 
 /// In-memory balanced persistent-sequence backend behind the production seam.
@@ -413,18 +456,14 @@ impl PersistentSequenceAppend for BalancedSequence {
         parent: Option<PersistentRoot>,
         bytes: &[u8],
     ) -> Result<PersistentRoot, Self::Error> {
-        let resolved = parent.map(|root| self.resolve(root)).transpose()?;
-        let result = self.inner.append(resolved, bytes)?;
-        self.note_written(
-            result.allocated_nodes(),
-            result.inspected_nodes(),
-            bytes.len(),
-        );
-        let root = result.root();
-        Ok(PersistentRoot::balanced_v2(
-            root.node_id(),
-            LogicalLength::new(root.logical_len()),
-        ))
+        let (offset, delete_len) = match parent {
+            None => (LogicalLength::new(0), LogicalLength::new(0)),
+            Some(root) => {
+                let len = LogicalLength::new(self.resolve(root)?.logical_len());
+                (len, LogicalLength::new(0))
+            }
+        };
+        Ok(self.splice(parent, offset, delete_len, bytes)?.root)
     }
 
     fn verify(&self, root: PersistentRoot) -> Result<(), Self::Error> {
@@ -432,6 +471,39 @@ impl PersistentSequenceAppend for BalancedSequence {
         let visited = self.inner.verify_root_counted(canonical)?;
         self.note_read(visited, 0);
         Ok(())
+    }
+}
+
+impl PersistentSequenceSplice for BalancedSequence {
+    type Error = SequenceError;
+
+    fn splice(
+        &mut self,
+        parent: Option<PersistentRoot>,
+        offset: LogicalLength,
+        delete_len: LogicalLength,
+        insert: &[u8],
+    ) -> Result<SpliceResult, Self::Error> {
+        let resolved = parent.map(|root| self.resolve(root)).transpose()?;
+        let result = self
+            .inner
+            .splice(resolved, offset.get(), delete_len.get(), insert)?;
+        self.note_written(
+            result.allocated_nodes(),
+            result.inspected_nodes(),
+            result.payload_bytes_allocated(),
+        );
+        let root = result.root();
+        Ok(SpliceResult {
+            root: PersistentRoot::balanced_v2(
+                root.node_id(),
+                LogicalLength::new(root.logical_len()),
+            ),
+            nodes_allocated: u64::try_from(result.allocated_nodes()).unwrap_or(u64::MAX),
+            nodes_inspected: u64::try_from(result.inspected_nodes()).unwrap_or(u64::MAX),
+            payload_bytes_allocated: u64::try_from(result.payload_bytes_allocated())
+                .unwrap_or(u64::MAX),
+        })
     }
 }
 
@@ -686,5 +758,76 @@ mod tests {
         assert!(inspected <= 8 * allocated + 8);
         sequence.verify(child).unwrap();
         assert_eq!(sequence.logical_len(child).unwrap().get(), 4 + 400 + 3);
+    }
+
+    /// E2.17 locality regression: a small middle splice of a large parent
+    /// costs tree height plus inserted payload, never total parent bytes.
+    /// The parent is built through the bounded-leaf path, and the hard
+    /// invariant bounds new payload bytes by inserted bytes plus at most
+    /// two boundary-leaf fragments — not parent size.
+    fn middle_splice_locality_case(parent_len: usize, edit_len: usize) {
+        use super::format_v2::MAX_LEAF_PAYLOAD_BYTES;
+
+        let mut sequence = balanced_fixture();
+        let parent_bytes = vec![0x5Au8; parent_len];
+        let parent = sequence
+            .splice(
+                None,
+                LogicalLength::new(0),
+                LogicalLength::new(0),
+                &parent_bytes,
+            )
+            .expect("bounded root creation should succeed")
+            .root;
+        assert_eq!(parent.logical_len().get(), parent_len as u64);
+        // Sanity: the large root really is chunked, not one giant leaf.
+        assert!(sequence.work_counters().payload_bytes_written as usize >= parent_len);
+
+        let offset = (parent_len / 2) as u64;
+        let replacement = vec![0xA5u8; edit_len];
+        let before = sequence.work_counters();
+        let child = sequence
+            .splice(
+                Some(parent),
+                LogicalLength::new(offset),
+                LogicalLength::new(edit_len as u64),
+                &replacement,
+            )
+            .expect("middle splice should succeed");
+        let after = sequence.work_counters();
+        let new_payload = (after.payload_bytes_written - before.payload_bytes_written) as usize;
+        let bound = edit_len + 2 * MAX_LEAF_PAYLOAD_BYTES;
+        let allocated = after.nodes_allocated - before.nodes_allocated;
+        let inspected = after.nodes_inspected - before.nodes_inspected;
+        assert!(
+            new_payload <= bound,
+            "4 KiB-class edit of {parent_len} bytes allocated {new_payload} payload bytes (bound {bound})"
+        );
+        assert!(
+            allocated <= 256,
+            "allocated {allocated} nodes for a local edit of {parent_len} bytes"
+        );
+        assert!(
+            inspected <= 4096,
+            "inspected {inspected} nodes for a local edit of {parent_len} bytes"
+        );
+
+        // Exactness on both sides of the edit.
+        let mut expected = parent_bytes;
+        expected.splice(offset as usize..offset as usize + edit_len, replacement);
+        assert_eq!(read_full(&sequence, child.root), expected);
+        assert_eq!(read_full(&sequence, parent), vec![0x5Au8; parent_len]);
+        sequence.verify(child.root).unwrap();
+        sequence.verify(parent).unwrap();
+    }
+
+    #[test]
+    fn middle_splice_of_100mib_parent_stays_local() {
+        middle_splice_locality_case(100 * 1024 * 1024, 4 * 1024);
+    }
+
+    #[test]
+    fn middle_splice_of_1mib_parent_stays_local() {
+        middle_splice_locality_case(1024 * 1024, 1024);
     }
 }

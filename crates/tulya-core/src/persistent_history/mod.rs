@@ -27,7 +27,7 @@
 use crate::operation::DurabilityOperation;
 use crate::persistent_sequence::{
     BalancedSequence, LogicalLength, PersistentRoot, PersistentSequence, PersistentSequenceAppend,
-    SequenceError, SequenceRange, SequenceWorkCounters,
+    PersistentSequenceSplice, SequenceError, SequenceRange, SequenceWorkCounters,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -39,8 +39,13 @@ pub mod manifest;
 pub mod snapshot;
 use durable_log::{DurableError, DurableHistoryLog, HistoryLogRecord};
 
-/// Domain separator for the generic history operation digest.
-const HISTORY_OPERATION_DOMAIN: &[u8] = b"tulya-history/v1/commit\0";
+/// Domain separator for the canonical splice operation digest.
+///
+/// Staging domain, deliberately NOT the old append-commit domain and NOT a
+/// release Format-v1 commitment: E9 freezes the release domain. The epoch
+/// change (log magic, snapshot schema) keeps old append-digest bytes from
+/// ever validating as splice operations.
+const HISTORY_SPLICE_DIGEST_DOMAIN: &[u8] = b"tulya-history/staging/splice\0";
 
 /// Maximum request-identity byte length accepted by the history core.
 const MAX_HISTORY_REQUEST_ID_BYTES: usize = 4096;
@@ -147,22 +152,28 @@ impl From<SequenceError> for HistoryError {
     }
 }
 
-/// Computes the generic operation digest for one exact semantic operation.
+/// Computes the canonical digest for one exact splice mutation.
 ///
-/// The digest binds history, parent, payload, and the opaque adapter binding
-/// — the complete logical coordinates of the operation, deliberately
-/// excluding the assigned version identity (which is a consequence, not an
-/// input) and the request identity (which binds to the digest at the ledger).
-/// A request bound to one digest therefore replays only the identical
-/// operation and conflicts with any different history/parent/payload/binding.
-pub fn history_operation_digest(
+/// The digest binds history, parent presence and identity, splice offset,
+/// delete length, insert length and bytes, and the opaque adapter binding —
+/// the complete logical coordinates of the operation, deliberately excluding
+/// the assigned version identity (which is a consequence, not an input) and
+/// the request identity (which binds to the digest at the ledger). Append
+/// canonicalizes to splice coordinates before hashing, so an append and its
+/// equivalent explicit splice share one digest and one durable encoding. A
+/// request bound to one digest therefore replays only the identical splice
+/// and conflicts with any different offset, delete length, insert, parent,
+/// or binding.
+pub fn history_splice_digest(
     history: HistoryId,
     parent: Option<VersionId>,
-    payload: &[u8],
+    offset: u64,
+    delete_len: u64,
+    insert: &[u8],
     binding: Option<&[u8]>,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(HISTORY_OPERATION_DOMAIN);
+    hasher.update(HISTORY_SPLICE_DIGEST_DOMAIN);
     hasher.update(history.id().to_le_bytes());
     match parent {
         Some(id) => {
@@ -174,12 +185,14 @@ pub fn history_operation_digest(
             hasher.update(0u64.to_le_bytes());
         }
     }
+    hasher.update(offset.to_le_bytes());
+    hasher.update(delete_len.to_le_bytes());
     hasher.update(
-        u64::try_from(payload.len())
+        u64::try_from(insert.len())
             .unwrap_or(u64::MAX)
             .to_le_bytes(),
     );
-    hasher.update(payload);
+    hasher.update(insert);
     match binding {
         Some(bytes) => {
             hasher.update([1u8]);
@@ -238,20 +251,22 @@ impl CommitOutcome {
     }
 }
 
-/// Result of validating a logical commit without mutating state.
-enum CommitPreview<'a> {
+/// Result of validating a logical splice without mutating state.
+enum SplicePreview<'a> {
     Replayed(Version),
     Retired,
-    Fresh(PreparedCommit<'a>),
+    Fresh(PreparedSplice<'a>),
 }
 
-/// A validated logical commit awaiting persistence and application. Borrows
+/// A validated logical splice awaiting persistence and application. Borrows
 /// caller bytes so preparation itself never allocates payload copies.
-struct PreparedCommit<'a> {
+struct PreparedSplice<'a> {
     history: HistoryId,
     parent: Option<VersionId>,
     parent_root: Option<PersistentRoot>,
-    payload: &'a [u8],
+    offset: u64,
+    delete_len: u64,
+    insert: &'a [u8],
     request_id: Option<&'a [u8]>,
     binding: Option<&'a [u8]>,
     digest: [u8; 32],
@@ -371,65 +386,59 @@ impl PersistentHistoryStore {
         Ok(id)
     }
 
-    /// Commits `payload` as a new version of `history` under `parent`.
+    /// Splices `insert` into the parent version at `offset`, deleting
+    /// `delete_len` bytes first: the single canonical content mutation.
     ///
-    /// `None` parent creates a root version. The backend append preserves all
-    /// retained history; on any failure no version is recorded.
+    /// `None` parent creates a root version and requires zero offset and
+    /// delete length with non-empty insert. On an existing parent, a
+    /// zero-effect splice (no deletion, empty insert) and a zero-result
+    /// splice are rejected; versions must stay non-empty in this slice.
+    /// The backend splice preserves all retained history; on any failure no
+    /// version is recorded and the arena rolls back.
     ///
     /// With `request_id`, the durable idempotency matrix applies: an unknown
-    /// identity commits; a bound identity with the same operation digest
-    /// replays its committed version with no second mutation; a different
-    /// digest conflicts; a retired identity never resurrects.
+    /// identity splices; a bound identity with the same canonical splice
+    /// digest replays its committed version with no second mutation; a
+    /// different digest conflicts; a retired identity never resurrects.
     ///
     /// `binding` carries opaque adapter material recorded alongside the
     /// version and covered by the operation digest, so adapters rebuild their
     /// maps from the core itself after reopen.
-    pub fn commit(
+    pub fn splice(
         &mut self,
         history: HistoryId,
         parent: Option<VersionId>,
-        payload: &[u8],
+        offset: u64,
+        delete_len: u64,
+        insert: &[u8],
         request_id: Option<&[u8]>,
         binding: Option<&[u8]>,
     ) -> Result<CommitOutcome, HistoryError> {
-        match self.preview_commit(history, parent, payload, request_id, binding)? {
-            CommitPreview::Replayed(version) => Ok(CommitOutcome::Replayed(version)),
-            CommitPreview::Retired => Ok(CommitOutcome::Retired),
-            CommitPreview::Fresh(prepared) => self.apply_prepared_commit(&prepared),
+        match self.preview_splice(
+            history, parent, offset, delete_len, insert, request_id, binding,
+        )? {
+            SplicePreview::Replayed(version) => Ok(CommitOutcome::Replayed(version)),
+            SplicePreview::Retired => Ok(CommitOutcome::Retired),
+            SplicePreview::Fresh(prepared) => self.apply_prepared_splice(&prepared),
         }
     }
 
-    /// Validates a logical commit without mutating anything: history and
-    /// parent resolution, operation-digest computation, and the full
-    /// request-ledger matrix. Durable commit runs this first, persists the
-    /// prepared bytes, and only then applies.
-    fn preview_commit<'a>(
-        &self,
+    /// Appends `bytes` to the parent version (or creates a root for `None`).
+    ///
+    /// Convenience over [`splice`](Self::splice) at the parent end: the
+    /// offset canonicalizes to the parent logical length immediately, so an
+    /// append and its equivalent explicit splice share one digest and one
+    /// durable encoding. There is no second mutation implementation.
+    pub fn append(
+        &mut self,
         history: HistoryId,
         parent: Option<VersionId>,
-        payload: &'a [u8],
-        request_id: Option<&'a [u8]>,
-        binding: Option<&'a [u8]>,
-    ) -> Result<CommitPreview<'a>, HistoryError> {
-        self.require_unpoisoned()?;
-        if !self.histories.contains(&history) {
-            return Err(HistoryError::Invalid(
-                "persistent commit targets an unknown history",
-            ));
-        }
-        // Payload validity is preview-checked so a rejected empty commit can
-        // never reach the log: an encoded-but-unappliable record would brick
-        // later recovery.
-        if payload.is_empty() {
-            return Err(HistoryError::Invalid(
-                "persistent commit payload must be non-empty",
-            ));
-        }
-        if let Some(bytes) = binding {
-            validate_binding(bytes)?;
-        }
-        let parent_root = match parent {
-            None => None,
+        bytes: &[u8],
+        request_id: Option<&[u8]>,
+        binding: Option<&[u8]>,
+    ) -> Result<CommitOutcome, HistoryError> {
+        let offset = match parent {
+            None => 0,
             Some(id) => {
                 let record = self.version_record(id)?;
                 if record.history() != history {
@@ -437,67 +446,165 @@ impl PersistentHistoryStore {
                         "persistent parent version belongs to a different history",
                     ));
                 }
-                Some(record.root())
+                self.backend.logical_len(record.root())?.get()
             }
         };
-        let digest = history_operation_digest(history, parent, payload, binding);
+        self.splice(history, parent, offset, 0, bytes, request_id, binding)
+    }
+
+    /// Validates a logical splice without mutating anything: history and
+    /// parent resolution, splice-coordinate validation against the parent
+    /// length, canonical-digest computation, and the full request-ledger
+    /// matrix. Durable splice runs this first, persists the prepared bytes,
+    /// and only then applies — so a rejected coordinate can never reach the
+    /// log, where an encoded-but-unappliable record would brick recovery.
+    fn preview_splice<'a>(
+        &self,
+        history: HistoryId,
+        parent: Option<VersionId>,
+        offset: u64,
+        delete_len: u64,
+        insert: &'a [u8],
+        request_id: Option<&'a [u8]>,
+        binding: Option<&'a [u8]>,
+    ) -> Result<SplicePreview<'a>, HistoryError> {
+        self.require_unpoisoned()?;
+        if !self.histories.contains(&history) {
+            return Err(HistoryError::Invalid(
+                "persistent splice targets an unknown history",
+            ));
+        }
+        if let Some(bytes) = binding {
+            validate_binding(bytes)?;
+        }
+        let (parent_root, parent_len) = match parent {
+            None => (None, 0),
+            Some(id) => {
+                let record = self.version_record(id)?;
+                if record.history() != history {
+                    return Err(HistoryError::Invalid(
+                        "persistent parent version belongs to a different history",
+                    ));
+                }
+                let len = self.backend.logical_len(record.root())?.get();
+                (Some(record.root()), len)
+            }
+        };
+        if offset > parent_len {
+            return Err(HistoryError::Invalid(
+                "persistent splice offset exceeds parent length",
+            ));
+        }
+        if delete_len > parent_len - offset {
+            return Err(HistoryError::Invalid(
+                "persistent splice delete range exceeds parent length",
+            ));
+        }
+        let insert_len = u64::try_from(insert.len())
+            .map_err(|_| HistoryError::Overflow("persistent splice insert length exceeds u64"))?;
+        let result_len =
+            (parent_len - delete_len)
+                .checked_add(insert_len)
+                .ok_or(HistoryError::Overflow(
+                    "persistent splice result length exceeds u64",
+                ))?;
+        if parent.is_none() {
+            if offset != 0 || delete_len != 0 {
+                return Err(HistoryError::Invalid(
+                    "persistent root creation requires zero offset and delete length",
+                ));
+            }
+            if insert.is_empty() {
+                return Err(HistoryError::Invalid(
+                    "persistent root creation requires non-empty insert",
+                ));
+            }
+        } else if delete_len == 0 && insert.is_empty() {
+            return Err(HistoryError::Invalid(
+                "persistent splice without effect is rejected",
+            ));
+        }
+        if result_len == 0 {
+            return Err(HistoryError::Invalid(
+                "persistent splice result must be non-empty",
+            ));
+        }
+        let digest = history_splice_digest(history, parent, offset, delete_len, insert, binding);
         if let Some(request) = request_id {
             validate_request_identity(request)?;
             if let Some(active) = self.active_requests.get(request) {
                 if active.digest() == digest {
                     let version = self.version_record(active.version())?;
-                    return Ok(CommitPreview::Replayed(version));
+                    return Ok(SplicePreview::Replayed(version));
                 }
                 return Err(HistoryError::RequestConflict);
             }
             if let Some(retired) = self.retired_requests.get(request) {
                 if *retired == digest {
-                    return Ok(CommitPreview::Retired);
+                    return Ok(SplicePreview::Retired);
                 }
                 return Err(HistoryError::RequestConflict);
             }
         }
-        Ok(CommitPreview::Fresh(PreparedCommit {
+        Ok(SplicePreview::Fresh(PreparedSplice {
             history,
             parent,
             parent_root,
-            payload,
+            offset,
+            delete_len,
+            insert,
             request_id,
             binding,
             digest,
         }))
     }
 
-    /// Applies a prepared commit: the single mutation point shared by the
+    /// Applies a prepared splice: the single mutation point shared by the
     /// in-memory and durable paths.
-    fn apply_prepared_commit(
+    ///
+    /// Every fallible table/ledger/binding reservation completes before the
+    /// backend edit runs, and the identity counter advances only after the
+    /// arena edit succeeds (which rolls its own allocations back on
+    /// failure). A rejection therefore leaves the counter, tables, ledgers,
+    /// and bindings exactly as found.
+    fn apply_prepared_splice(
         &mut self,
-        prepared: &PreparedCommit<'_>,
+        prepared: &PreparedSplice<'_>,
     ) -> Result<CommitOutcome, HistoryError> {
+        self.versions
+            .try_reserve(1)
+            .map_err(|_| HistoryError::Capacity("persistent version table allocation failed"))?;
+        if prepared.request_id.is_some() {
+            self.active_requests.try_reserve(1).map_err(|_| {
+                HistoryError::Capacity("persistent active request allocation failed")
+            })?;
+        }
+        if prepared.binding.is_some() {
+            self.version_bindings.try_reserve(1).map_err(|_| {
+                HistoryError::Capacity("persistent version binding allocation failed")
+            })?;
+        }
         let id = VersionId(self.next_version_id);
+        let splice = self.backend.splice(
+            prepared.parent_root,
+            LogicalLength::new(prepared.offset),
+            LogicalLength::new(prepared.delete_len),
+            prepared.insert,
+        )?;
         self.next_version_id =
             self.next_version_id
                 .checked_add(1)
                 .ok_or(HistoryError::Overflow(
                     "persistent version count exceeds u64",
                 ))?;
-        self.versions
-            .try_reserve(1)
-            .map_err(|_| HistoryError::Capacity("persistent version table allocation failed"))?;
-        let root = self
-            .backend
-            .append(prepared.parent_root, prepared.payload)?;
         let version = Version {
             history: prepared.history,
             id,
             parent: prepared.parent,
-            root,
+            root: splice.root,
         };
         self.versions.push(version);
         if let Some(request) = prepared.request_id {
-            self.active_requests.try_reserve(1).map_err(|_| {
-                HistoryError::Capacity("persistent active request allocation failed")
-            })?;
             let _ = self.active_requests.insert(
                 request.to_vec(),
                 ActiveRequest {
@@ -507,9 +614,6 @@ impl PersistentHistoryStore {
             );
         }
         if let Some(binding) = prepared.binding {
-            self.version_bindings.try_reserve(1).map_err(|_| {
-                HistoryError::Capacity("persistent version binding allocation failed")
-            })?;
             let _ = self.version_bindings.insert(id, binding.to_vec());
         }
         Ok(CommitOutcome::Committed(version))
@@ -603,26 +707,31 @@ impl PersistentHistoryStore {
         Ok(())
     }
 
-    /// Replays one logged commit during recovery with exact-identity and
-    /// digest assertions. Backend reconstruction revalidates parents and
-    /// arena coordinates exactly as the live path does.
-    pub fn replay_commit(
+    /// Replays one logged splice during recovery: exact history, exact
+    /// parent, same-history parenthood, recomputed canonical digest,
+    /// coordinate validation against the parent length, persistent splice
+    /// application, exact version identity, and request/binding rebuild —
+    /// with all prior historical roots preserved. A complete but malformed
+    /// splice frame fails closed; a torn suffix never reaches this point.
+    pub fn replay_splice(
         &mut self,
         history: HistoryId,
         version: VersionId,
         parent: Option<VersionId>,
-        payload: &[u8],
+        offset: u64,
+        delete_len: u64,
+        insert: &[u8],
         request_id: Option<&[u8]>,
         binding: Option<&[u8]>,
         digest: [u8; 32],
     ) -> Result<VersionId, HistoryError> {
         if !self.histories.contains(&history) {
             return Err(HistoryError::Invalid(
-                "history log commit targets an unknown history",
+                "history log splice targets an unknown history",
             ));
         }
-        let parent_root = match parent {
-            None => None,
+        let (parent_root, parent_len) = match parent {
+            None => (None, 0),
             Some(id) => {
                 let record = self.version_record(id)?;
                 if record.history() != history {
@@ -630,12 +739,52 @@ impl PersistentHistoryStore {
                         "history log parent version belongs to a different history",
                     ));
                 }
-                Some(record.root())
+                let len = self.backend.logical_len(record.root())?.get();
+                (Some(record.root()), len)
             }
         };
-        if history_operation_digest(history, parent, payload, binding) != digest {
+        if offset > parent_len {
             return Err(HistoryError::Invalid(
-                "history log commit digest disagrees with its operation",
+                "history log splice offset exceeds parent length",
+            ));
+        }
+        if delete_len > parent_len - offset {
+            return Err(HistoryError::Invalid(
+                "history log splice delete range exceeds parent length",
+            ));
+        }
+        let insert_len = u64::try_from(insert.len())
+            .map_err(|_| HistoryError::Overflow("history log splice insert length exceeds u64"))?;
+        let result_len =
+            (parent_len - delete_len)
+                .checked_add(insert_len)
+                .ok_or(HistoryError::Overflow(
+                    "history log splice result length exceeds u64",
+                ))?;
+        if parent.is_none() {
+            if offset != 0 || delete_len != 0 {
+                return Err(HistoryError::Invalid(
+                    "history log root creation requires zero offset and delete length",
+                ));
+            }
+            if insert.is_empty() {
+                return Err(HistoryError::Invalid(
+                    "history log root creation requires non-empty insert",
+                ));
+            }
+        } else if delete_len == 0 && insert.is_empty() {
+            return Err(HistoryError::Invalid(
+                "history log splice without effect is rejected",
+            ));
+        }
+        if result_len == 0 {
+            return Err(HistoryError::Invalid(
+                "history log splice result must be non-empty",
+            ));
+        }
+        if history_splice_digest(history, parent, offset, delete_len, insert, binding) != digest {
+            return Err(HistoryError::Invalid(
+                "history log splice digest disagrees with its operation",
             ));
         }
         if let Some(bytes) = binding {
@@ -656,12 +805,17 @@ impl PersistentHistoryStore {
         self.versions
             .try_reserve(1)
             .map_err(|_| HistoryError::Capacity("persistent version table allocation failed"))?;
-        let root = self.backend.append(parent_root, payload)?;
+        let splice = self.backend.splice(
+            parent_root,
+            LogicalLength::new(offset),
+            LogicalLength::new(delete_len),
+            insert,
+        )?;
         self.versions.push(Version {
             history,
             id,
             parent,
-            root,
+            root: splice.root,
         });
         if let Some(request) = request_id {
             validate_request_identity(request)?;
@@ -908,32 +1062,38 @@ impl PersistentHistoryStore {
         Ok(prepared.history)
     }
 
-    /// Durably commits through the request ledger: replay and retired outcomes
+    /// Durably splices through the request ledger: replay and retired outcomes
     /// return without touching the log; fresh operations follow
     /// write-then-barrier-then-apply with poison on any post-barrier failure.
-    pub(crate) fn commit_durable(
+    pub(crate) fn splice_durable(
         &mut self,
         log: &mut DurableHistoryLog,
         history: HistoryId,
         parent: Option<VersionId>,
-        payload: &[u8],
+        offset: u64,
+        delete_len: u64,
+        insert: &[u8],
         request_id: Option<&[u8]>,
         binding: Option<&[u8]>,
     ) -> Result<CommitOutcome, DurableError> {
         self.require_unpoisoned_durable()?;
         let prepared = match self
-            .preview_commit(history, parent, payload, request_id, binding)
+            .preview_splice(
+                history, parent, offset, delete_len, insert, request_id, binding,
+            )
             .map_err(DurableError::Rejected)?
         {
-            CommitPreview::Replayed(version) => return Ok(CommitOutcome::Replayed(version)),
-            CommitPreview::Retired => return Ok(CommitOutcome::Retired),
-            CommitPreview::Fresh(prepared) => prepared,
+            SplicePreview::Replayed(version) => return Ok(CommitOutcome::Replayed(version)),
+            SplicePreview::Retired => return Ok(CommitOutcome::Retired),
+            SplicePreview::Fresh(prepared) => prepared,
         };
-        let record = HistoryLogRecord::Commit {
+        let record = HistoryLogRecord::Splice {
             history: prepared.history,
             version: VersionId(self.next_version_id),
             parent: prepared.parent,
-            payload: prepared.payload.to_vec(),
+            offset: prepared.offset,
+            delete_len: prepared.delete_len,
+            insert: prepared.insert.to_vec(),
             request_id: prepared.request_id.map(<[u8]>::to_vec),
             binding: prepared.binding.map(<[u8]>::to_vec),
             digest: prepared.digest,
@@ -943,8 +1103,40 @@ impl PersistentHistoryStore {
         )
         .map_err(DurableError::Rejected)?;
         self.write_and_sync(log, &frame)?;
-        self.apply_prepared_commit(&prepared)
+        self.apply_prepared_splice(&prepared)
             .map_err(|error| self.poison_after_barrier(error))
+    }
+
+    /// Durably appends through the canonical splice path: the offset resolves
+    /// from the parent length first (a pure read), then the operation flows
+    /// through [`splice_durable`](Self::splice_durable) with identical digest
+    /// and encoding to the equivalent explicit splice.
+    pub(crate) fn append_durable(
+        &mut self,
+        log: &mut DurableHistoryLog,
+        history: HistoryId,
+        parent: Option<VersionId>,
+        bytes: &[u8],
+        request_id: Option<&[u8]>,
+        binding: Option<&[u8]>,
+    ) -> Result<CommitOutcome, DurableError> {
+        self.require_unpoisoned_durable()?;
+        let offset = match parent {
+            None => 0,
+            Some(id) => {
+                let record = self.version_record(id).map_err(DurableError::Rejected)?;
+                if record.history() != history {
+                    return Err(DurableError::Rejected(HistoryError::Invalid(
+                        "persistent parent version belongs to a different history",
+                    )));
+                }
+                self.backend
+                    .logical_len(record.root())
+                    .map_err(|error| DurableError::Rejected(error.into()))?
+                    .get()
+            }
+        };
+        self.splice_durable(log, history, parent, offset, 0, bytes, request_id, binding)
     }
 
     /// Durably retires a request identity with the same write-then-apply
@@ -1323,15 +1515,509 @@ mod tests {
         output
     }
 
-    fn commit_new(
+    fn append_new(
         store: &mut PersistentHistoryStore,
         history: HistoryId,
         parent: Option<VersionId>,
         payload: &[u8],
     ) -> Version {
-        let outcome = store.commit(history, parent, payload, None, None).unwrap();
+        let outcome = store.append(history, parent, payload, None, None).unwrap();
         assert!(matches!(outcome, CommitOutcome::Committed(_)));
         outcome.version().unwrap()
+    }
+
+    fn splice_new(
+        store: &mut PersistentHistoryStore,
+        history: HistoryId,
+        parent: Option<VersionId>,
+        offset: u64,
+        delete_len: u64,
+        insert: &[u8],
+    ) -> Version {
+        let outcome = store
+            .splice(history, parent, offset, delete_len, insert, None, None)
+            .unwrap();
+        assert!(matches!(outcome, CommitOutcome::Committed(_)));
+        outcome.version().unwrap()
+    }
+
+    #[test]
+    fn splice_insert_delete_replace_are_exact() {
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = splice_new(&mut store, history, None, 0, 0, b"abcdefghij");
+        assert_eq!(read_full(&store, v0, 10), b"abcdefghij");
+        let v1 = splice_new(&mut store, history, Some(v0.id()), 5, 0, b"-MID-");
+        assert_eq!(read_full(&store, v1, 15), b"abcde-MID-fghij");
+        let v2 = splice_new(&mut store, history, Some(v1.id()), 0, 5, b"");
+        assert_eq!(read_full(&store, v2, 10), b"-MID-fghij");
+        let v3 = splice_new(&mut store, history, Some(v2.id()), 5, 5, b"1234567890");
+        assert_eq!(read_full(&store, v3, 15), b"-MID-1234567890");
+        // Every intermediate root still reads exactly.
+        assert_eq!(read_full(&store, v0, 10), b"abcdefghij");
+        assert_eq!(read_full(&store, v1, 15), b"abcde-MID-fghij");
+        assert_eq!(read_full(&store, v2, 10), b"-MID-fghij");
+        for version in [v0, v1, v2, v3] {
+            store.verify(version).unwrap();
+        }
+    }
+
+    #[test]
+    fn splice_historical_branches_stay_exact() {
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"base-payload");
+        let v1 = splice_new(&mut store, history, Some(v0.id()), 5, 0, b"[edit1]");
+        assert_eq!(read_full(&store, v1, 19), b"base-[edit1]payload");
+        let v2 = splice_new(&mut store, history, Some(v0.id()), 0, 4, b"EDIT");
+        assert_eq!(read_full(&store, v2, 12), b"EDIT-payload");
+        assert_eq!(read_full(&store, v0, 12), b"base-payload");
+        assert_eq!(v1.parent(), Some(v0.id()));
+        assert_eq!(v2.parent(), Some(v0.id()));
+    }
+
+    #[test]
+    fn splice_rejects_invalid_coordinates_atomically() {
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let other = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"abcdef");
+        let versions_before = store.versions.len();
+        let counter_before = store.next_version_id;
+        let bad = [
+            // offset past the end, including u64 extremes
+            (Some(v0.id()), 7, 0, b"x".as_slice()),
+            (Some(v0.id()), u64::MAX, 0, b"x"),
+            // delete past the end
+            (Some(v0.id()), 5, 2, b""),
+            (Some(v0.id()), 0, 7, b""),
+            // zero-effect and zero-result splices
+            (Some(v0.id()), 3, 0, b""),
+            (Some(v0.id()), 0, 6, b""),
+            // root creation violations
+            (None, 1, 0, b"x"),
+            (None, 0, 1, b"x"),
+            (None, 0, 0, b""),
+            // cross-history parent
+            (Some(v0.id()), 0, 0, b"x"),
+        ];
+        for (index, (parent, offset, delete_len, insert)) in bad.iter().enumerate() {
+            let history = if index == bad.len() - 1 {
+                other
+            } else {
+                history
+            };
+            assert!(
+                store
+                    .splice(history, *parent, *offset, *delete_len, insert, None, None)
+                    .is_err(),
+                "case {index} must fail"
+            );
+        }
+        // Unknown parent fails closed too.
+        assert!(store
+            .splice(history, Some(VersionId::new(999)), 0, 0, b"x", None, None)
+            .is_err());
+        // Every rejection left counters, tables, and ledgers untouched.
+        assert_eq!(store.versions.len(), versions_before);
+        assert_eq!(store.next_version_id, counter_before);
+        assert!(store.active_requests.is_empty());
+        assert!(store.version_bindings.is_empty());
+        assert_eq!(read_full(&store, v0, 6), b"abcdef");
+    }
+
+    #[test]
+    fn splice_request_ledger_replays_and_conflicts() {
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"abcdefghij");
+        let v1 = match store
+            .splice(history, Some(v0.id()), 5, 2, b"XY", Some(b"req-1"), None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("fresh splice must create")
+            }
+        };
+        assert_eq!(read_full(&store, v1, 10), b"abcdeXYhij");
+        // Identical splice under the same request replays without mutation.
+        let versions_before = store.versions.len();
+        assert_eq!(
+            store.splice(history, Some(v0.id()), 5, 2, b"XY", Some(b"req-1"), None),
+            Ok(CommitOutcome::Replayed(v1))
+        );
+        assert_eq!(store.versions.len(), versions_before);
+        // Any changed coordinate conflicts: offset, delete length, insert,
+        // parent, and binding each address a different operation.
+        let v9 = append_new(&mut store, history, Some(v1.id()), b"tail");
+        for (parent, offset, delete_len, insert, binding) in [
+            (Some(v0.id()), 6, 2, b"XY".as_slice(), None),
+            (Some(v0.id()), 5, 3, b"XY".as_slice(), None),
+            (Some(v0.id()), 5, 2, b"XZ".as_slice(), None),
+            (Some(v9.id()), 5, 2, b"XY".as_slice(), None),
+            (
+                Some(v0.id()),
+                5,
+                2,
+                b"XY".as_slice(),
+                Some(b"bind".as_slice()),
+            ),
+        ] {
+            assert_eq!(
+                store.splice(
+                    history,
+                    parent,
+                    offset,
+                    delete_len,
+                    insert,
+                    Some(b"req-1"),
+                    binding
+                ),
+                Err(HistoryError::RequestConflict)
+            );
+        }
+        assert_eq!(store.versions.len(), versions_before + 1);
+    }
+
+    #[test]
+    fn append_and_explicit_splice_share_digest_and_encoding() {
+        // E2.18: one canonical mutation. The explicit splice of append
+        // coordinates under the same request replays the append — proving a
+        // shared digest — and both spellings read byte-identical.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"hello");
+        let v1 = match store
+            .append(history, Some(v0.id()), b" world", Some(b"req-1"), None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("append must create")
+            }
+        };
+        assert_eq!(
+            store.splice(
+                history,
+                Some(v0.id()),
+                5,
+                0,
+                b" world",
+                Some(b"req-1"),
+                None
+            ),
+            Ok(CommitOutcome::Replayed(v1))
+        );
+        assert_eq!(read_full(&store, v1, 11), b"hello world");
+
+        let mut other = PersistentHistoryStore::new();
+        let other_history = other.create_history().unwrap();
+        let other_v0 = append_new(&mut other, other_history, None, b"hello");
+        let other_v1 = splice_new(
+            &mut other,
+            other_history,
+            Some(other_v0.id()),
+            5,
+            0,
+            b" world",
+        );
+        assert_eq!(read_full(&other, other_v1, 11), b"hello world");
+    }
+
+    #[test]
+    fn splice_durable_reopen_is_byte_exact() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = test_log_path(temp.path());
+        let (v1_id, v2_id);
+        {
+            let mut store = PersistentHistoryStore::new();
+            let mut log = DurableHistoryLog::open(&path).unwrap();
+            let history = store.create_history_durable(&mut log).unwrap();
+            let v0 = match store
+                .append_durable(&mut log, history, None, b"abcdefghij", None, None)
+                .unwrap()
+            {
+                CommitOutcome::Committed(version) => version,
+                CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                    panic!("durable root must create")
+                }
+            };
+            let v1 = match store
+                .splice_durable(&mut log, history, Some(v0.id()), 5, 2, b"XY", None, None)
+                .unwrap()
+            {
+                CommitOutcome::Committed(version) => version,
+                CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                    panic!("durable splice must create")
+                }
+            };
+            v1_id = v1.id();
+            let v2 = match store
+                .splice_durable(
+                    &mut log,
+                    history,
+                    Some(v1.id()),
+                    0,
+                    10,
+                    b"replaced!!",
+                    None,
+                    None,
+                )
+                .unwrap()
+            {
+                CommitOutcome::Committed(version) => version,
+                CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                    panic!("durable replace must create")
+                }
+            };
+            v2_id = v2.id();
+            drop(store);
+            drop(log);
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let reopened = recover_history_store(&bytes).unwrap();
+        assert_eq!(reopened.versions.len(), 3);
+        let v1 = reopened.lookup_version(v1_id).unwrap();
+        let v2 = reopened.lookup_version(v2_id).unwrap();
+        assert_eq!(read_full(&reopened, v1, 10), b"abcdeXYhij");
+        assert_eq!(read_full(&reopened, v2, 10), b"replaced!!");
+        reopened.verify(v1).unwrap();
+        reopened.verify(v2).unwrap();
+    }
+
+    fn splice_record(
+        history: HistoryId,
+        version: VersionId,
+        parent: Option<VersionId>,
+        offset: u64,
+        delete_len: u64,
+        insert: &[u8],
+        digest: [u8; 32],
+    ) -> Vec<u8> {
+        durable_log::encode_history_log_frame(
+            &durable_log::encode_history_log_record(&durable_log::HistoryLogRecord::Splice {
+                history,
+                version,
+                parent,
+                offset,
+                delete_len,
+                insert: insert.to_vec(),
+                request_id: None,
+                binding: None,
+                digest,
+            })
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn honest_splice_fixture() -> (Vec<u8>, HistoryId, VersionId) {
+        // Genesis history 0 with V0 = "abcdefghij" (10 bytes): the parent
+        // every corruption case below builds on.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        append_new(&mut store, history, None, b"abcdefghij");
+        let mut bytes = durable_log::encode_history_log_frame(
+            &durable_log::encode_history_log_record(
+                &durable_log::HistoryLogRecord::CreateHistory {
+                    history,
+                    binding: None,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let digest = history_splice_digest(history, None, 0, 0, b"abcdefghij", None);
+        bytes.extend_from_slice(&splice_record(
+            history,
+            VersionId::new(0),
+            None,
+            0,
+            0,
+            b"abcdefghij",
+            digest,
+        ));
+        (bytes, history, VersionId::new(0))
+    }
+
+    #[test]
+    fn splice_record_corruption_fails_closed() {
+        let (prefix, history, v0) = honest_splice_fixture();
+        let good_digest = |offset: u64, delete_len: u64, insert: &[u8]| {
+            history_splice_digest(history, Some(v0), offset, delete_len, insert, None)
+        };
+        // Each case appends one complete but malformed splice frame after a
+        // valid prefix: recovery must fail closed, never reinterpret.
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "offset past end",
+                splice_record(
+                    history,
+                    VersionId::new(1),
+                    Some(v0),
+                    11,
+                    0,
+                    b"x",
+                    good_digest(11, 0, b"x"),
+                ),
+            ),
+            (
+                "delete past end",
+                splice_record(
+                    history,
+                    VersionId::new(1),
+                    Some(v0),
+                    9,
+                    2,
+                    b"",
+                    good_digest(9, 2, b""),
+                ),
+            ),
+            (
+                "no-op splice",
+                splice_record(
+                    history,
+                    VersionId::new(1),
+                    Some(v0),
+                    3,
+                    0,
+                    b"",
+                    good_digest(3, 0, b""),
+                ),
+            ),
+            (
+                "zero-result splice",
+                splice_record(
+                    history,
+                    VersionId::new(1),
+                    Some(v0),
+                    0,
+                    10,
+                    b"",
+                    good_digest(0, 10, b""),
+                ),
+            ),
+            (
+                "wrong digest",
+                splice_record(history, VersionId::new(1), Some(v0), 5, 0, b"x", [0x55; 32]),
+            ),
+            (
+                "wrong history",
+                splice_record(
+                    HistoryId::new(7),
+                    VersionId::new(1),
+                    Some(v0),
+                    5,
+                    0,
+                    b"x",
+                    good_digest(5, 0, b"x"),
+                ),
+            ),
+            (
+                "wrong version identity",
+                splice_record(
+                    history,
+                    VersionId::new(9),
+                    Some(v0),
+                    5,
+                    0,
+                    b"x",
+                    good_digest(5, 0, b"x"),
+                ),
+            ),
+        ];
+        for (name, frame) in cases {
+            let mut bytes = prefix.clone();
+            bytes.extend_from_slice(&frame);
+            assert!(
+                recover_history_store(&bytes).is_err(),
+                "{name} must fail closed"
+            );
+        }
+        // Wrong parent: same-history rule at replay. The digest is recomputed
+        // for the forged coordinates so only parenthood can reject.
+        let mut store = PersistentHistoryStore::new();
+        let second = store.create_history().unwrap();
+        append_new(&mut store, second, None, b"other");
+        let mut bytes = prefix.clone();
+        let forged_digest = history_splice_digest(second, Some(v0), 0, 0, b"x", None);
+        let second_create = durable_log::encode_history_log_frame(
+            &durable_log::encode_history_log_record(
+                &durable_log::HistoryLogRecord::CreateHistory {
+                    history: second,
+                    binding: None,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // Replay order demands dense identities: history 1 second.
+        bytes.extend_from_slice(&second_create);
+        bytes.extend_from_slice(&splice_record(
+            second,
+            VersionId::new(1),
+            Some(v0),
+            0,
+            0,
+            b"x",
+            forged_digest,
+        ));
+        assert!(recover_history_store(&bytes).is_err());
+    }
+
+    #[test]
+    fn splice_record_trailing_bytes_fail_closed() {
+        let (mut bytes, _, _) = honest_splice_fixture();
+        // Garbage inside the last record body breaks the frame digest.
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        assert!(recover_history_store(&bytes).is_err());
+    }
+
+    #[test]
+    fn old_staging_grammar_fails_closed() {
+        // Pre-E2 append-grammar bytes (THL1 magic) are never reinterpreted
+        // as splice records: the frame magic rejects them first.
+        let (bytes, _, _) = honest_splice_fixture();
+        let mut old_magic = bytes.clone();
+        old_magic[0..4].copy_from_slice(b"THL1");
+        assert!(matches!(
+            recover_history_store(&old_magic),
+            Err(HistoryError::Invalid(_))
+        ));
+        // Pre-E2 snapshots (schema 1) fail at the schema gate, so old
+        // append-grammar request digests can never validate as splice
+        // digests. Patch only the schema word of an otherwise valid
+        // artifact: every other check would still pass.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        append_new(&mut store, history, None, b"data");
+        let snapshot =
+            crate::persistent_history::snapshot::encode_history_snapshot(&store, 1, 0).unwrap();
+        let mut old_schema = snapshot.clone();
+        old_schema[12..16].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(
+            crate::persistent_history::snapshot::decode_history_snapshot(&old_schema),
+            Err(HistoryError::Invalid(_))
+        ));
+        // Control: the unpatched artifacts decode.
+        assert!(recover_history_store(&bytes).is_ok());
+        assert!(crate::persistent_history::snapshot::decode_history_snapshot(&snapshot).is_ok());
+    }
+
+    #[test]
+    fn splice_version_counter_overflow_leaves_no_version() {
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"abcdef");
+        store.next_version_id = u64::MAX;
+        assert!(matches!(
+            store.splice(history, Some(v0.id()), 6, 0, b"x", None, None),
+            Err(HistoryError::Overflow(_))
+        ));
+        assert_eq!(store.next_version_id, u64::MAX);
+        assert_eq!(store.versions.len(), 1);
     }
 
     #[test]
@@ -1341,12 +2027,12 @@ mod tests {
         let second = store.create_history().unwrap();
         assert_ne!(first, second);
 
-        let root_a = commit_new(&mut store, first, None, b"aaa");
+        let root_a = append_new(&mut store, first, None, b"aaa");
         assert_eq!(root_a.history(), first);
         assert_eq!(root_a.parent(), None);
-        let child_a = commit_new(&mut store, first, Some(root_a.id()), b"bbb");
+        let child_a = append_new(&mut store, first, Some(root_a.id()), b"bbb");
         assert_eq!(child_a.parent(), Some(root_a.id()));
-        let root_b = commit_new(&mut store, second, None, b"zzz");
+        let root_b = append_new(&mut store, second, None, b"zzz");
 
         assert_eq!(read_full(&store, root_a, 3), b"aaa");
         assert_eq!(read_full(&store, child_a, 6), b"aaabbb");
@@ -1354,20 +2040,20 @@ mod tests {
 
         // Cross-history grafts fail closed.
         assert_eq!(
-            store.commit(second, Some(root_a.id()), b"nope", None, None),
+            store.append(second, Some(root_a.id()), b"nope", None, None),
             Err(HistoryError::Invalid(
                 "persistent parent version belongs to a different history"
             ))
         );
         // Unknown history and unknown parent fail closed.
         assert_eq!(
-            store.commit(HistoryId(999), None, b"nope", None, None),
+            store.append(HistoryId(999), None, b"nope", None, None),
             Err(HistoryError::Invalid(
-                "persistent commit targets an unknown history"
+                "persistent splice targets an unknown history"
             ))
         );
         assert_eq!(
-            store.commit(first, Some(VersionId(999)), b"nope", None, None),
+            store.append(first, Some(VersionId(999)), b"nope", None, None),
             Err(HistoryError::Invalid("persistent version is unknown"))
         );
         // Failures record no versions.
@@ -1378,9 +2064,9 @@ mod tests {
     fn sibling_versions_share_parent_byte_exact() {
         let mut store = PersistentHistoryStore::new();
         let history = store.create_history().unwrap();
-        let parent = commit_new(&mut store, history, None, b"parent");
-        let left = commit_new(&mut store, history, Some(parent.id()), b"-left");
-        let right = commit_new(&mut store, history, Some(parent.id()), b"-right");
+        let parent = append_new(&mut store, history, None, b"parent");
+        let left = append_new(&mut store, history, Some(parent.id()), b"-left");
+        let right = append_new(&mut store, history, Some(parent.id()), b"-right");
         assert_eq!(left.parent(), Some(parent.id()));
         assert_eq!(right.parent(), Some(parent.id()));
         assert_eq!(read_full(&store, parent, 6), b"parent");
@@ -1395,7 +2081,7 @@ mod tests {
     fn fabricated_versions_fail_closed_on_read_and_verify() {
         let mut store = PersistentHistoryStore::new();
         let history = store.create_history().unwrap();
-        let version = commit_new(&mut store, history, None, b"data");
+        let version = append_new(&mut store, history, None, b"data");
 
         let wrong_id = Version {
             history,
@@ -1438,36 +2124,50 @@ mod tests {
     fn empty_commit_payload_is_rejected_without_recording() {
         let mut store = PersistentHistoryStore::new();
         let history = store.create_history().unwrap();
-        assert!(store.commit(history, None, b"", None, None).is_err());
+        assert!(store.append(history, None, b"", None, None).is_err());
         assert_eq!(store.versions.len(), 0);
     }
 
     #[test]
     fn operation_digest_binds_exact_semantic_operation() {
+        // One canonical splice digest: append canonicalizes to splice
+        // coordinates before hashing, so both spellings share it. Any
+        // differing coordinate changes the digest: same request bound to one
+        // digest can never replay a different operation.
         let history = HistoryId(3);
         let parent = Some(VersionId(2));
-        let first = history_operation_digest(history, parent, b"payload", None);
+        let first = history_splice_digest(history, parent, 7, 2, b"payload", None);
         assert_eq!(
             first,
-            history_operation_digest(history, parent, b"payload", None)
-        );
-        // Any differing coordinate changes the digest: same request bound to
-        // one digest can never replay a different operation.
-        assert_ne!(
-            first,
-            history_operation_digest(HistoryId(4), parent, b"payload", None)
+            history_splice_digest(history, parent, 7, 2, b"payload", None)
         );
         assert_ne!(
             first,
-            history_operation_digest(history, Some(VersionId(8)), b"payload", None)
+            history_splice_digest(HistoryId(4), parent, 7, 2, b"payload", None)
         );
         assert_ne!(
             first,
-            history_operation_digest(history, None, b"payload", None)
+            history_splice_digest(history, Some(VersionId(8)), 7, 2, b"payload", None)
         );
         assert_ne!(
             first,
-            history_operation_digest(history, parent, b"other", None)
+            history_splice_digest(history, None, 7, 2, b"payload", None)
+        );
+        assert_ne!(
+            first,
+            history_splice_digest(history, parent, 8, 2, b"payload", None)
+        );
+        assert_ne!(
+            first,
+            history_splice_digest(history, parent, 7, 3, b"payload", None)
+        );
+        assert_ne!(
+            first,
+            history_splice_digest(history, parent, 7, 2, b"other", None)
+        );
+        assert_ne!(
+            first,
+            history_splice_digest(history, parent, 7, 2, b"payload", Some(b"bind"))
         );
     }
 
@@ -1475,8 +2175,8 @@ mod tests {
     fn version_table_position_never_overrides_logical_identity() {
         let mut store = PersistentHistoryStore::new();
         let history = store.create_history().unwrap();
-        let first = commit_new(&mut store, history, None, b"one");
-        let second = commit_new(&mut store, history, Some(first.id()), b"two");
+        let first = append_new(&mut store, history, None, b"one");
+        let second = append_new(&mut store, history, Some(first.id()), b"two");
         // Physically swap the two records: both lookups must now fail closed
         // because position disagrees with logical identity.
         store.versions.swap(0, 1);
@@ -1501,9 +2201,9 @@ mod tests {
         let second_history = store.create_history().unwrap();
         assert_eq!(first_history.id(), 0);
         assert_eq!(second_history.id(), 1);
-        let first = commit_new(&mut store, first_history, None, b"one");
-        let second = commit_new(&mut store, first_history, Some(first.id()), b"two");
-        let third = commit_new(&mut store, second_history, None, b"three");
+        let first = append_new(&mut store, first_history, None, b"one");
+        let second = append_new(&mut store, first_history, Some(first.id()), b"two");
+        let third = append_new(&mut store, second_history, None, b"three");
         assert_eq!(first.id().id(), 0);
         assert_eq!(second.id().id(), 1);
         assert_eq!(third.id().id(), 2);
@@ -1514,7 +2214,7 @@ mod tests {
         let mut store = PersistentHistoryStore::new();
         let history = store.create_history().unwrap();
         let before = store.work_counters();
-        let version = commit_new(&mut store, history, None, b"payload");
+        let version = append_new(&mut store, history, None, b"payload");
         let after_commit = store.work_counters();
         assert_eq!(
             after_commit.payload_bytes_written - before.payload_bytes_written,
@@ -1524,7 +2224,7 @@ mod tests {
         // Root creation resolves no parent and copies no spine.
         assert_eq!(after_commit.nodes_inspected, before.nodes_inspected);
 
-        let child = commit_new(&mut store, history, Some(version.id()), b"more");
+        let child = append_new(&mut store, history, Some(version.id()), b"more");
         let after_child = store.work_counters();
         assert!(after_child.nodes_inspected > after_commit.nodes_inspected);
         assert_eq!(
@@ -1549,7 +2249,7 @@ mod tests {
         let history = store.create_history().unwrap();
 
         let first = match store
-            .commit(history, None, b"payload", Some(b"req-1"), None)
+            .append(history, None, b"payload", Some(b"req-1"), None)
             .unwrap()
         {
             CommitOutcome::Committed(version) => version,
@@ -1561,19 +2261,19 @@ mod tests {
 
         // Same request and same operation replays with no second mutation.
         assert_eq!(
-            store.commit(history, None, b"payload", Some(b"req-1"), None),
+            store.append(history, None, b"payload", Some(b"req-1"), None),
             Ok(CommitOutcome::Replayed(first))
         );
         assert_eq!(store.versions.len(), 1);
 
         // Same request with a different payload conflicts.
         assert_eq!(
-            store.commit(history, None, b"other", Some(b"req-1"), None),
+            store.append(history, None, b"other", Some(b"req-1"), None),
             Err(HistoryError::RequestConflict)
         );
         // Same request with a different parent conflicts.
         assert_eq!(
-            store.commit(history, Some(first.id()), b"payload", Some(b"req-1"), None),
+            store.append(history, Some(first.id()), b"payload", Some(b"req-1"), None),
             Err(HistoryError::RequestConflict)
         );
         assert_eq!(store.versions.len(), 1);
@@ -1581,11 +2281,11 @@ mod tests {
         // Retirement then resurrection attempt.
         store.retire_request(b"req-1").unwrap();
         assert_eq!(
-            store.commit(history, None, b"payload", Some(b"req-1"), None),
+            store.append(history, None, b"payload", Some(b"req-1"), None),
             Ok(CommitOutcome::Retired)
         );
         assert_eq!(
-            store.commit(history, None, b"other", Some(b"req-1"), None),
+            store.append(history, None, b"other", Some(b"req-1"), None),
             Err(HistoryError::RequestConflict)
         );
         assert_eq!(store.versions.len(), 1);
@@ -1604,7 +2304,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            store.commit(history, None, b"x", Some(b""), None),
+            store.append(history, None, b"x", Some(b""), None),
             Err(HistoryError::Invalid(
                 "persistent request identity is empty or exceeds the byte limit"
             ))
@@ -1615,10 +2315,10 @@ mod tests {
     fn poisoned_store_rejects_mutation_but_keeps_reads() {
         let mut store = PersistentHistoryStore::new();
         let history = store.create_history().unwrap();
-        let version = commit_new(&mut store, history, None, b"data");
+        let version = append_new(&mut store, history, None, b"data");
         store.set_poisoned();
         assert_eq!(
-            store.commit(history, None, b"more", None, None),
+            store.append(history, None, b"more", None, None),
             Err(HistoryError::Poisoned)
         );
         assert_eq!(store.retire_request(b"req-1"), Err(HistoryError::Poisoned));
@@ -1642,7 +2342,7 @@ mod tests {
         let first_history = store.create_history_durable(&mut log).unwrap();
         let second_history = store.create_history_durable(&mut log).unwrap();
         let v1 = match store
-            .commit_durable(&mut log, first_history, None, b"aaa", None, None)
+            .append_durable(&mut log, first_history, None, b"aaa", None, None)
             .unwrap()
         {
             CommitOutcome::Committed(version) => version,
@@ -1651,7 +2351,7 @@ mod tests {
             }
         };
         let v2 = match store
-            .commit_durable(
+            .append_durable(
                 &mut log,
                 first_history,
                 Some(v1.id()),
@@ -1671,7 +2371,7 @@ mod tests {
         let len_before = log.read_all().unwrap().len();
         assert_eq!(
             store
-                .commit_durable(
+                .append_durable(
                     &mut log,
                     first_history,
                     Some(v1.id()),
@@ -1686,7 +2386,7 @@ mod tests {
 
         // Same request with a different payload conflicts without logging.
         assert!(matches!(
-            store.commit_durable(
+            store.append_durable(
                 &mut log,
                 first_history,
                 Some(v1.id()),
@@ -1701,7 +2401,7 @@ mod tests {
         store.retire_durable(&mut log, b"req-1").unwrap();
         assert_eq!(
             store
-                .commit_durable(
+                .append_durable(
                     &mut log,
                     first_history,
                     Some(v1.id()),
@@ -1739,7 +2439,7 @@ mod tests {
         let mut store = PersistentHistoryStore::new();
         let history = store.create_history_durable(&mut log).unwrap();
         let first = match store
-            .commit_durable(&mut log, history, None, b"one", None, None)
+            .append_durable(&mut log, history, None, b"one", None, None)
             .unwrap()
         {
             CommitOutcome::Committed(version) => version,
@@ -1753,7 +2453,7 @@ mod tests {
         let mut reopened_log = DurableHistoryLog::open(&path).unwrap();
         let mut reopened = recover_history_store(&reopened_log.read_all().unwrap()).unwrap();
         let second = match reopened
-            .commit_durable(
+            .append_durable(
                 &mut reopened_log,
                 history,
                 Some(first.id()),
@@ -1783,7 +2483,7 @@ mod tests {
         let mut store = PersistentHistoryStore::new();
         let history = store.create_history_durable(&mut log).unwrap();
         match store
-            .commit_durable(&mut log, history, None, b"stable", None, None)
+            .append_durable(&mut log, history, None, b"stable", None, None)
             .unwrap()
         {
             CommitOutcome::Committed(_) => {}
@@ -1792,17 +2492,23 @@ mod tests {
             }
         }
         // Simulate a crash mid-write: raw frame bytes without barrier or ack.
+        // The pending bytes are a well-formed splice record (append of
+        // "lost" onto the 6-byte parent), cut in half below.
         let pending = durable_log::encode_history_log_frame(
-            &durable_log::encode_history_log_record(&durable_log::HistoryLogRecord::Commit {
+            &durable_log::encode_history_log_record(&durable_log::HistoryLogRecord::Splice {
                 history,
                 version: crate::persistent_history::VersionId(1),
                 parent: Some(crate::persistent_history::VersionId(0)),
-                payload: b"lost".to_vec(),
+                offset: 6,
+                delete_len: 0,
+                insert: b"lost".to_vec(),
                 request_id: None,
                 binding: None,
-                digest: crate::persistent_history::history_operation_digest(
+                digest: crate::persistent_history::history_splice_digest(
                     history,
                     Some(crate::persistent_history::VersionId(0)),
+                    6,
+                    0,
                     b"lost",
                     None,
                 ),
@@ -1833,7 +2539,7 @@ mod tests {
         let mut healed = DurableHistoryLog::open(&path).unwrap();
         let mut healed_store = recover_history_store(&healed.read_all().unwrap()).unwrap();
         match healed_store
-            .commit_durable(
+            .append_durable(
                 &mut healed,
                 history,
                 Some(crate::persistent_history::VersionId(0)),
@@ -1860,7 +2566,7 @@ mod tests {
         let mut store = PersistentHistoryStore::new();
         let history = store.create_history_durable(&mut log).unwrap();
         match store
-            .commit_durable(&mut log, history, None, b"stable", None, None)
+            .append_durable(&mut log, history, None, b"stable", None, None)
             .unwrap()
         {
             CommitOutcome::Committed(_) => {}
@@ -1885,12 +2591,12 @@ mod tests {
         // Rejection happens in preview: no frame is written, nothing is
         // synced, and the store is not poisoned.
         assert!(matches!(
-            store.commit_durable(&mut log, history, None, b"", None, None),
+            store.append_durable(&mut log, history, None, b"", None, None),
             Err(DurableError::Rejected(_))
         ));
         assert_eq!(log.read_all().unwrap().len(), len_before);
         match store
-            .commit_durable(&mut log, history, None, b"after", None, None)
+            .append_durable(&mut log, history, None, b"after", None, None)
             .unwrap()
         {
             CommitOutcome::Committed(_) => {}
@@ -1913,7 +2619,7 @@ mod tests {
             Err(DurableError::RecoveryRequired)
         ));
         assert!(matches!(
-            store.commit_durable(&mut log, HistoryId(0), None, b"x", None, None),
+            store.append_durable(&mut log, HistoryId(0), None, b"x", None, None),
             Err(DurableError::RecoveryRequired)
         ));
         assert!(matches!(
@@ -1957,12 +2663,12 @@ mod tests {
     fn commit_binding_is_recorded_and_digest_bound() {
         let mut store = PersistentHistoryStore::new();
         let history = store.create_history().unwrap();
-        let plain = history_operation_digest(history, None, b"data", None);
-        let bound = history_operation_digest(history, None, b"data", Some(b"thread-a/cp-1"));
+        let plain = history_splice_digest(history, None, 0, 0, b"data", None);
+        let bound = history_splice_digest(history, None, 0, 0, b"data", Some(b"thread-a/cp-1"));
         assert_ne!(plain, bound);
 
         let version = match store
-            .commit(history, None, b"data", None, Some(b"thread-a/cp-1"))
+            .append(history, None, b"data", None, Some(b"thread-a/cp-1"))
             .unwrap()
         {
             CommitOutcome::Committed(version) => version,
@@ -1978,12 +2684,12 @@ mod tests {
         // different operation, so the bound request conflicts instead of
         // replaying the first version.
         let other = store
-            .commit(history, None, b"data", Some(b"req-b"), None)
+            .append(history, None, b"data", Some(b"req-b"), None)
             .unwrap()
             .version()
             .unwrap();
         assert_eq!(
-            store.commit(history, None, b"data", Some(b"req-b"), Some(b"other")),
+            store.append(history, None, b"data", Some(b"req-b"), Some(b"other")),
             Err(HistoryError::RequestConflict)
         );
         assert_eq!(store.version_bindings.get(&other.id()), None);
@@ -2005,7 +2711,7 @@ mod tests {
             history
         );
         let version = match store
-            .commit_durable(
+            .append_durable(
                 &mut log,
                 history,
                 None,

@@ -19,7 +19,7 @@ fn committed(
     payload: &[u8],
 ) -> tulya_core::persistent_history::Version {
     match authority
-        .commit(history, parent, payload, None, None)
+        .append(history, parent, payload, None, None)
         .unwrap()
     {
         CommitOutcome::Committed(version) => version,
@@ -43,7 +43,7 @@ fn public_surface_covers_the_full_durable_lifecycle() {
     let v0 = committed(&mut first, history, None, b"aaa");
     // Request-scoped commit plus retirement through the authority.
     let v1 = match first
-        .commit(history, Some(v0.id()), b"bbb", Some(b"req-1"), None)
+        .append(history, Some(v0.id()), b"bbb", Some(b"req-1"), None)
         .unwrap()
     {
         CommitOutcome::Committed(version) => version,

@@ -158,17 +158,43 @@ impl WritableHistoryAuthority {
         }
     }
 
-    /// Durably commits through the owned writable log.
-    pub fn commit(
+    /// Durably splices through the owned writable log: the single canonical
+    /// content mutation. See [`PersistentHistoryStore::splice`].
+    pub fn splice(
         &mut self,
         history: HistoryId,
         parent: Option<VersionId>,
-        payload: &[u8],
+        offset: u64,
+        delete_len: u64,
+        insert: &[u8],
+        request_id: Option<&[u8]>,
+        binding: Option<&[u8]>,
+    ) -> Result<CommitOutcome, DurableError> {
+        self.store.splice_durable(
+            &mut self.hot,
+            history,
+            parent,
+            offset,
+            delete_len,
+            insert,
+            request_id,
+            binding,
+        )
+    }
+
+    /// Durably appends through the owned writable log: canonicalizes to a
+    /// splice at the parent end with one shared digest and encoding. See
+    /// [`PersistentHistoryStore::append`].
+    pub fn append(
+        &mut self,
+        history: HistoryId,
+        parent: Option<VersionId>,
+        bytes: &[u8],
         request_id: Option<&[u8]>,
         binding: Option<&[u8]>,
     ) -> Result<CommitOutcome, DurableError> {
         self.store
-            .commit_durable(&mut self.hot, history, parent, payload, request_id, binding)
+            .append_durable(&mut self.hot, history, parent, bytes, request_id, binding)
     }
 
     /// Durably retires a request identity through the owned writable log.
@@ -553,7 +579,7 @@ mod tests {
         parent: Option<VersionId>,
         payload: &[u8],
     ) -> VersionId {
-        match store.commit(history, parent, payload, None, None).unwrap() {
+        match store.append(history, parent, payload, None, None).unwrap() {
             CommitOutcome::Committed(version) => version.id(),
             CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
                 panic!("fixture commit must create")
@@ -569,7 +595,7 @@ mod tests {
         payload: &[u8],
     ) -> VersionId {
         match store
-            .commit_durable(log, history, parent, payload, None, None)
+            .append_durable(log, history, parent, payload, None, None)
             .unwrap()
         {
             CommitOutcome::Committed(version) => version.id(),
@@ -859,7 +885,7 @@ mod tests {
         assert_eq!(read_only.generation, 0);
 
         let history = first.create_history(Some(b"thread-a")).unwrap();
-        let v0 = match first.commit(history, None, b"aaa", None, None).unwrap() {
+        let v0 = match first.append(history, None, b"aaa", None, None).unwrap() {
             CommitOutcome::Committed(version) => version,
             CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
                 panic!("authority commit must create")
@@ -884,7 +910,7 @@ mod tests {
         // Post-seal writes land in the new generation through the owned
         // handle, with no unlocked open anywhere in the path.
         let v1 = match first
-            .commit(history, Some(v0.id()), b"bbb", None, None)
+            .append(history, Some(v0.id()), b"bbb", None, None)
             .unwrap()
         {
             CommitOutcome::Committed(version) => version,
@@ -952,7 +978,7 @@ mod tests {
             let temp = fixture_dir();
             let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
             let history = authority.create_history(Some(b"thread-a")).unwrap();
-            let v0 = match authority.commit(history, None, b"aaa", None, None).unwrap() {
+            let v0 = match authority.append(history, None, b"aaa", None, None).unwrap() {
                 CommitOutcome::Committed(version) => version,
                 CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
                     panic!("authority commit must create")
@@ -975,7 +1001,7 @@ mod tests {
             assert!(!temp.path().join(HISTORY_MANIFEST_FILE).exists());
             assert_eq!(authority.generation(), 0);
             let v1 = match authority
-                .commit(history, Some(v0.id()), b"bbb", None, None)
+                .append(history, Some(v0.id()), b"bbb", None, None)
                 .unwrap()
             {
                 CommitOutcome::Committed(version) => version,
@@ -1001,7 +1027,7 @@ mod tests {
         let temp = fixture_dir();
         let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
         let history = authority.create_history(Some(b"thread-a")).unwrap();
-        let v0 = match authority.commit(history, None, b"aaa", None, None).unwrap() {
+        let v0 = match authority.append(history, None, b"aaa", None, None).unwrap() {
             CommitOutcome::Committed(version) => version,
             CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
                 panic!("authority commit must create")
@@ -1025,7 +1051,7 @@ mod tests {
             Err(DurableError::RecoveryRequired)
         ));
         assert!(matches!(
-            authority.commit(history, None, b"zzz", None, None),
+            authority.append(history, None, b"zzz", None, None),
             Err(DurableError::RecoveryRequired)
         ));
         assert!(matches!(
@@ -1176,7 +1202,7 @@ mod tests {
         let history = HistoryId::new(0);
         let base = store.lookup_version(VersionId::new(3)).unwrap();
         let v5 = match store
-            .commit_durable(&mut log, history, Some(base.id()), b"fff", None, None)
+            .append_durable(&mut log, history, Some(base.id()), b"fff", None, None)
             .unwrap()
         {
             CommitOutcome::Committed(version) => version,
@@ -1185,7 +1211,7 @@ mod tests {
             }
         };
         let v6 = match store
-            .commit_durable(&mut log, history, Some(v5.id()), b"ggg", None, None)
+            .append_durable(&mut log, history, Some(v5.id()), b"ggg", None, None)
             .unwrap()
         {
             CommitOutcome::Committed(version) => version,
@@ -1216,5 +1242,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(output, b"aaadddfffggg");
+    }
+
+    #[test]
+    fn seal_then_splice_suffix_reopens_exact() {
+        // Durable splice after a seal lands in the new hot generation and
+        // reopens byte-exact: snapshot base plus bounded splice suffix.
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority
+            .append(history, None, b"abcdefghij", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        let summary = authority.seal().unwrap();
+        assert_eq!(summary.generation, 1);
+        let v1 = match authority
+            .splice(history, Some(v0.id()), 5, 2, b"XY", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("suffix splice must create")
+            }
+        };
+        drop(authority);
+        let reopened = open_history_authority(temp.path()).unwrap();
+        assert_eq!(reopened.generation, 1);
+        assert_eq!(reopened.stats.snapshot_versions, 1);
+        assert!(reopened.stats.suffix_bytes > 0);
+        let got = reopened.store.lookup_version(v1.id()).unwrap();
+        let mut output = Vec::new();
+        reopened
+            .store
+            .read(got, 0, got.root().logical_len().get(), &mut output)
+            .unwrap();
+        assert_eq!(output, b"abcdeXYhij");
+        // The pre-seal root is untouched by the suffix splice.
+        let base = reopened.store.lookup_version(v0.id()).unwrap();
+        let mut expected = Vec::new();
+        reopened
+            .store
+            .read(base, 0, base.root().logical_len().get(), &mut expected)
+            .unwrap();
+        assert_eq!(expected, b"abcdefghij");
     }
 }

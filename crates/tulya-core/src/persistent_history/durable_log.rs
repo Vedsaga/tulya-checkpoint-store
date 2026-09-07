@@ -1,14 +1,20 @@
-//! Append-only durable log for the domain-neutral history core.
+//! Splice-epoch durable log for the domain-neutral history core.
 //!
-//! The log is the P1.3 durability authority for generic history: a sequence
-//! of framed records replayed from genesis on open. It stores no
-//! adapter vocabulary — only numeric history/version identities, parent
-//! links, opaque payloads, request identities, and operation digests.
+//! The log is the durability authority for generic history: a sequence of
+//! framed records replayed from genesis on open. It stores no adapter
+//! vocabulary — only numeric history/version identities, parent links,
+//! splice coordinates, inserted bytes, request identities, and operation
+//! digests.
+//!
+//! Staging epoch note: the `THL2` magic and the splice record below replace
+//! the pre-E2 append-only `THL1` grammar. Old staging logs fail closed at
+//! the frame magic and are never reinterpreted; there is deliberately no
+//! migration parser (zero external users).
 //!
 //! Frame layout (all integers little-endian):
 //!
 //! ```text
-//! magic[4] = THL1
+//! magic[4] = THL2
 //! body_len[u64]
 //! body[..]
 //! footer_magic[4] = THLF
@@ -19,10 +25,12 @@
 //! Record bodies:
 //!
 //! ```text
-//! kind[u8]: 1 = create history, 2 = commit, 3 = retire
-//! create:  history_id[u64]
-//! commit:  history_id[u64], version_id[u64], parent[u64, MAX = none],
-//!          payload_len[u64], payload[..], request_len[u64], request[..],
+//! kind[u8]: 1 = create history, 4 = splice, 3 = retire
+//! create:  history_id[u64], binding-present[u8] + len[u64] + bytes
+//! splice:  history_id[u64], version_id[u64], parent[u64, MAX = none],
+//!          offset[u64], delete_len[u64], insert_len[u64], insert[..],
+//!          request_len[u64], request[..],
+//!          binding-present[u8] + len[u64] + bytes,
 //!          operation_digest[32]
 //! retire:  request_len[u64], request[..], operation_digest[32]
 //! ```
@@ -45,15 +53,18 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-const HISTORY_LOG_MAGIC: [u8; 4] = *b"THL1";
+const HISTORY_LOG_MAGIC: [u8; 4] = *b"THL2";
 const HISTORY_LOG_FOOTER_MAGIC: [u8; 4] = *b"THLF";
 const HISTORY_LOG_HEADER_SIZE: usize = 12;
 const HISTORY_LOG_FOOTER_SIZE: usize = 44;
 const HISTORY_LOG_DIGEST_DOMAIN: &[u8] = b"tulya-history/v1/log-frame\0";
 
 const RECORD_CREATE_HISTORY: u8 = 1;
-const RECORD_COMMIT: u8 = 2;
 const RECORD_RETIRE: u8 = 3;
+/// Canonical splice/version record tag. Tag 2 named the pre-E2
+/// append-oriented commit record and is deliberately never reused, so no
+/// staging byte sequence can be reinterpreted across the grammar epoch.
+const RECORD_SPLICE: u8 = 4;
 const NO_PARENT: u64 = u64::MAX;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,11 +73,13 @@ pub enum HistoryLogRecord {
         history: HistoryId,
         binding: Option<Vec<u8>>,
     },
-    Commit {
+    Splice {
         history: HistoryId,
         version: VersionId,
         parent: Option<VersionId>,
-        payload: Vec<u8>,
+        offset: u64,
+        delete_len: u64,
+        insert: Vec<u8>,
         request_id: Option<Vec<u8>>,
         binding: Option<Vec<u8>>,
         digest: [u8; 32],
@@ -147,20 +160,24 @@ pub fn encode_history_log_record(record: &HistoryLogRecord) -> Result<Vec<u8>, H
                 None => put_u64(&mut output, 0),
             }
         }
-        HistoryLogRecord::Commit {
+        HistoryLogRecord::Splice {
             history,
             version,
             parent,
-            payload,
+            offset,
+            delete_len,
+            insert,
             request_id,
             binding,
             digest,
         } => {
-            output.push(RECORD_COMMIT);
+            output.push(RECORD_SPLICE);
             output.extend_from_slice(&history.id().to_le_bytes());
             output.extend_from_slice(&version.id().to_le_bytes());
             output.extend_from_slice(&parent.map_or(NO_PARENT, VersionId::id).to_le_bytes());
-            put_bytes(&mut output, payload);
+            output.extend_from_slice(&offset.to_le_bytes());
+            output.extend_from_slice(&delete_len.to_le_bytes());
+            put_bytes(&mut output, insert);
             match request_id {
                 Some(id) => {
                     if id.len() > MAX_HISTORY_REQUEST_ID_BYTES {
@@ -211,8 +228,8 @@ fn encoded_record_len(record: &HistoryLogRecord) -> Result<usize, HistoryError> 
             .ok_or(HistoryError::Overflow(
                 "history log record length exceeds usize",
             ))?,
-        HistoryLogRecord::Commit {
-            payload,
+        HistoryLogRecord::Splice {
+            insert,
             request_id,
             binding,
             ..
@@ -221,7 +238,9 @@ fn encoded_record_len(record: &HistoryLogRecord) -> Result<usize, HistoryError> 
             .and_then(|value| value.checked_add(8))
             .and_then(|value| value.checked_add(8))
             .and_then(|value| value.checked_add(8))
-            .and_then(|value| value.checked_add(payload.len()))
+            .and_then(|value| value.checked_add(8))
+            .and_then(|value| value.checked_add(8))
+            .and_then(|value| value.checked_add(insert.len()))
             .and_then(|value| value.checked_add(8))
             .and_then(|value| value.checked_add(request_id.as_ref().map_or(0, Vec::len)))
             .and_then(|value| value.checked_add(8))
@@ -259,7 +278,7 @@ pub fn decode_history_log_record(bytes: &[u8]) -> Result<HistoryLogRecord, Histo
             let binding = decode_optional_binding(&mut cursor)?;
             HistoryLogRecord::CreateHistory { history, binding }
         }
-        RECORD_COMMIT => {
+        RECORD_SPLICE => {
             let history = HistoryId(cursor.take_u64()?);
             let version = VersionId(cursor.take_u64()?);
             let raw_parent = cursor.take_u64()?;
@@ -268,8 +287,10 @@ pub fn decode_history_log_record(bytes: &[u8]) -> Result<HistoryLogRecord, Histo
             } else {
                 Some(VersionId(raw_parent))
             };
-            let payload_len = cursor.take_u64()?;
-            let payload = cursor.take_bytes(payload_len)?;
+            let offset = cursor.take_u64()?;
+            let delete_len = cursor.take_u64()?;
+            let insert_len = cursor.take_u64()?;
+            let insert = cursor.take_bytes(insert_len)?;
             let request_len = cursor.take_u64()?;
             let request_id = if request_len == 0 {
                 None
@@ -284,11 +305,13 @@ pub fn decode_history_log_record(bytes: &[u8]) -> Result<HistoryLogRecord, Histo
             };
             let binding = decode_optional_binding(&mut cursor)?;
             let digest = cursor.take_array::<32>()?;
-            HistoryLogRecord::Commit {
+            HistoryLogRecord::Splice {
                 history,
                 version,
                 parent,
-                payload: payload.to_vec(),
+                offset,
+                delete_len,
+                insert: insert.to_vec(),
                 request_id,
                 binding,
                 digest,
@@ -548,20 +571,24 @@ fn apply_recovered_record(
         HistoryLogRecord::CreateHistory { history, binding } => {
             store.replay_create(*history, binding.as_deref())?;
         }
-        HistoryLogRecord::Commit {
+        HistoryLogRecord::Splice {
             history,
             version,
             parent,
-            payload,
+            offset,
+            delete_len,
+            insert,
             request_id,
             binding,
             digest,
         } => {
-            let assigned = store.replay_commit(
+            let assigned = store.replay_splice(
                 *history,
                 *version,
                 *parent,
-                payload,
+                *offset,
+                *delete_len,
+                insert,
                 request_id.as_deref(),
                 binding.as_deref(),
                 *digest,
@@ -711,12 +738,14 @@ fn scan_log_tail(bytes: &[u8]) -> Result<u64, HistoryError> {
 mod tests {
     use super::*;
 
-    fn commit_record() -> HistoryLogRecord {
-        HistoryLogRecord::Commit {
+    fn splice_record() -> HistoryLogRecord {
+        HistoryLogRecord::Splice {
             history: HistoryId(2),
             version: VersionId(5),
             parent: Some(VersionId(4)),
-            payload: b"payload-bytes".to_vec(),
+            offset: 3,
+            delete_len: 2,
+            insert: b"payload-bytes".to_vec(),
             request_id: Some(b"req-1".to_vec()),
             binding: Some(b"bind-1".to_vec()),
             digest: [0x33; 32],
@@ -734,12 +763,14 @@ mod tests {
                 history: HistoryId(8),
                 binding: None,
             },
-            commit_record(),
-            HistoryLogRecord::Commit {
+            splice_record(),
+            HistoryLogRecord::Splice {
                 history: HistoryId(0),
                 version: VersionId(0),
                 parent: None,
-                payload: Vec::new(),
+                offset: 0,
+                delete_len: 0,
+                insert: Vec::new(),
                 request_id: None,
                 binding: None,
                 digest: [0x00; 32],
@@ -756,7 +787,7 @@ mod tests {
 
     #[test]
     fn record_decoder_fails_closed_on_truncation_and_trailing() {
-        let encoded = encode_history_log_record(&commit_record()).unwrap();
+        let encoded = encode_history_log_record(&splice_record()).unwrap();
         for end in [0, 1, 7, 8, 9, 20, encoded.len() - 1] {
             assert!(
                 decode_history_log_record(&encoded[..end]).is_err(),
@@ -791,7 +822,7 @@ mod tests {
 
     #[test]
     fn frame_scan_accepts_complete_prefix_and_ignores_torn_tail() {
-        let first = encode_history_log_frame(&encode_history_log_record(&commit_record()).unwrap())
+        let first = encode_history_log_frame(&encode_history_log_record(&splice_record()).unwrap())
             .unwrap();
         let second = encode_history_log_frame(
             &encode_history_log_record(&HistoryLogRecord::CreateHistory {
@@ -813,7 +844,7 @@ mod tests {
 
     #[test]
     fn frame_scan_rejects_corrupt_magic_digest_and_length() {
-        let frame = encode_history_log_frame(&encode_history_log_record(&commit_record()).unwrap())
+        let frame = encode_history_log_frame(&encode_history_log_record(&splice_record()).unwrap())
             .unwrap();
         let mut bad_magic = frame.clone();
         bad_magic[0] ^= 0xFF;
