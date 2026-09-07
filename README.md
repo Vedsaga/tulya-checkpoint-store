@@ -209,9 +209,11 @@ python3 benchmarks/release_smoke.py
 
 ## Documentation
 
-- [Production-readiness plan and release gates](docs/PRODUCTION_READINESS.md)
+- [Authoritative core engineering execution plan](docs/TULYA_CORE_ENGINEERING_PLAN.md)
+- [Authoritative benchmark execution plan](docs/TULYA_BENCHMARK_EXECUTION_PLAN.md)
+- [Production-readiness invariants and release gates](docs/PRODUCTION_READINESS.md)
 - [Evaluate Tulya and use the local API](docs/EVALUATING_TULYA.md)
-- [Exact benchmark and reproduction](docs/BENCHMARKS.md)
+- [Historical benchmark evidence and reproduction](docs/BENCHMARKS.md)
 - [On-disk format](docs/FORMAT.md)
 - [Durability, recovery, and crash testing](docs/RECOVERY.md)
 - [LangGraph shadow integration](integrations/langgraph/README.md)
