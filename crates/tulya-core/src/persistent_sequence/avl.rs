@@ -330,8 +330,7 @@ impl V2AvlSequence {
                     }
                     std::cmp::Ordering::Equal => Ok((Some(left), Some(right))),
                     std::cmp::Ordering::Greater => {
-                        let (near, far_right) =
-                            self.split(right, offset - left_len, inspected)?;
+                        let (near, far_right) = self.split(right, offset - left_len, inspected)?;
                         let joined_left = match near {
                             None => left,
                             Some(near) => self.concat(left, near, inspected)?,
