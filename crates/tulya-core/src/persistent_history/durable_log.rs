@@ -43,7 +43,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const HISTORY_LOG_MAGIC: [u8; 4] = *b"THL1";
 const HISTORY_LOG_FOOTER_MAGIC: [u8; 4] = *b"THLF";
@@ -582,16 +582,21 @@ fn apply_recovered_record(
 /// Append-only file handle for one history log, tracking the replayed logical
 /// tail so appends truncate any torn tail before writing.
 #[derive(Debug)]
-pub struct DurableHistoryLog {
+pub(crate) struct DurableHistoryLog {
     file: File,
-    path: PathBuf,
     tail: u64,
+    fail_next_append: bool,
 }
 
 impl DurableHistoryLog {
     /// Opens (creating if absent) the log file and recovers the logical tail
     /// by scanning for the last complete frame.
-    pub fn open(path: &Path) -> std::io::Result<Self> {
+    ///
+    /// Test-only driver: production opens generation logs through
+    /// [`open_write`](Self::open_write) under the writable authority lease,
+    /// never through unlocked opens.
+    #[cfg(test)]
+    pub(crate) fn open(path: &Path) -> std::io::Result<Self> {
         // Never truncate on open: existing frames are the authority being
         // recovered. Appends truncate explicitly to the replayed tail first.
         let mut file = OpenOptions::new()
@@ -608,13 +613,9 @@ impl DurableHistoryLog {
         })?;
         Ok(Self {
             file,
-            path: path.to_path_buf(),
             tail,
+            fail_next_append: false,
         })
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     /// Opens a generation hot log for writing, holding an exclusive
@@ -627,7 +628,7 @@ impl DurableHistoryLog {
     /// hold the old generation while opening the next one without
     /// self-deadlock; cross-generation safety comes from manifest-driven
     /// recovery, which never reads a superseded hot file.
-    pub fn open_write(path: &Path) -> std::io::Result<Self> {
+    pub(crate) fn open_write(path: &Path) -> std::io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -637,18 +638,29 @@ impl DurableHistoryLog {
         file.try_lock_exclusive()?;
         let mut log = Self {
             file,
-            path: path.to_path_buf(),
             tail: 0,
+            fail_next_append: false,
         };
         log.tail = scan_log_tail(&log.read_all()?).map_err(|error| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
         })?;
+        log.fail_next_append = false;
         Ok(log)
+    }
+
+    /// Arms a one-shot deterministic append failure for the next
+    /// [`append_frame`](Self::append_frame): it fails before touching any
+    /// byte, exactly like a filesystem write rejection. Test seam only —
+    /// production paths never arm it — for proving pre-authority failures
+    /// leave semantic state unchanged.
+    #[cfg(test)]
+    pub(crate) fn arm_fail_next_append(&mut self) {
+        self.fail_next_append = true;
     }
 
     /// Returns true when the underlying lock failure signals contention
     /// rather than a genuine I/O error.
-    pub fn is_lock_contention(error: &std::io::Error) -> bool {
+    pub(crate) fn is_lock_contention(error: &std::io::Error) -> bool {
         error.kind() == std::io::ErrorKind::WouldBlock
             || error.raw_os_error() == fs4::lock_contended_error().raw_os_error()
     }
@@ -656,7 +668,14 @@ impl DurableHistoryLog {
     /// Appends one complete frame at the logical tail, discarding any torn
     /// tail beyond it first. Callers sync separately to distinguish write
     /// failures (definite reject) from barrier failures (indeterminate).
-    pub fn append_frame(&mut self, frame: &[u8]) -> std::io::Result<()> {
+    pub(crate) fn append_frame(&mut self, frame: &[u8]) -> std::io::Result<()> {
+        if self.fail_next_append {
+            self.fail_next_append = false;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "injected fault: history log append rejected",
+            ));
+        }
         self.file.seek(SeekFrom::Start(self.tail))?;
         self.file.set_len(self.tail)?;
         self.file.write_all(frame)?;
@@ -672,11 +691,11 @@ impl DurableHistoryLog {
 
     /// Full file durability barrier. File length changes with every append,
     /// so this is `sync_all`, not `sync_data`.
-    pub fn sync(&mut self) -> std::io::Result<()> {
+    pub(crate) fn sync(&mut self) -> std::io::Result<()> {
         self.file.sync_all()
     }
 
-    pub fn read_all(&mut self) -> std::io::Result<Vec<u8>> {
+    pub(crate) fn read_all(&mut self) -> std::io::Result<Vec<u8>> {
         self.file.seek(SeekFrom::Start(0))?;
         let mut bytes = Vec::new();
         self.file.read_to_end(&mut bytes)?;

@@ -2204,9 +2204,12 @@ fn candidate_seal_recycles_and_bounds_reopen() -> Result<(), Box<dyn std::error:
 fn candidate_legacy_genesis_wal_is_adopted_once() -> Result<(), Box<dyn std::error::Error>> {
     // A P1.3-era genesis `history.wal` (valid frames, bound adapter
     // material) is adopted into generation zero on open and never read
-    // again afterwards.
-    use tulya_core::persistent_history::durable_log::DurableHistoryLog;
-    use tulya_core::persistent_history::{CommitOutcome, PersistentHistoryStore};
+    // again afterwards. The genesis bytes are laid with public codecs only —
+    // no writable core handle — exactly modelling foreign-produced bytes.
+    use tulya_core::persistent_history::durable_log::{
+        encode_history_log_frame, encode_history_log_record, HistoryLogRecord,
+    };
+    use tulya_core::persistent_history::{history_operation_digest, HistoryId, VersionId};
 
     let temp = tempfile::tempdir()?;
     let config = CheckpointStoreConfig {
@@ -2217,17 +2220,30 @@ fn candidate_legacy_genesis_wal_is_adopted_once() -> Result<(), Box<dyn std::err
         recovery_mode: CheckpointStoreRecoveryMode::ReusePayload,
     };
     {
-        let mut core = PersistentHistoryStore::new();
-        let mut log = DurableHistoryLog::open(&temp.path().join("history.wal"))?;
-        let history = core.create_history_durable_with_binding(&mut log, b"thread-a")?;
-        let binding = encode_candidate_version_binding("thread-a", "cp-1");
-        match core.commit_durable(&mut log, history, None, b"hello", None, Some(&binding))? {
-            CommitOutcome::Committed(_) => {}
-            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
-                panic!("genesis commit must create")
-            }
-        }
-        log.sync()?;
+        let history = HistoryId::new(0);
+        let thread_binding = b"thread-a".to_vec();
+        let version_binding = encode_candidate_version_binding("thread-a", "cp-1");
+        let digest = history_operation_digest(history, None, b"hello", Some(&version_binding));
+        let mut bytes = encode_history_log_frame(&encode_history_log_record(
+            &HistoryLogRecord::CreateHistory {
+                history,
+                binding: Some(thread_binding),
+            },
+        )?)?;
+        bytes.extend_from_slice(&encode_history_log_frame(&encode_history_log_record(
+            &HistoryLogRecord::Commit {
+                history,
+                version: VersionId::new(0),
+                parent: None,
+                payload: b"hello".to_vec(),
+                request_id: None,
+                binding: Some(version_binding),
+                digest,
+            },
+        )?)?);
+        let path = temp.path().join("history.wal");
+        std::fs::write(&path, &bytes)?;
+        std::fs::File::open(&path)?.sync_all()?;
     }
     let reopened = CheckpointStore::open(temp.path(), config)?;
     // Adoption renames exactly once: the genesis name is gone, the

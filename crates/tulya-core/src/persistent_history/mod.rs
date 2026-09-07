@@ -259,10 +259,11 @@ struct PreparedCommit<'a> {
 
 /// A begun durable history creation whose frame is already authoritative in
 /// the log but not yet applied in memory. The token is valid only for the
-/// store that began it; finishing twice, or finishing after the identity
-/// arrived by another path, poisons instead of aliasing.
+/// store that began it and pairs strictly with one finish: finishing twice,
+/// or finishing after the identity arrived by another path, poisons instead
+/// of aliasing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreparedHistoryCreate {
+pub(crate) struct PreparedHistoryCreate {
     history: HistoryId,
     binding: Option<Vec<u8>>,
 }
@@ -756,7 +757,7 @@ impl PersistentHistoryStore {
     /// fallible step (validation, reservation, identity assignment, encode,
     /// write, barrier) completes before the in-memory apply, which cannot
     /// fail — so a rejection provably precedes any new authority.
-    pub fn create_history_durable(
+    pub(crate) fn create_history_durable(
         &mut self,
         log: &mut DurableHistoryLog,
     ) -> Result<HistoryId, DurableError> {
@@ -770,7 +771,7 @@ impl PersistentHistoryStore {
     /// Durably creates a history bound to opaque adapter bytes, idempotently:
     /// a retry with the same binding resolves the existing history instead of
     /// allocating a duplicate lineage, before or after any crash.
-    pub fn create_history_durable_with_binding(
+    pub(crate) fn create_history_durable_with_binding(
         &mut self,
         log: &mut DurableHistoryLog,
         binding: &[u8],
@@ -782,18 +783,24 @@ impl PersistentHistoryStore {
         Ok(id)
     }
 
-    /// Prepared durable history creation: the identity is assigned, all
-    /// in-memory capacity is reserved, and the create frame is encoded,
-    /// written, and synced. The returned token still needs
-    /// [`finish_durable_history_create`] to become visible in memory — the
-    /// window between models exactly the crash between the durable barrier
-    /// and the in-memory apply, which recovery resolves by replaying the
-    /// now-authoritative record.
+    /// Prepared durable history creation: identity computed, capacity
+    /// reserved, frame encoded, written, and synced — but visibility still
+    /// needs [`finish_durable_history_create`]. The window between models
+    /// exactly the crash between the durable barrier and the in-memory
+    /// apply, which recovery resolves by replaying the now-authoritative
+    /// record.
+    ///
+    /// A definite rejection before or at the barrier restores the allocation
+    /// counter to its prior value: only the write step runs after the bump,
+    /// and a rejected append leaves no authority behind (at most a torn
+    /// tail, which recovery ignores), so retry reuses the same identity and
+    /// replay order can never skew. Only the barrier-ambiguous sync failure
+    /// poisons without restoring — that record may already be authoritative.
     ///
     /// A `None` token with an identity means idempotent resolution: the
     /// binding already exists, nothing was written, and there is nothing to
     /// apply.
-    pub fn begin_durable_history_create(
+    pub(crate) fn begin_durable_history_create(
         &mut self,
         log: &mut DurableHistoryLog,
         binding: Option<&[u8]>,
@@ -809,9 +816,10 @@ impl PersistentHistoryStore {
                 return Ok((existing, None));
             }
         }
-        // Reserve every fallible in-memory allocation before the barrier, and
-        // assign the identity up front so the token owns an unambiguous slot
-        // even if the apply is delayed past later operations.
+        // Reserve every fallible in-memory allocation before assigning, so a
+        // capacity rejection changes nothing at all. Encoding precedes the
+        // counter bump because it touches no state: only the write step can
+        // fail after the bump, and only it needs the restore below.
         self.histories.try_reserve(1).map_err(|_| {
             DurableError::Rejected(HistoryError::Capacity(
                 "persistent history set allocation failed",
@@ -825,12 +833,6 @@ impl PersistentHistoryStore {
             })?;
         }
         let id = HistoryId(self.next_history_id);
-        self.next_history_id =
-            self.next_history_id
-                .checked_add(1)
-                .ok_or(DurableError::Rejected(HistoryError::Overflow(
-                    "persistent history count exceeds u64",
-                )))?;
         let record = HistoryLogRecord::CreateHistory {
             history: id,
             binding: binding.map(<[u8]>::to_vec),
@@ -839,7 +841,24 @@ impl PersistentHistoryStore {
             &durable_log::encode_history_log_record(&record).map_err(DurableError::Rejected)?,
         )
         .map_err(DurableError::Rejected)?;
-        self.write_and_sync(log, &frame)?;
+        let prior_counter = self.next_history_id;
+        self.next_history_id =
+            self.next_history_id
+                .checked_add(1)
+                .ok_or(DurableError::Rejected(HistoryError::Overflow(
+                    "persistent history count exceeds u64",
+                )))?;
+        if let Err(error) = self.write_and_sync(log, &frame) {
+            if matches!(error, DurableError::Rejected(_)) {
+                // Pre-authority failure: the append left no new authority
+                // behind (at most a torn tail, which recovery ignores), so
+                // restore the counter for an exact retry. Barrier-ambiguous
+                // sync failures keep the bump: that record may already be
+                // authoritative, and the poisoned writer must reopen anyway.
+                self.next_history_id = prior_counter;
+            }
+            return Err(error);
+        }
         Ok((
             id,
             Some(PreparedHistoryCreate {
@@ -849,19 +868,35 @@ impl PersistentHistoryStore {
         ))
     }
 
-    /// Applies a begun durable history creation. The apply touches only
-    /// pre-reserved capacity, so it cannot fail — except when the token is
-    /// stale or already applied while its record is authoritative in the log
-    /// (double finish, or a finish after the record replayed on reopen). That
-    /// divergence poisons the writer and demands reopen instead of aliasing
-    /// an identity: the log already holds the truth and recovery resolves it.
-    pub fn finish_durable_history_create(
+    /// Applies a begun durable history creation. The counter was already
+    /// advanced by the begin step and the apply touches only pre-reserved
+    /// capacity, so it cannot fail — except when the token disagrees with
+    /// live state: an already-applied identity (double finish), or a counter
+    /// that moved past the token (stale token held across other mutations,
+    /// or a token finished on the wrong store lifetime). In all those cases
+    /// the record is already authoritative in the log, so the writer poisons
+    /// and demands reopen instead of aliasing an identity: the log already
+    /// holds the truth and recovery resolves it.
+    pub(crate) fn finish_durable_history_create(
         &mut self,
         prepared: &PreparedHistoryCreate,
     ) -> Result<HistoryId, DurableError> {
         if self.histories.contains(&prepared.history) {
             return Err(self.poison_after_barrier(HistoryError::Invalid(
                 "prepared history identity is already applied",
+            )));
+        }
+        // The begin step already advanced the counter past the token identity:
+        // anything else means the token is stale or belongs to another store
+        // lifetime.
+        let adopted = prepared.history.id().checked_add(1).ok_or_else(|| {
+            self.poison_after_barrier(HistoryError::Invalid(
+                "prepared history identity exceeds the allocation counter",
+            ))
+        })?;
+        if self.next_history_id != adopted {
+            return Err(self.poison_after_barrier(HistoryError::Invalid(
+                "prepared history identity disagrees with the allocation counter",
             )));
         }
         let _ = self.histories.insert(prepared.history);
@@ -876,7 +911,7 @@ impl PersistentHistoryStore {
     /// Durably commits through the request ledger: replay and retired outcomes
     /// return without touching the log; fresh operations follow
     /// write-then-barrier-then-apply with poison on any post-barrier failure.
-    pub fn commit_durable(
+    pub(crate) fn commit_durable(
         &mut self,
         log: &mut DurableHistoryLog,
         history: HistoryId,
@@ -914,7 +949,7 @@ impl PersistentHistoryStore {
 
     /// Durably retires a request identity with the same write-then-apply
     /// discipline as commits.
-    pub fn retire_durable(
+    pub(crate) fn retire_durable(
         &mut self,
         log: &mut DurableHistoryLog,
         request_id: &[u8],
@@ -2076,6 +2111,48 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         let recovered = recover_history_store(&bytes).unwrap();
         assert!(recovered.histories.contains(&id));
+    }
+
+    #[test]
+    fn rejected_create_append_leaves_counter_unchanged() {
+        // Pre-authority append failure is a definite rejection: the counter
+        // must not advance, or the retry would write a skipped identity that
+        // recovery reads as a replay-order mismatch. Covers bound and
+        // unbound create through the same seam.
+        for binding in [None, Some(b"thread-a".as_slice())] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = test_log_path(temp.path());
+            let mut store = PersistentHistoryStore::new();
+            let mut log = DurableHistoryLog::open(&path).unwrap();
+            log.arm_fail_next_append();
+            let error = store
+                .begin_durable_history_create(&mut log, binding)
+                .unwrap_err();
+            assert!(
+                matches!(error, DurableError::Rejected(_)),
+                "injected append failure must reject, got {error}"
+            );
+            assert_eq!(store.next_history_id, 0);
+            assert!(store.histories.is_empty());
+            assert!(store.history_bindings.is_empty());
+            assert!(!store.is_poisoned());
+
+            // Fault removed: the retry writes HistoryId(0), applies, and a
+            // close/reopen cycle recovers exactly one history with the next
+            // counter at one.
+            let (id, prepared) = store
+                .begin_durable_history_create(&mut log, binding)
+                .unwrap();
+            assert_eq!(id, HistoryId::new(0));
+            let token = prepared.unwrap();
+            assert_eq!(store.finish_durable_history_create(&token).unwrap(), id);
+            drop(store);
+            drop(log);
+            let bytes = std::fs::read(&path).unwrap();
+            let recovered = recover_history_store(&bytes).unwrap();
+            assert!(recovered.histories.contains(&HistoryId::new(0)));
+            assert_eq!(recovered.next_history_id, 1);
+        }
     }
 
     #[test]

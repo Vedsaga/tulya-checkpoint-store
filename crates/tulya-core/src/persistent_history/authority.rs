@@ -9,7 +9,12 @@
 //! build snapshot(N+1) covering hot-N[..E]
 //! write + sync snapshot tmp, verify by strict re-decode, rename, dir sync
 //! create empty hot-(N+1) via tmp + rename + dir sync
-//! write + sync manifest tmp {N+1, sealed digest}, rename, dir sync
+//! open + lock hot-(N+1) while the manifest still reads N:
+//!     failure here is a definite reject, old authority fully operational
+//! write + sync manifest tmp {N+1, sealed digest}, rename
+//! dirsync: rename ok + dirsync failure is indeterminate (old-or-new),
+//!     so the writer poisons and must reopen
+//! adopt the already-open hot-(N+1) infallibly; switch generation/stats
 //! only now delete superseded hot-N (best effort, reported)
 //! ```
 //!
@@ -24,7 +29,8 @@ use super::{
     durable_log::{decode_history_log, replay_history_suffix, DurableError, DurableHistoryLog},
     manifest::{
         decode_history_manifest, encode_history_manifest, history_snapshot_filename,
-        history_wal_filename, HistoryManifest, HISTORY_LOCK_FILE, HISTORY_MANIFEST_FILE,
+        history_wal_filename, HistoryManifest, ManifestSealed, HISTORY_LOCK_FILE,
+        HISTORY_MANIFEST_FILE,
     },
     snapshot::{decode_history_snapshot, encode_history_snapshot},
     CommitOutcome, HistoryError, HistoryId, PersistentHistoryStore, VersionId,
@@ -171,26 +177,49 @@ impl WritableHistoryAuthority {
     }
 
     /// Seals the current generation while retaining the store-wide lease:
-    /// snapshot, next hot log, and manifest publish exactly like the free
-    /// function, then the owned handle switches to the next generation with
-    /// no writer race — no other authority can exist while this lease is
-    /// held. A poisoned store refuses to seal: publishing a snapshot of
+    /// snapshot, next hot log, and manifest publish in publication order,
+    /// then the owned handle switches to the next generation with no writer
+    /// race — no other authority can exist while this lease is held. A
+    /// poisoned store refuses to seal: publishing a snapshot of
     /// indeterminate state would launder it into authority.
     pub fn seal(&mut self) -> Result<SealSummary, DurableError> {
+        let dir = self.dir.clone();
+        self.seal_with_sync(|| sync_dir(&dir))
+    }
+
+    /// Seal orchestration with an injectable manifest directory sync: the
+    /// deterministic test seam for the rename-ok/dirsync-fail cut.
+    /// Crate-private; external writers use [`seal`](Self::seal).
+    pub(crate) fn seal_with_sync(
+        &mut self,
+        sync_dir_once: impl FnOnce() -> std::io::Result<()>,
+    ) -> Result<SealSummary, DurableError> {
         if self.store.is_poisoned() {
             return Err(DurableError::RecoveryRequired);
         }
-        let summary = seal_history_generation(&self.store, &self.dir)?;
-        let hot =
-            DurableHistoryLog::open_write(&self.dir.join(history_wal_filename(summary.generation)))
+        let staged = stage_sealed_generation(&self.store, &self.dir)?;
+        // Open and lock the next hot log BEFORE the manifest commits: any
+        // failure here still sees manifest N, so it stays a definite
+        // rejection with the old handle and generation fully operational.
+        let next_hot =
+            DurableHistoryLog::open_write(&self.dir.join(history_wal_filename(staged.generation)))
                 .map_err(map_hot_open_error)?;
-        self.hot = hot;
-        self.generation = summary.generation;
+        commit_staged_manifest(&mut self.store, &self.dir, &staged, sync_dir_once)?;
+        // Infallible adoption: the next handle is already open and locked, so
+        // no fallible step remains between durable authority and memory.
+        self.hot = next_hot;
+        self.generation = staged.generation;
         self.stats = OpenedHistoryStats {
             snapshot_versions: self.store.version_count(),
             suffix_bytes: 0,
         };
-        Ok(summary)
+        let recycled_hot = recycle_superseded_hot(&self.dir, staged.previous);
+        Ok(SealSummary {
+            generation: staged.generation,
+            represented_wal_end: staged.represented_wal_end,
+            snapshot_len: staged.snapshot_len,
+            recycled_hot,
+        })
     }
 }
 
@@ -295,14 +324,47 @@ pub fn open_history_authority(dir: &Path) -> Result<OpenedHistory, DurableError>
 /// plus the consumed hot prefix, publishes the next manifest generation, and
 /// recycles the superseded hot log.
 ///
-/// The live store is never mutated; the caller advances its generation
-/// tracking and write handle to the returned generation. All filesystem
-/// failures before manifest publication leave the old authority complete and
-/// report definite rejection.
-pub fn seal_history_generation(
-    store: &PersistentHistoryStore,
+/// Test-only full-file driver for crash-cut scenarios; production seals
+/// through [`WritableHistoryAuthority::seal`], which additionally opens the
+/// next hot log before the manifest commits. Takes the store by exclusive
+/// reference so a manifest dirsync failure can poison it: a rename that
+/// succeeded with a lost directory sync leaves old-or-new authority behind,
+/// which is indeterminate, never a definite rejection.
+///
+/// All failures before the manifest rename leave the old authority complete
+/// and report definite rejection.
+#[cfg(test)]
+pub(crate) fn seal_history_generation(
+    store: &mut PersistentHistoryStore,
     dir: &Path,
 ) -> Result<SealSummary, DurableError> {
+    let staged = stage_sealed_generation(store, dir)?;
+    commit_staged_manifest(store, dir, &staged, || sync_dir(dir))?;
+    let recycled_hot = recycle_superseded_hot(dir, staged.previous);
+    Ok(SealSummary {
+        generation: staged.generation,
+        represented_wal_end: staged.represented_wal_end,
+        snapshot_len: staged.snapshot_len,
+        recycled_hot,
+    })
+}
+
+/// Staged sealed generation: snapshot published and verified, empty
+/// next-generation hot log published, everything short of manifest
+/// authority. Every failure here predates any new authority and reports
+/// definite rejection.
+struct StagedSeal {
+    previous: u64,
+    generation: u64,
+    represented_wal_end: u64,
+    sealed: ManifestSealed,
+    snapshot_len: u64,
+}
+
+fn stage_sealed_generation(
+    store: &PersistentHistoryStore,
+    dir: &Path,
+) -> Result<StagedSeal, DurableError> {
     let current = current_generation(dir)?;
     let generation =
         current
@@ -378,35 +440,61 @@ pub fn seal_history_generation(
         ))
     })?;
 
-    let manifest = HistoryManifest::for_generation(
+    let sealed = ManifestSealed::for_snapshot(snapshot.len() as u64, &snapshot);
+    Ok(StagedSeal {
+        previous: current,
         generation,
-        Some(super::manifest::ManifestSealed::for_snapshot(
-            snapshot.len() as u64,
-            &snapshot,
-        )),
-    );
-    let manifest_tmp = tmp_path(&dir.join(HISTORY_MANIFEST_FILE));
+        represented_wal_end,
+        sealed,
+        snapshot_len: snapshot.len() as u64,
+    })
+}
+
+/// Commits a staged seal to manifest authority: tmp write and sync, atomic
+/// rename, then the directory sync that makes the rename durable.
+///
+/// Failure classes are phase-correct: tmp write/sync or rename failure
+/// leaves manifest N in place (definite rejection), but a rename that
+/// succeeded with a failed directory sync leaves old-or-new authority behind
+/// — indeterminate, so the writer poisons and must reopen instead of
+/// continuing on an unknown generation. The directory sync runs through the
+/// injected hook so tests can deterministically take the rename-ok/sync-fail
+/// cut; production passes the real directory sync.
+fn commit_staged_manifest(
+    store: &mut PersistentHistoryStore,
+    dir: &Path,
+    staged: &StagedSeal,
+    sync_dir_once: impl FnOnce() -> std::io::Result<()>,
+) -> Result<(), DurableError> {
+    let manifest = HistoryManifest::for_generation(staged.generation, Some(staged.sealed));
+    let manifest_path = dir.join(HISTORY_MANIFEST_FILE);
+    let manifest_tmp = tmp_path(&manifest_path);
     write_file_synced(&manifest_tmp, &encode_history_manifest(&manifest)).map_err(|_| {
         DurableError::Rejected(HistoryError::Invalid("history manifest write failed"))
     })?;
-    publish_file(&manifest_tmp, &dir.join(HISTORY_MANIFEST_FILE), dir).map_err(|_| {
+    std::fs::rename(&manifest_tmp, &manifest_path).map_err(|_| {
         DurableError::Rejected(HistoryError::Invalid("history manifest publication failed"))
     })?;
+    sync_dir_once().map_err(|source| {
+        store.set_poisoned();
+        DurableError::Indeterminate {
+            operation: crate::operation::DurabilityOperation::DirectorySync,
+            source,
+        }
+    })
+}
 
-    let recycled_hot = match fs::remove_file(&hot_current) {
+/// Recycles the superseded hot log after the new manifest is durable.
+/// Best-effort by design: a leftover superseded log is ignored, never read.
+fn recycle_superseded_hot(dir: &Path, previous: u64) -> bool {
+    match fs::remove_file(dir.join(history_wal_filename(previous))) {
         Ok(()) => {
             let _ = sync_dir(dir);
             true
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(_) => false,
-    };
-    Ok(SealSummary {
-        generation,
-        represented_wal_end,
-        snapshot_len: snapshot.len() as u64,
-        recycled_hot,
-    })
+    }
 }
 
 fn current_generation(dir: &Path) -> Result<u64, DurableError> {
@@ -604,8 +692,8 @@ mod tests {
     #[test]
     fn superseded_hot_is_ignored_after_publication() {
         let temp = fixture_dir();
-        let store = durable_fixture(temp.path());
-        let summary = seal_history_generation(&store, temp.path()).unwrap();
+        let mut store = durable_fixture(temp.path());
+        let summary = seal_history_generation(&mut store, temp.path()).unwrap();
         assert_eq!(summary.generation, 1);
         assert!(summary.recycled_hot);
         // Resurrect the superseded hot file with plausible bytes: the new
@@ -626,8 +714,8 @@ mod tests {
     #[test]
     fn missing_new_hot_fails_closed() {
         let temp = fixture_dir();
-        let store = durable_fixture(temp.path());
-        seal_history_generation(&store, temp.path()).unwrap();
+        let mut store = durable_fixture(temp.path());
+        seal_history_generation(&mut store, temp.path()).unwrap();
         std::fs::remove_file(temp.path().join(history_wal_filename(1))).unwrap();
 
         let error = open_history_authority(temp.path()).unwrap_err();
@@ -637,8 +725,8 @@ mod tests {
     #[test]
     fn sealed_snapshot_missing_fails_closed() {
         let temp = fixture_dir();
-        let store = durable_fixture(temp.path());
-        seal_history_generation(&store, temp.path()).unwrap();
+        let mut store = durable_fixture(temp.path());
+        seal_history_generation(&mut store, temp.path()).unwrap();
         std::fs::remove_file(temp.path().join(history_snapshot_filename(1))).unwrap();
 
         let error = open_history_authority(temp.path()).unwrap_err();
@@ -648,8 +736,8 @@ mod tests {
     #[test]
     fn torn_manifest_fails_closed() {
         let temp = fixture_dir();
-        let store = durable_fixture(temp.path());
-        seal_history_generation(&store, temp.path()).unwrap();
+        let mut store = durable_fixture(temp.path());
+        seal_history_generation(&mut store, temp.path()).unwrap();
         let manifest_path = temp.path().join(HISTORY_MANIFEST_FILE);
         let bytes = std::fs::read(&manifest_path).unwrap();
 
@@ -678,8 +766,8 @@ mod tests {
     #[test]
     fn snapshot_length_mismatch_fails_closed() {
         let temp = fixture_dir();
-        let store = durable_fixture(temp.path());
-        seal_history_generation(&store, temp.path()).unwrap();
+        let mut store = durable_fixture(temp.path());
+        seal_history_generation(&mut store, temp.path()).unwrap();
         let snap_path = temp.path().join(history_snapshot_filename(1));
         let mut bytes = std::fs::read(&snap_path).unwrap();
         bytes.push(0x00);
@@ -692,8 +780,8 @@ mod tests {
     #[test]
     fn snapshot_byte_flip_fails_closed_on_digest() {
         let temp = fixture_dir();
-        let store = durable_fixture(temp.path());
-        seal_history_generation(&store, temp.path()).unwrap();
+        let mut store = durable_fixture(temp.path());
+        seal_history_generation(&mut store, temp.path()).unwrap();
         let snap_path = temp.path().join(history_snapshot_filename(1));
         let mut bytes = std::fs::read(&snap_path).unwrap();
         let middle = bytes.len() / 2;
@@ -733,7 +821,7 @@ mod tests {
     fn corrupt_complete_hot_frame_fails_closed() {
         let temp = fixture_dir();
         let mut store = durable_fixture(temp.path());
-        seal_history_generation(&store, temp.path()).unwrap();
+        seal_history_generation(&mut store, temp.path()).unwrap();
         let mut log = DurableHistoryLog::open(&temp.path().join(history_wal_filename(1))).unwrap();
         let history = HistoryId::new(0);
         durable_committed(
@@ -783,6 +871,10 @@ mod tests {
         assert_eq!(first.generation(), 1);
         assert_eq!(first.stats().snapshot_versions, 1);
         assert_eq!(first.stats().suffix_bytes, 0);
+        // The new handle was already owned when the manifest committed, and
+        // the superseded hot log is gone only after that authority.
+        assert!(!temp.path().join(history_wal_filename(0)).exists());
+        assert!(temp.path().join(history_wal_filename(1)).exists());
         // The store-wide lease survives the generation transition: the
         // second writer is still rejected after seal.
         assert!(matches!(
@@ -852,6 +944,115 @@ mod tests {
     }
 
     #[test]
+    fn seal_rejects_foreign_next_hot_and_keeps_old_authority() {
+        // Any next-hot acquisition failure lands before manifest publication:
+        // definite rejection, manifest still generation zero, and the old
+        // writer keeps operating on its still-current handle.
+        for sabotage in ["nonempty", "directory"] {
+            let temp = fixture_dir();
+            let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+            let history = authority.create_history(Some(b"thread-a")).unwrap();
+            let v0 = match authority.commit(history, None, b"aaa", None, None).unwrap() {
+                CommitOutcome::Committed(version) => version,
+                CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                    panic!("authority commit must create")
+                }
+            };
+            match sabotage {
+                "nonempty" => {
+                    std::fs::write(temp.path().join(history_wal_filename(1)), b"foreign bytes")
+                        .unwrap();
+                }
+                _ => {
+                    std::fs::create_dir(temp.path().join(history_wal_filename(1))).unwrap();
+                }
+            }
+            let error = authority.seal().unwrap_err();
+            assert!(
+                matches!(error, DurableError::Rejected(_)),
+                "{sabotage}: pre-manifest failure must reject, got {error}"
+            );
+            assert!(!temp.path().join(HISTORY_MANIFEST_FILE).exists());
+            assert_eq!(authority.generation(), 0);
+            let v1 = match authority
+                .commit(history, Some(v0.id()), b"bbb", None, None)
+                .unwrap()
+            {
+                CommitOutcome::Committed(version) => version,
+                CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                    panic!("old writer must stay operational")
+                }
+            };
+            drop(authority);
+            let reopened = open_history_authority(temp.path()).unwrap();
+            assert_eq!(reopened.generation, 0);
+            let got = reopened.store.lookup_version(v1.id()).unwrap();
+            let mut output = Vec::new();
+            reopened.store.read(got, 0, 6, &mut output).unwrap();
+            assert_eq!(output, b"aaabbb");
+        }
+    }
+
+    #[test]
+    fn manifest_dirsync_failure_poisons_and_reopen_resolves() {
+        // Rename-ok/dirsync-fail is old-or-new authority: indeterminate, the
+        // writer poisons and must not continue, and reopen resolves a valid
+        // authority on whichever side of the cut survived.
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority.commit(history, None, b"aaa", None, None).unwrap() {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("authority commit must create")
+            }
+        };
+        let error = authority
+            .seal_with_sync(|| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected dirsync fault",
+                ))
+            })
+            .unwrap_err();
+        assert!(
+            matches!(error, DurableError::Indeterminate { .. }),
+            "rename-ok/sync-fail must be indeterminate, got {error}"
+        );
+        assert!(authority.store().is_poisoned());
+        assert!(matches!(
+            authority.create_history(None),
+            Err(DurableError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            authority.commit(history, None, b"zzz", None, None),
+            Err(DurableError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            authority.seal(),
+            Err(DurableError::RecoveryRequired)
+        ));
+        drop(authority);
+        let reopened = open_history_authority(temp.path()).unwrap();
+        match reopened.generation {
+            0 => {
+                let got = reopened.store.lookup_version(v0.id()).unwrap();
+                let mut output = Vec::new();
+                reopened.store.read(got, 0, 3, &mut output).unwrap();
+                assert_eq!(output, b"aaa");
+            }
+            1 => {
+                assert_eq!(reopened.stats.snapshot_versions, 1);
+                let got = reopened.store.lookup_version(v0.id()).unwrap();
+                let mut output = Vec::new();
+                reopened.store.read(got, 0, 3, &mut output).unwrap();
+                assert_eq!(output, b"aaa");
+            }
+            generation => panic!("reopen must resolve old-or-new authority, got {generation}"),
+        }
+    }
+
+    #[test]
     fn second_writer_is_rejected_with_contention() {
         let temp = fixture_dir();
         let path = temp.path().join(history_wal_filename(0));
@@ -867,7 +1068,7 @@ mod tests {
     fn reopen_reports_bounded_restart_inputs() {
         let temp = fixture_dir();
         let mut store = durable_fixture(temp.path());
-        seal_history_generation(&store, temp.path()).unwrap();
+        seal_history_generation(&mut store, temp.path()).unwrap();
         let mut log = DurableHistoryLog::open(&temp.path().join(history_wal_filename(1))).unwrap();
         let history = HistoryId::new(0);
         durable_committed(
@@ -909,7 +1110,7 @@ mod tests {
         let _v2 = committed(&mut store, first, Some(v1), b"ccc");
         let _v3 = committed(&mut store, first, Some(v0), b"ddd");
         let _v4 = committed(&mut store, second, None, b"eee");
-        let summary = seal_history_generation(&store, dir).unwrap();
+        let summary = seal_history_generation(&mut store, dir).unwrap();
         assert_eq!(summary.generation, 1);
         store
     }
