@@ -92,6 +92,10 @@ pub enum DurableError {
         source: std::io::Error,
     },
     RecoveryRequired,
+    /// A second writable authority was requested while one is already open.
+    /// Distinct from rejection: nothing was examined or mutated, another
+    /// writer simply holds the store-wide lease.
+    AlreadyOpen,
 }
 
 impl fmt::Display for DurableError {
@@ -107,6 +111,7 @@ impl fmt::Display for DurableError {
             Self::RecoveryRequired => formatter.write_str(
                 "history writer requires reopen after an indeterminate durability outcome",
             ),
+            Self::AlreadyOpen => formatter.write_str("history store is already open for writing"),
         }
     }
 }
@@ -115,7 +120,7 @@ impl std::error::Error for DurableError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Indeterminate { source, .. } => Some(source),
-            Self::Rejected(_) | Self::RecoveryRequired => None,
+            Self::Rejected(_) | Self::RecoveryRequired | Self::AlreadyOpen => None,
         }
     }
 }
@@ -518,6 +523,11 @@ pub fn recover_history_store(bytes: &[u8]) -> Result<PersistentHistoryStore, His
 /// Replays decoded log bytes into a live store, ignoring a torn tail exactly
 /// like full recovery. Used when a snapshot already provides the prefix and
 /// only the hot suffix needs application.
+///
+/// After applying every record, the combined history bindings are validated
+/// unique in one linear pass: a repeated nonempty binding proves a forged or
+/// torn record, since live creates resolve existing bindings without
+/// appending. This covers an imported snapshot plus its hot suffix together.
 pub fn replay_history_suffix(
     store: &mut PersistentHistoryStore,
     bytes: &[u8],
@@ -526,6 +536,7 @@ pub fn replay_history_suffix(
     for record in &records {
         apply_recovered_record(store, record)?;
     }
+    store.validate_replayed_history_bindings()?;
     Ok(())
 }
 

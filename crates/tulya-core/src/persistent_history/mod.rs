@@ -257,6 +257,16 @@ struct PreparedCommit<'a> {
     digest: [u8; 32],
 }
 
+/// A begun durable history creation whose frame is already authoritative in
+/// the log but not yet applied in memory. The token is valid only for the
+/// store that began it; finishing twice, or finishing after the identity
+/// arrived by another path, poisons instead of aliasing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedHistoryCreate {
+    history: HistoryId,
+    binding: Option<Vec<u8>>,
+}
+
 /// Domain-neutral store of versioned opaque payload histories over one shared
 /// balanced arena. Histories isolate parenthood: a parent version must belong
 /// to the same history, so one object's lineage can never silently graft onto
@@ -298,9 +308,14 @@ impl PersistentHistoryStore {
     /// Creates an empty history and returns its core-assigned identity.
     ///
     /// Identities come from a monotonic counter, never from live-set size, so
-    /// a removed history's identity is never reassigned.
+    /// a removed history's identity is never reassigned. All fallible
+    /// reservations complete before the counter advances, so a definite
+    /// rejection leaves semantic state unchanged.
     pub fn create_history(&mut self) -> Result<HistoryId, HistoryError> {
         self.require_unpoisoned()?;
+        self.histories
+            .try_reserve(1)
+            .map_err(|_| HistoryError::Capacity("persistent history set allocation failed"))?;
         let id = HistoryId(self.next_history_id);
         self.next_history_id =
             self.next_history_id
@@ -308,9 +323,6 @@ impl PersistentHistoryStore {
                 .ok_or(HistoryError::Overflow(
                     "persistent history count exceeds u64",
                 ))?;
-        self.histories
-            .try_reserve(1)
-            .map_err(|_| HistoryError::Capacity("persistent history set allocation failed"))?;
         let _ = self.histories.insert(id);
         Ok(id)
     }
@@ -323,6 +335,10 @@ impl PersistentHistoryStore {
     /// after its create observes success retries with the same binding and
     /// resolves the existing logical history rather than orphaning a second
     /// one. Bindings are unique across histories by construction.
+    ///
+    /// Both the history set and the binding map are reserved before anything
+    /// is inserted, so a capacity rejection cannot leave a newly created
+    /// history without its binding.
     pub fn create_history_with_binding(
         &mut self,
         binding: &[u8],
@@ -336,10 +352,20 @@ impl PersistentHistoryStore {
         {
             return Ok(existing);
         }
-        let id = self.create_history()?;
+        self.histories
+            .try_reserve(1)
+            .map_err(|_| HistoryError::Capacity("persistent history set allocation failed"))?;
         self.history_bindings
             .try_reserve(1)
             .map_err(|_| HistoryError::Capacity("persistent history binding allocation failed"))?;
+        let id = HistoryId(self.next_history_id);
+        self.next_history_id =
+            self.next_history_id
+                .checked_add(1)
+                .ok_or(HistoryError::Overflow(
+                    "persistent history count exceeds u64",
+                ))?;
+        let _ = self.histories.insert(id);
         let _ = self.history_bindings.insert(id, binding.to_vec());
         Ok(id)
     }
@@ -534,13 +560,36 @@ impl PersistentHistoryStore {
         self.poisoned = true;
     }
 
+    /// Reports whether the writer is poisoned after an indeterminate
+    /// durability outcome. Poisoned writers reject every mutation until
+    /// reopen; the writable authority consults this so seal never publishes
+    /// a snapshot of indeterminate state.
+    pub const fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     /// Replays one logged history creation during recovery, restoring its
-    /// adapter binding exactly.
+    /// adapter binding exactly. The binding reservation precedes the history
+    /// allocation so a capacity rejection cannot leave a half-created
+    /// history; forged duplicate or malformed bindings fail closed.
+    ///
+    /// Bindings are the idempotent external identity: a valid log never
+    /// carries the same nonempty binding twice, because the live create
+    /// resolves an existing binding without appending. Duplicate detection
+    /// runs as one linear pass over the replayed store at the end of the
+    /// replay suffix pass, so lifetime recovery stays linear in history
+    /// count even with a binding on every history.
     pub fn replay_create(
         &mut self,
         history: HistoryId,
         binding: Option<&[u8]>,
     ) -> Result<(), HistoryError> {
+        if let Some(bytes) = binding {
+            validate_binding(bytes)?;
+            self.history_bindings.try_reserve(1).map_err(|_| {
+                HistoryError::Capacity("persistent history binding allocation failed")
+            })?;
+        }
         let assigned = self.create_history()?;
         if assigned != history {
             return Err(HistoryError::Invalid(
@@ -548,10 +597,6 @@ impl PersistentHistoryStore {
             ));
         }
         if let Some(bytes) = binding {
-            validate_binding(bytes)?;
-            self.history_bindings.try_reserve(1).map_err(|_| {
-                HistoryError::Capacity("persistent history binding allocation failed")
-            })?;
             let _ = self.history_bindings.insert(history, bytes.to_vec());
         }
         Ok(())
@@ -682,37 +727,42 @@ impl PersistentHistoryStore {
         Ok(())
     }
 
-    /// Durably creates a history: encode, write, barrier, then apply.
+    /// Rejects a replayed store whose nonempty history bindings are not
+    /// unique across histories. The replay suffix pass calls this once over
+    /// the final store — covering an imported snapshot plus its hot suffix
+    /// together — so a repeated binding fails closed in linear time.
+    ///
+    /// Empty bindings never validate at any boundary, so only nonempty
+    /// bindings participate here.
+    pub fn validate_replayed_history_bindings(&self) -> Result<(), HistoryError> {
+        let mut seen: HashSet<&[u8]> = HashSet::new();
+        seen.try_reserve(self.history_bindings.len()).map_err(|_| {
+            HistoryError::Capacity("persistent history binding validation allocation failed")
+        })?;
+        for bound in self.history_bindings.values() {
+            if bound.is_empty() {
+                continue;
+            }
+            if !seen.insert(bound.as_slice()) {
+                return Err(HistoryError::Invalid(
+                    "replayed history bindings are not unique",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Durably creates a history through the begin/finish seam below: every
+    /// fallible step (validation, reservation, identity assignment, encode,
+    /// write, barrier) completes before the in-memory apply, which cannot
+    /// fail — so a rejection provably precedes any new authority.
     pub fn create_history_durable(
         &mut self,
         log: &mut DurableHistoryLog,
     ) -> Result<HistoryId, DurableError> {
-        self.require_unpoisoned_durable()?;
-        let id = HistoryId(self.next_history_id);
-        self.next_history_id
-            .checked_add(1)
-            .ok_or(DurableError::Rejected(HistoryError::Overflow(
-                "persistent history count exceeds u64",
-            )))?;
-        let record = HistoryLogRecord::CreateHistory {
-            history: id,
-            binding: None,
-        };
-        let frame = durable_log::encode_history_log_frame(
-            &durable_log::encode_history_log_record(&record).map_err(DurableError::Rejected)?,
-        )
-        .map_err(DurableError::Rejected)?;
-        self.write_and_sync(log, &frame)?;
-        let assigned = self.create_history().map_err(DurableError::Rejected)?;
-        if assigned != id {
-            self.set_poisoned();
-            return Err(DurableError::Indeterminate {
-                operation: DurabilityOperation::FileSyncAll,
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "history identity diverged after durable write",
-                ),
-            });
+        let (id, prepared) = self.begin_durable_history_create(log, None)?;
+        if let Some(token) = prepared {
+            return self.finish_durable_history_create(&token);
         }
         Ok(id)
     }
@@ -725,44 +775,102 @@ impl PersistentHistoryStore {
         log: &mut DurableHistoryLog,
         binding: &[u8],
     ) -> Result<HistoryId, DurableError> {
+        let (id, prepared) = self.begin_durable_history_create(log, Some(binding))?;
+        if let Some(token) = prepared {
+            return self.finish_durable_history_create(&token);
+        }
+        Ok(id)
+    }
+
+    /// Prepared durable history creation: the identity is assigned, all
+    /// in-memory capacity is reserved, and the create frame is encoded,
+    /// written, and synced. The returned token still needs
+    /// [`finish_durable_history_create`] to become visible in memory — the
+    /// window between models exactly the crash between the durable barrier
+    /// and the in-memory apply, which recovery resolves by replaying the
+    /// now-authoritative record.
+    ///
+    /// A `None` token with an identity means idempotent resolution: the
+    /// binding already exists, nothing was written, and there is nothing to
+    /// apply.
+    pub fn begin_durable_history_create(
+        &mut self,
+        log: &mut DurableHistoryLog,
+        binding: Option<&[u8]>,
+    ) -> Result<(HistoryId, Option<PreparedHistoryCreate>), DurableError> {
         self.require_unpoisoned_durable()?;
-        validate_binding(binding).map_err(DurableError::Rejected)?;
-        if let Some(existing) = self
-            .history_bindings
-            .iter()
-            .find_map(|(id, bound)| (bound.as_slice() == binding).then_some(*id))
-        {
-            return Ok(existing);
+        if let Some(bytes) = binding {
+            validate_binding(bytes).map_err(DurableError::Rejected)?;
+            if let Some(existing) = self
+                .history_bindings
+                .iter()
+                .find_map(|(id, bound)| (bound.as_slice() == bytes).then_some(*id))
+            {
+                return Ok((existing, None));
+            }
+        }
+        // Reserve every fallible in-memory allocation before the barrier, and
+        // assign the identity up front so the token owns an unambiguous slot
+        // even if the apply is delayed past later operations.
+        self.histories.try_reserve(1).map_err(|_| {
+            DurableError::Rejected(HistoryError::Capacity(
+                "persistent history set allocation failed",
+            ))
+        })?;
+        if binding.is_some() {
+            self.history_bindings.try_reserve(1).map_err(|_| {
+                DurableError::Rejected(HistoryError::Capacity(
+                    "persistent history binding allocation failed",
+                ))
+            })?;
         }
         let id = HistoryId(self.next_history_id);
-        self.next_history_id
-            .checked_add(1)
-            .ok_or(DurableError::Rejected(HistoryError::Overflow(
-                "persistent history count exceeds u64",
-            )))?;
+        self.next_history_id =
+            self.next_history_id
+                .checked_add(1)
+                .ok_or(DurableError::Rejected(HistoryError::Overflow(
+                    "persistent history count exceeds u64",
+                )))?;
         let record = HistoryLogRecord::CreateHistory {
             history: id,
-            binding: Some(binding.to_vec()),
+            binding: binding.map(<[u8]>::to_vec),
         };
         let frame = durable_log::encode_history_log_frame(
             &durable_log::encode_history_log_record(&record).map_err(DurableError::Rejected)?,
         )
         .map_err(DurableError::Rejected)?;
         self.write_and_sync(log, &frame)?;
-        let assigned = self
-            .create_history_with_binding(binding)
-            .map_err(DurableError::Rejected)?;
-        if assigned != id {
-            self.set_poisoned();
-            return Err(DurableError::Indeterminate {
-                operation: DurabilityOperation::FileSyncAll,
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "history identity diverged after durable write",
-                ),
-            });
+        Ok((
+            id,
+            Some(PreparedHistoryCreate {
+                history: id,
+                binding: binding.map(<[u8]>::to_vec),
+            }),
+        ))
+    }
+
+    /// Applies a begun durable history creation. The apply touches only
+    /// pre-reserved capacity, so it cannot fail — except when the token is
+    /// stale or already applied while its record is authoritative in the log
+    /// (double finish, or a finish after the record replayed on reopen). That
+    /// divergence poisons the writer and demands reopen instead of aliasing
+    /// an identity: the log already holds the truth and recovery resolves it.
+    pub fn finish_durable_history_create(
+        &mut self,
+        prepared: &PreparedHistoryCreate,
+    ) -> Result<HistoryId, DurableError> {
+        if self.histories.contains(&prepared.history) {
+            return Err(self.poison_after_barrier(HistoryError::Invalid(
+                "prepared history identity is already applied",
+            )));
         }
-        Ok(id)
+        let _ = self.histories.insert(prepared.history);
+        if let Some(bytes) = &prepared.binding {
+            let _ = self
+                .history_bindings
+                .insert(prepared.history, bytes.clone());
+        }
+        Ok(prepared.history)
     }
 
     /// Durably commits through the request ledger: replay and retired outcomes
@@ -1030,6 +1138,23 @@ impl PersistentHistoryStore {
             .histories
             .try_reserve(snapshot.history_bindings.len())
             .map_err(|_| HistoryError::Capacity("history snapshot import allocation failed"))?;
+        {
+            let mut seen: HashSet<&[u8]> = HashSet::new();
+            seen.try_reserve(snapshot.history_bindings.len())
+                .map_err(|_| HistoryError::Capacity("history snapshot import allocation failed"))?;
+            for binding in snapshot.history_bindings.iter().flatten() {
+                if binding.is_empty() {
+                    return Err(HistoryError::Invalid(
+                        "history snapshot history binding is empty",
+                    ));
+                }
+                if !seen.insert(binding.as_slice()) {
+                    return Err(HistoryError::Invalid(
+                        "history snapshot history bindings are not unique",
+                    ));
+                }
+            }
+        }
         for (index, binding) in snapshot.history_bindings.iter().enumerate() {
             let id = HistoryId::new(u64::try_from(index).map_err(|_| {
                 HistoryError::Overflow("history snapshot history identity exceeds u64")
@@ -1050,6 +1175,26 @@ impl PersistentHistoryStore {
             let id = VersionId::new(u64::try_from(index).map_err(|_| {
                 HistoryError::Overflow("history snapshot version identity exceeds u64")
             })?);
+            // Import re-verifies the lineage rule the live API enforces: a
+            // parent must belong to the same history as its child, addressed
+            // defensively since this struct may not have come from decode.
+            if let Some(parent) = entry.parent {
+                let parent_index = usize::try_from(parent.id()).map_err(|_| {
+                    HistoryError::Overflow("history snapshot version identity exceeds usize")
+                })?;
+                let parent_entry =
+                    snapshot
+                        .versions
+                        .get(parent_index)
+                        .ok_or(HistoryError::Invalid(
+                            "history snapshot version parent is not topologically prior",
+                        ))?;
+                if parent_entry.history != entry.history {
+                    return Err(HistoryError::Invalid(
+                        "history snapshot version parent belongs to a different history",
+                    ));
+                }
+            }
             store.versions.push(Version {
                 history: entry.history,
                 id,
@@ -1855,5 +2000,143 @@ mod tests {
         );
         // The adapter rebuilds its maps from bindings alone: no legacy state.
         let _ = reopened_log;
+    }
+
+    #[test]
+    fn durable_create_crash_window_resolves_exactly_on_reopen() {
+        // The begin/finish seam models the crash between the durable barrier
+        // and the in-memory apply: the record is authoritative in the log
+        // while invisible in memory, and recovery plus idempotent retry
+        // resolve it to exactly one identity.
+        let temp = tempfile::tempdir().unwrap();
+        let path = test_log_path(temp.path());
+        let id = {
+            let mut store = PersistentHistoryStore::new();
+            let mut log = DurableHistoryLog::open(&path).unwrap();
+            let (id, prepared) = store
+                .begin_durable_history_create(&mut log, Some(b"thread-a"))
+                .unwrap();
+            assert!(prepared.is_some());
+            assert!(!store.histories.contains(&id));
+            id
+        };
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(!bytes.is_empty());
+        let mut recovered = recover_history_store(&bytes).unwrap();
+        assert!(recovered.histories.contains(&id));
+        assert_eq!(recovered.history_binding(id), Some(b"thread-a".as_slice()));
+        let mut log = DurableHistoryLog::open(&path).unwrap();
+        let (again, prepared) = recovered
+            .begin_durable_history_create(&mut log, Some(b"thread-a"))
+            .unwrap();
+        assert_eq!(again, id);
+        assert!(prepared.is_none());
+    }
+
+    #[test]
+    fn unbound_create_crash_window_replays_without_aliasing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = test_log_path(temp.path());
+        let id = {
+            let mut store = PersistentHistoryStore::new();
+            let mut log = DurableHistoryLog::open(&path).unwrap();
+            let (id, prepared) = store.begin_durable_history_create(&mut log, None).unwrap();
+            assert!(prepared.is_some());
+            id
+        };
+        let bytes = std::fs::read(&path).unwrap();
+        let recovered = recover_history_store(&bytes).unwrap();
+        assert!(recovered.histories.contains(&id));
+        assert_eq!(recovered.history_binding(id), None);
+    }
+
+    #[test]
+    fn double_finish_poisons_and_reopen_still_resolves() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = test_log_path(temp.path());
+        let mut store = PersistentHistoryStore::new();
+        let mut log = DurableHistoryLog::open(&path).unwrap();
+        let (id, prepared) = store.begin_durable_history_create(&mut log, None).unwrap();
+        let token = prepared.unwrap();
+        assert_eq!(store.finish_durable_history_create(&token).unwrap(), id);
+        // The record is already authoritative in the log, so a second apply
+        // would alias state: poison and demand reopen instead.
+        let error = store.finish_durable_history_create(&token).unwrap_err();
+        assert!(
+            matches!(error, DurableError::Indeterminate { .. }),
+            "double apply after the barrier must be indeterminate, got {error}"
+        );
+        assert!(store.is_poisoned());
+        assert!(matches!(
+            store.create_history_durable(&mut log),
+            Err(DurableError::RecoveryRequired)
+        ));
+        drop(store);
+        drop(log);
+        let bytes = std::fs::read(&path).unwrap();
+        let recovered = recover_history_store(&bytes).unwrap();
+        assert!(recovered.histories.contains(&id));
+    }
+
+    #[test]
+    fn replayed_duplicate_history_binding_fails_closed() {
+        // A valid log never repeats a nonempty binding: the live create
+        // resolves an existing binding without appending. Two create records
+        // sharing one binding therefore prove forgery, never a retry.
+        fn create_frame(history: u64, binding: &[u8]) -> Vec<u8> {
+            durable_log::encode_history_log_frame(
+                &durable_log::encode_history_log_record(&HistoryLogRecord::CreateHistory {
+                    history: HistoryId::new(history),
+                    binding: Some(binding.to_vec()),
+                })
+                .unwrap(),
+            )
+            .unwrap()
+        }
+        let mut forged = create_frame(0, b"dup");
+        forged.extend_from_slice(&create_frame(1, b"dup"));
+        assert!(matches!(
+            recover_history_store(&forged),
+            Err(HistoryError::Invalid(_))
+        ));
+        // Control: distinct bindings replay exactly.
+        let mut honest = create_frame(0, b"thread-a");
+        honest.extend_from_slice(&create_frame(1, b"thread-b"));
+        let recovered = recover_history_store(&honest).unwrap();
+        assert_eq!(
+            recovered.history_binding(HistoryId::new(1)),
+            Some(b"thread-b".as_slice())
+        );
+    }
+
+    #[test]
+    fn create_at_identity_exhaustion_rejects_without_mutation() {
+        // Definite rejection leaves semantic state unchanged: the counter is
+        // checked before anything is reserved, written, or inserted.
+        let mut store = PersistentHistoryStore::new();
+        store.next_history_id = u64::MAX;
+        assert!(matches!(
+            store.create_history(),
+            Err(HistoryError::Overflow(_))
+        ));
+        assert_eq!(store.next_history_id, u64::MAX);
+        assert!(store.histories.is_empty());
+        assert!(matches!(
+            store.create_history_with_binding(b"thread-a"),
+            Err(HistoryError::Overflow(_))
+        ));
+        assert!(store.histories.is_empty());
+        assert!(store.history_bindings.is_empty());
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = test_log_path(temp.path());
+        let mut log = DurableHistoryLog::open(&path).unwrap();
+        assert!(matches!(
+            store.begin_durable_history_create(&mut log, None),
+            Err(DurableError::Rejected(_))
+        ));
+        assert_eq!(store.next_history_id, u64::MAX);
+        assert!(!store.is_poisoned());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
     }
 }

@@ -21,14 +21,15 @@
 //! hot log is recycled, and only after the new manifest is durable.
 
 use super::{
-    durable_log::{decode_history_log, replay_history_suffix, DurableError},
+    durable_log::{decode_history_log, replay_history_suffix, DurableError, DurableHistoryLog},
     manifest::{
         decode_history_manifest, encode_history_manifest, history_snapshot_filename,
-        history_wal_filename, HistoryManifest, HISTORY_MANIFEST_FILE,
+        history_wal_filename, HistoryManifest, HISTORY_LOCK_FILE, HISTORY_MANIFEST_FILE,
     },
     snapshot::{decode_history_snapshot, encode_history_snapshot},
-    HistoryError, PersistentHistoryStore,
+    CommitOutcome, HistoryError, HistoryId, PersistentHistoryStore, VersionId,
 };
+use fs4::FileExt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -52,6 +53,153 @@ pub struct SealSummary {
     pub represented_wal_end: u64,
     pub snapshot_len: u64,
     pub recycled_hot: bool,
+}
+
+/// Single-writer authority over one history directory: a store-wide writer
+/// lease, the owned writable hot-log handle, and generation tracking that
+/// survives seal transitions.
+///
+/// Opening a writable authority acquires one store-wide non-blocking writer
+/// lease (`history.lock`) held for the authority lifetime, loads the read
+/// authority, and opens the current-generation hot log for writing. Every
+/// mutation (create, commit, retire) goes through the owned handle — never
+/// through ad-hoc unlocked opens — so at most one writable authority exists
+/// per directory at any moment, including across seal transitions: the lease
+/// is retained while the generation advances and the hot handle switches.
+/// A second writable open fails with [`DurableError::AlreadyOpen`]; dropping
+/// the authority releases the lease and admits the next writer. Read-only
+/// loading via [`open_history_authority`] stays lock-free.
+pub struct WritableHistoryAuthority {
+    store: PersistentHistoryStore,
+    generation: u64,
+    stats: OpenedHistoryStats,
+    dir: PathBuf,
+    // The store-wide writer lease: never read, held purely for its flock
+    // lifetime. Dropping the authority releases the lease and admits the
+    // next writer.
+    _lease: File,
+    hot: DurableHistoryLog,
+}
+
+impl WritableHistoryAuthority {
+    /// Opens the writable authority for a directory: store-wide lease, read
+    /// authority, and current-generation writable hot log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError::AlreadyOpen`] when another writable authority
+    /// holds the store-wide lease (or the current hot log), and definite
+    /// rejection for any corrupt or unreadable authority. Nothing is mutated
+    /// on any error path.
+    pub fn open(dir: &Path) -> Result<Self, DurableError> {
+        let lease = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(HISTORY_LOCK_FILE))
+            .map_err(|_| {
+                DurableError::Rejected(HistoryError::Invalid("history writer lease open failed"))
+            })?;
+        lease.try_lock_exclusive().map_err(|error| {
+            if DurableHistoryLog::is_lock_contention(&error) {
+                DurableError::AlreadyOpen
+            } else {
+                DurableError::Rejected(HistoryError::Invalid(
+                    "history writer lease acquisition failed",
+                ))
+            }
+        })?;
+        let opened = open_history_authority(dir)?;
+        let hot = DurableHistoryLog::open_write(&dir.join(history_wal_filename(opened.generation)))
+            .map_err(map_hot_open_error)?;
+        Ok(Self {
+            store: opened.store,
+            generation: opened.generation,
+            stats: opened.stats,
+            dir: dir.to_path_buf(),
+            _lease: lease,
+            hot,
+        })
+    }
+
+    /// Borrows the live store. Only shared access escapes: every mutation
+    /// flows through the authority-owned writable log.
+    pub fn store(&self) -> &PersistentHistoryStore {
+        &self.store
+    }
+
+    /// Reports the generation the writable hot log belongs to.
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Reports the bounded-reopen evidence captured at open (or the last
+    /// seal): snapshot versions plus replayed hot suffix bytes.
+    pub const fn stats(&self) -> OpenedHistoryStats {
+        self.stats
+    }
+
+    /// Durably creates a history through the owned writable log, bound to
+    /// opaque adapter bytes when supplied. First use stays idempotent by
+    /// binding exactly like the underlying core primitive.
+    pub fn create_history(&mut self, binding: Option<&[u8]>) -> Result<HistoryId, DurableError> {
+        match binding {
+            None => self.store.create_history_durable(&mut self.hot),
+            Some(bytes) => self
+                .store
+                .create_history_durable_with_binding(&mut self.hot, bytes),
+        }
+    }
+
+    /// Durably commits through the owned writable log.
+    pub fn commit(
+        &mut self,
+        history: HistoryId,
+        parent: Option<VersionId>,
+        payload: &[u8],
+        request_id: Option<&[u8]>,
+        binding: Option<&[u8]>,
+    ) -> Result<CommitOutcome, DurableError> {
+        self.store
+            .commit_durable(&mut self.hot, history, parent, payload, request_id, binding)
+    }
+
+    /// Durably retires a request identity through the owned writable log.
+    pub fn retire(&mut self, request_id: &[u8]) -> Result<(), DurableError> {
+        self.store.retire_durable(&mut self.hot, request_id)
+    }
+
+    /// Seals the current generation while retaining the store-wide lease:
+    /// snapshot, next hot log, and manifest publish exactly like the free
+    /// function, then the owned handle switches to the next generation with
+    /// no writer race — no other authority can exist while this lease is
+    /// held. A poisoned store refuses to seal: publishing a snapshot of
+    /// indeterminate state would launder it into authority.
+    pub fn seal(&mut self) -> Result<SealSummary, DurableError> {
+        if self.store.is_poisoned() {
+            return Err(DurableError::RecoveryRequired);
+        }
+        let summary = seal_history_generation(&self.store, &self.dir)?;
+        let hot =
+            DurableHistoryLog::open_write(&self.dir.join(history_wal_filename(summary.generation)))
+                .map_err(map_hot_open_error)?;
+        self.hot = hot;
+        self.generation = summary.generation;
+        self.stats = OpenedHistoryStats {
+            snapshot_versions: self.store.version_count(),
+            suffix_bytes: 0,
+        };
+        Ok(summary)
+    }
+}
+
+fn map_hot_open_error(error: std::io::Error) -> DurableError {
+    if DurableHistoryLog::is_lock_contention(&error) {
+        DurableError::AlreadyOpen
+    } else {
+        DurableError::Rejected(HistoryError::Invalid("history hot log open failed"))
+    }
 }
 
 /// Opens the authoritative history for a directory: manifest generation,
@@ -303,6 +451,7 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 mod tests {
     use super::super::durable_log::DurableHistoryLog;
     use super::super::manifest::ManifestSealed;
+    use super::super::snapshot::{decode_history_snapshot, encode_history_snapshot_struct};
     use super::super::{CommitOutcome, HistoryId, VersionId};
     use super::*;
 
@@ -605,6 +754,101 @@ mod tests {
 
         let error = open_history_authority(temp.path()).unwrap_err();
         assert!(matches!(error, DurableError::Rejected(_)));
+    }
+
+    #[test]
+    fn writable_authority_owns_single_writer_across_seal() {
+        let temp = fixture_dir();
+        let mut first = WritableHistoryAuthority::open(temp.path()).unwrap();
+        assert_eq!(first.generation(), 0);
+        // A second writable open is rejected while the first authority lives.
+        assert!(matches!(
+            WritableHistoryAuthority::open(temp.path()),
+            Err(DurableError::AlreadyOpen)
+        ));
+        // Lock-free read-only loading still works beside the writer.
+        let read_only = open_history_authority(temp.path()).unwrap();
+        assert_eq!(read_only.generation, 0);
+
+        let history = first.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match first.commit(history, None, b"aaa", None, None).unwrap() {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("authority commit must create")
+            }
+        };
+        let summary = first.seal().unwrap();
+        assert_eq!(summary.generation, 1);
+        assert!(summary.recycled_hot);
+        assert_eq!(first.generation(), 1);
+        assert_eq!(first.stats().snapshot_versions, 1);
+        assert_eq!(first.stats().suffix_bytes, 0);
+        // The store-wide lease survives the generation transition: the
+        // second writer is still rejected after seal.
+        assert!(matches!(
+            WritableHistoryAuthority::open(temp.path()),
+            Err(DurableError::AlreadyOpen)
+        ));
+        // Post-seal writes land in the new generation through the owned
+        // handle, with no unlocked open anywhere in the path.
+        let v1 = match first
+            .commit(history, Some(v0.id()), b"bbb", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("post-seal commit must create")
+            }
+        };
+        drop(first);
+        // After release, the next writer opens exactly where the first left
+        // off: sealed snapshot plus the bounded post-seal suffix.
+        let second = WritableHistoryAuthority::open(temp.path()).unwrap();
+        assert_eq!(second.generation(), 1);
+        assert_eq!(second.stats().snapshot_versions, 1);
+        assert!(second.stats().suffix_bytes > 0);
+        let got = second.store().lookup_version(v1.id()).unwrap();
+        assert_eq!(got, v1);
+        let mut output = Vec::new();
+        second.store().read(got, 0, 6, &mut output).unwrap();
+        assert_eq!(output, b"aaabbb");
+    }
+
+    #[test]
+    fn cross_history_snapshot_lineage_fails_authority_open() {
+        // History 0 owns V0, history 1 owns V1 as a root; graft V1 under V0
+        // and publish with recomputed length and digest. Integrity agrees, so
+        // only the lineage cross-check can reject at open.
+        let temp = fixture_dir();
+        let mut store = PersistentHistoryStore::new();
+        let first = store.create_history().unwrap();
+        let second = store.create_history().unwrap();
+        committed(&mut store, first, None, b"aaa");
+        committed(&mut store, second, None, b"bbb");
+        let snapshot =
+            decode_history_snapshot(&encode_history_snapshot(&store, 1, 0).unwrap()).unwrap();
+        let mut forged = snapshot;
+        forged.versions[1].parent = Some(VersionId::new(0));
+        let forged_bytes = encode_history_snapshot_struct(&forged).unwrap();
+        let snap_path = temp.path().join(history_snapshot_filename(1));
+        write_file_synced(&snap_path, &forged_bytes).unwrap();
+        let manifest = HistoryManifest::for_generation(
+            1,
+            Some(ManifestSealed::for_snapshot(
+                forged_bytes.len() as u64,
+                &forged_bytes,
+            )),
+        );
+        write_file_synced(
+            &temp.path().join(HISTORY_MANIFEST_FILE),
+            &encode_history_manifest(&manifest),
+        )
+        .unwrap();
+        std::fs::write(temp.path().join(history_wal_filename(1)), b"").unwrap();
+        assert!(matches!(
+            open_history_authority(temp.path()),
+            Err(DurableError::Rejected(_))
+        ));
     }
 
     #[test]

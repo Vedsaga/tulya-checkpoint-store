@@ -37,8 +37,8 @@ use crate::error_classification::{
     DurabilityOperation,
 };
 use crate::hot_wal_commit::{FileHotWalCommitIo, HotWalCommitter};
-use tulya_core::persistent_history::authority::OpenedHistoryStats;
-use tulya_core::persistent_history::{HistoryId, PersistentHistoryStore, VersionId};
+use tulya_core::persistent_history::authority::WritableHistoryAuthority;
+use tulya_core::persistent_history::{HistoryId, VersionId};
 
 mod storage_format;
 use storage_format::*;
@@ -817,12 +817,13 @@ pub struct CheckpointStore {
     hot: HotWal,
     lazy_base: Option<RefCell<LazyCheckpointStore>>,
     range_sizes: RefCell<Vec<Option<u64>>>,
-    /// Staged release-candidate history core. The legacy `state` remains
-    /// authoritative until the candidate path carries durability (P1.3+).
-    /// Staged P1.2: durability wiring makes these fields live; remove the
-    /// allowances then.
+    /// Staged release-candidate history authority: store-wide writer lease,
+    /// owned writable hot log, and generation tracking owned by the generic
+    /// core. The legacy `state` remains authoritative until the candidate
+    /// path carries durability. Staged: remove the allowances when the
+    /// legacy write path migrates onto the candidate authority.
     #[allow(dead_code)]
-    history: PersistentHistoryStore,
+    history_authority: WritableHistoryAuthority,
     /// Adapter mapping: checkpoint thread to generic history identity.
     /// Derived from durable bindings on every open, never persisted
     /// separately, so a crash cannot desynchronize it from the log.
@@ -832,14 +833,6 @@ pub struct CheckpointStore {
     /// Derived from durable bindings on every open, like `history_ids`.
     #[allow(dead_code)]
     history_versions: HashMap<(String, String), VersionId>,
-    /// Manifest generation the candidate history authority opened at.
-    /// Candidate appends write this generation's hot log; sealing advances it.
-    #[allow(dead_code)]
-    history_generation: u64,
-    /// Bounded-reopen evidence from the candidate authority open: snapshot
-    /// versions plus hot suffix bytes that were replayed.
-    #[allow(dead_code)]
-    history_open_stats: OpenedHistoryStats,
 }
 
 mod store;

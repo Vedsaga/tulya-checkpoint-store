@@ -1,7 +1,7 @@
 use super::*;
 use tulya_core::persistent_history::{
-    authority::{open_history_authority, seal_history_generation, OpenedHistoryStats, SealSummary},
-    durable_log::{DurableError, DurableHistoryLog},
+    authority::{OpenedHistoryStats, SealSummary, WritableHistoryAuthority},
+    durable_log::DurableError,
     manifest::{history_wal_filename, HISTORY_MANIFEST_FILE},
     CommitOutcome, HistoryError, PersistentHistoryStore, Version,
 };
@@ -101,19 +101,19 @@ impl CheckpointStore {
             apply_prepared_transaction(&mut state, prepared);
         }
         let hot = HotWal::open_at(&hot_path, normalized_tail, config)?;
-        // Candidate history authority opens through the generic manifest
-        // authority: sealed snapshot plus bounded hot suffix. Adapter maps
-        // are derived from durable bindings on every open, never persisted
-        // separately, so they cannot desynchronize from the log. A corrupt
-        // candidate authority fails the whole open closed: delete the
-        // history-manifest/history-* files to return to legacy-only use.
+        // Candidate history authority opens through the generic writable
+        // authority: store-wide writer lease, sealed snapshot plus bounded
+        // hot suffix, and every mutation through the owned hot handle.
+        // Adapter maps are derived from durable bindings on every open,
+        // never persisted separately, so they cannot desynchronize from the
+        // log. A corrupt candidate authority fails the whole open closed:
+        // delete the history-manifest/history-* files to return to
+        // legacy-only use.
         Self::adopt_legacy_history_wal(&dir)?;
-        let opened = open_history_authority(&dir)
+        let history_authority = WritableHistoryAuthority::open(&dir)
             .map_err(|error| Self::durable_history_error(&dir, error))?;
-        let history_generation = opened.generation;
-        let history_open_stats = opened.stats;
-        let history = opened.store;
-        let (history_ids, history_versions) = Self::rebuild_history_maps(&history)?;
+        let (history_ids, history_versions) =
+            Self::rebuild_history_maps(history_authority.store())?;
         let store = Self {
             dir,
             config,
@@ -124,11 +124,9 @@ impl CheckpointStore {
             hot,
             lazy_base,
             range_sizes: RefCell::new(Vec::new()),
-            history,
+            history_authority,
             history_ids,
             history_versions,
-            history_generation,
-            history_open_stats,
         };
         if store.lazy_base.is_none() {
             let roots = store
@@ -601,14 +599,15 @@ impl CheckpointStore {
         self.append_encoded_transaction(&transaction)
     }
 
-    /// Candidate release-path append through the generic history core.
+    /// Candidate release-path append through the generic writable authority.
     ///
     /// Durability authority belongs to the generic history core alone: this
-    /// writes only the current-generation candidate hot log, never a legacy
-    /// transaction. Checkpoint thread maps to generic history, checkpoint id
-    /// maps to generic version, and the message payload commits as opaque
-    /// bytes with no whole-parent XXH3 reconstruction. The legacy state
-    /// remains authoritative for legacy operations.
+    /// writes only through the authority-owned hot log, never a legacy
+    /// transaction and never an ad-hoc unlocked log open. Checkpoint thread
+    /// maps to generic history, checkpoint id maps to generic version, and
+    /// the message payload commits as opaque bytes with no whole-parent XXH3
+    /// reconstruction. The legacy state remains authoritative for legacy
+    /// operations.
     ///
     /// Both mappings are recorded as durable opaque bindings, so a crash
     /// between the log append and the in-memory map insert cannot
@@ -645,10 +644,9 @@ impl CheckpointStore {
         let history = match self.history_ids.get(thread_id) {
             Some(id) => *id,
             None => {
-                let mut history_log = DurableHistoryLog::open(&self.candidate_hot_path())?;
                 let id = self
-                    .history
-                    .create_history_durable_with_binding(&mut history_log, thread_id.as_bytes())
+                    .history_authority
+                    .create_history(Some(thread_id.as_bytes()))
                     .map_err(|error| Self::durable_history_error(&self.dir, error))?;
                 self.history_ids.insert(thread_id.to_owned(), id);
                 id
@@ -663,17 +661,9 @@ impl CheckpointStore {
             })
             .transpose()?;
         let binding = encode_candidate_version_binding(thread_id, checkpoint_id);
-        let mut history_log = DurableHistoryLog::open(&self.candidate_hot_path())?;
         let version = self
-            .history
-            .commit_durable(
-                &mut history_log,
-                history,
-                parent,
-                payload,
-                None,
-                Some(&binding),
-            )
+            .history_authority
+            .commit(history, parent, payload, None, Some(&binding))
             .map_err(|error| Self::durable_history_error(&self.dir, error))?;
         let version = match version {
             CommitOutcome::Committed(version) => version,
@@ -712,10 +702,12 @@ impl CheckpointStore {
             .copied()
             .ok_or(CheckpointStoreError::CheckpointNotFound)?;
         let version = self
-            .history
+            .history_authority
+            .store()
             .committed_version_for_adapter(id, history)
             .map_err(Self::history_error)?;
-        self.history
+        self.history_authority
+            .store()
             .read(version, offset, length, output)
             .map_err(Self::history_error)
     }
@@ -727,24 +719,23 @@ impl CheckpointStore {
     /// write path migrates onto the candidate authority.
     #[allow(dead_code)]
     pub(crate) fn history_store(&self) -> &PersistentHistoryStore {
-        &self.history
+        self.history_authority.store()
     }
 
-    /// Reports the bounded-reopen evidence captured when the candidate
-    /// authority opened: snapshot versions plus replayed hot suffix bytes.
+    /// Reports the bounded-reopen evidence from the candidate authority:
+    /// snapshot versions plus replayed hot suffix bytes at open, reset by
+    /// each seal.
     ///
     /// Staged P1.4 candidate path: remove the allowance when the legacy
     /// write path migrates onto the candidate authority.
     #[allow(dead_code)]
     pub(crate) fn candidate_history_open_stats(&self) -> OpenedHistoryStats {
-        self.history_open_stats
+        self.history_authority.stats()
     }
 
-    /// Seals the candidate history authority: persists a snapshot covering
-    /// the live candidate state, publishes the next manifest generation, and
-    /// recycles the superseded hot log. The store then reopens the authority
-    /// so generation tracking, the write path, and the adapter maps follow
-    /// the new generation exactly.
+    /// Seals the candidate history authority through the owned writable
+    /// authority: the store-wide lease is retained across the generation
+    /// transition, then the adapter maps rebuild from the sealed store.
     ///
     /// # Errors
     ///
@@ -756,22 +747,15 @@ impl CheckpointStore {
     #[allow(dead_code)]
     pub(crate) fn seal_candidate_history(&mut self) -> Result<SealSummary, CheckpointStoreError> {
         self.ensure_mutation_allowed()?;
-        let summary = seal_history_generation(&self.history, &self.dir)
+        let summary = self
+            .history_authority
+            .seal()
             .map_err(|error| Self::durable_history_error(&self.dir, error))?;
-        let opened = open_history_authority(&self.dir)
-            .map_err(|error| Self::durable_history_error(&self.dir, error))?;
-        self.history_generation = opened.generation;
-        self.history_open_stats = opened.stats;
-        self.history = opened.store;
-        let (history_ids, history_versions) = Self::rebuild_history_maps(&self.history)?;
+        let (history_ids, history_versions) =
+            Self::rebuild_history_maps(self.history_authority.store())?;
         self.history_ids = history_ids;
         self.history_versions = history_versions;
         Ok(summary)
-    }
-
-    /// Resolves the current-generation candidate hot log path.
-    fn candidate_hot_path(&self) -> PathBuf {
-        self.dir.join(history_wal_filename(self.history_generation))
     }
 
     /// Adopts the P1.3 genesis `history.wal` into the generation authority
@@ -863,6 +847,7 @@ impl CheckpointStore {
                 durability_indeterminate_error(operation, path, source)
             }
             DurableError::RecoveryRequired => recovery_required_error(path, None),
+            DurableError::AlreadyOpen => CheckpointStoreError::WriterAlreadyOpen,
         }
     }
 

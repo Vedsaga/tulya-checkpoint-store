@@ -146,29 +146,133 @@ pub fn encode_history_snapshot(
     }
     retired.sort_by(|left, right| left.0.cmp(right.0));
 
-    let mut body = Vec::new();
+    let mut history_bindings = Vec::new();
+    history_bindings
+        .try_reserve_exact(store.histories.len())
+        .map_err(|_| HistoryError::Capacity("history snapshot table allocation failed"))?;
     for index in 0..store.next_history_id {
         let binding = store.history_bindings.get(&HistoryId::new(index));
-        put_optional_bytes(&mut body, binding.map(Vec::as_slice))?;
+        history_bindings.push(binding.cloned());
     }
+    let mut versions = Vec::new();
+    versions
+        .try_reserve_exact(store.versions.len())
+        .map_err(|_| HistoryError::Capacity("history snapshot table allocation failed"))?;
     for record in &store.versions {
-        put_u64(&mut body, record.history().id())?;
-        put_u64(&mut body, record.parent().map_or(NO_PARENT, VersionId::id))?;
-        put_optional_bytes(
-            &mut body,
-            store.version_bindings.get(&record.id()).map(Vec::as_slice),
-        )?;
+        versions.push(SnapshotVersion {
+            history: record.history(),
+            parent: record.parent(),
+            binding: store.version_bindings.get(&record.id()).cloned(),
+        });
     }
-    for (id, digest, version) in &active {
-        put_bytes(&mut body, id)?;
-        body.extend_from_slice(digest);
-        put_u64(&mut body, version.id())?;
+    let snapshot = HistorySnapshot {
+        generation,
+        represented_wal_end,
+        next_history_id: store.next_history_id,
+        next_version_id: store.next_version_id,
+        history_bindings,
+        versions,
+        active: active
+            .iter()
+            .map(|(id, digest, version)| SnapshotActive {
+                request_id: (*id).clone(),
+                digest: *digest,
+                version: *version,
+            })
+            .collect(),
+        retired: retired
+            .iter()
+            .map(|(id, digest)| SnapshotRetired {
+                request_id: (*id).clone(),
+                digest: **digest,
+            })
+            .collect(),
+        image,
+    };
+    encode_history_snapshot_struct(&snapshot)
+}
+
+/// Encodes an already-built snapshot struct to artifact bytes.
+///
+/// Structural only: density, coordinate agreement, ledger order, lengths,
+/// and the trailing digest are enforced exactly like the store path, but
+/// semantic lineage rules (same-history parents, binding uniqueness) are
+/// deliberately NOT re-checked here — they are decode/import's job. That
+/// split is what lets tests and conformance tooling construct otherwise
+/// well-formed corruption vectors with recomputed integrity.
+pub fn encode_history_snapshot_struct(snapshot: &HistorySnapshot) -> Result<Vec<u8>, HistoryError> {
+    if snapshot.next_history_id as usize != snapshot.history_bindings.len() {
+        return Err(HistoryError::Invalid(
+            "history snapshot next history identity disagrees with its table",
+        ));
     }
-    for (id, digest) in &retired {
-        put_bytes(&mut body, id)?;
-        body.extend_from_slice(digest.as_slice());
+    if snapshot.next_version_id as usize != snapshot.versions.len() {
+        return Err(HistoryError::Invalid(
+            "history snapshot next version identity disagrees with its table",
+        ));
     }
-    body.extend_from_slice(&image);
+    let mut body = Vec::new();
+    for binding in &snapshot.history_bindings {
+        put_optional_bytes(&mut body, binding.as_deref())?;
+    }
+    for record in &snapshot.versions {
+        if record.history.id() as usize >= snapshot.history_bindings.len() {
+            return Err(HistoryError::Invalid(
+                "history snapshot version references a missing history",
+            ));
+        }
+        put_u64(&mut body, record.history.id())?;
+        put_u64(&mut body, record.parent.map_or(NO_PARENT, VersionId::id))?;
+        put_optional_bytes(&mut body, record.binding.as_deref())?;
+    }
+    let mut previous_active: Option<&[u8]> = None;
+    for record in &snapshot.active {
+        if record.request_id.is_empty() || record.request_id.len() > MAX_HISTORY_REQUEST_ID_BYTES {
+            return Err(HistoryError::Invalid(
+                "history snapshot request identity is outside bounds",
+            ));
+        }
+        if let Some(previous) = previous_active {
+            if previous >= record.request_id.as_slice() {
+                return Err(HistoryError::Invalid(
+                    "history snapshot active requests are not strictly ordered",
+                ));
+            }
+        }
+        previous_active = Some(&record.request_id);
+        if record.version.id() as usize >= snapshot.versions.len() {
+            return Err(HistoryError::Invalid(
+                "history snapshot active request references a missing version",
+            ));
+        }
+        put_bytes(&mut body, &record.request_id)?;
+        body.extend_from_slice(&record.digest);
+        put_u64(&mut body, record.version.id())?;
+    }
+    let mut previous_retired: Option<&[u8]> = None;
+    for record in &snapshot.retired {
+        if record.request_id.is_empty() || record.request_id.len() > MAX_HISTORY_REQUEST_ID_BYTES {
+            return Err(HistoryError::Invalid(
+                "history snapshot request identity is outside bounds",
+            ));
+        }
+        if let Some(previous) = previous_retired {
+            if previous >= record.request_id.as_slice() {
+                return Err(HistoryError::Invalid(
+                    "history snapshot retired requests are not strictly ordered",
+                ));
+            }
+        }
+        previous_retired = Some(&record.request_id);
+        put_bytes(&mut body, &record.request_id)?;
+        body.extend_from_slice(&record.digest);
+    }
+    if snapshot.versions.is_empty() && !snapshot.image.is_empty() {
+        return Err(HistoryError::Invalid(
+            "history snapshot image without versions is malformed",
+        ));
+    }
+    body.extend_from_slice(&snapshot.image);
 
     let mut output = Vec::new();
     output
@@ -188,27 +292,35 @@ pub fn encode_history_snapshot(
             .map_err(|_| HistoryError::Overflow("history snapshot length exceeds u64"))?,
     )?;
     put_u32(&mut output, HISTORY_SNAPSHOT_SCHEMA);
-    put_u64(&mut output, generation)?;
-    put_u64(&mut output, represented_wal_end)?;
-    put_u64(&mut output, store.next_history_id)?;
-    put_u64(&mut output, store.next_version_id)?;
+    put_u64(&mut output, snapshot.generation)?;
+    put_u64(&mut output, snapshot.represented_wal_end)?;
     put_u64(
         &mut output,
-        u64::try_from(active.len())
+        u64::try_from(snapshot.history_bindings.len())
+            .map_err(|_| HistoryError::Overflow("history snapshot history count exceeds u64"))?,
+    )?;
+    put_u64(
+        &mut output,
+        u64::try_from(snapshot.versions.len())
+            .map_err(|_| HistoryError::Overflow("history snapshot version count exceeds u64"))?,
+    )?;
+    put_u64(
+        &mut output,
+        u64::try_from(snapshot.active.len())
             .map_err(|_| HistoryError::Overflow("history snapshot active count exceeds u64"))?,
     )?;
     put_u64(
         &mut output,
-        u64::try_from(retired.len())
+        u64::try_from(snapshot.retired.len())
             .map_err(|_| HistoryError::Overflow("history snapshot retired count exceeds u64"))?,
     )?;
     put_u64(
         &mut output,
-        u64::try_from(image.len())
+        u64::try_from(snapshot.image.len())
             .map_err(|_| HistoryError::Overflow("history snapshot image length exceeds u64"))?,
     )?;
-    put_u64(&mut output, store.next_history_id)?;
-    put_u64(&mut output, store.next_version_id)?;
+    put_u64(&mut output, snapshot.next_history_id)?;
+    put_u64(&mut output, snapshot.next_version_id)?;
     output.extend_from_slice(&body);
     output.extend_from_slice(&snapshot_digest(&output));
     if output.len() != HISTORY_SNAPSHOT_HEADER_SIZE + body.len() + 32 {
@@ -283,7 +395,23 @@ pub fn decode_history_snapshot(bytes: &[u8]) -> Result<HistorySnapshot, HistoryE
     for _ in 0..history_count {
         history_bindings.push(cursor.take_optional_bytes()?);
     }
-    let mut versions = Vec::new();
+    // Bindings are the idempotent external identity: the live create resolves
+    // an existing binding without writing, so a valid snapshot never repeats
+    // a nonempty binding. (Empty bindings cannot appear: the codec rejects
+    // zero-length bindings above.)
+    {
+        let mut seen: HashSet<&[u8]> = HashSet::new();
+        seen.try_reserve(history_bindings.len())
+            .map_err(|_| HistoryError::Capacity("history snapshot table allocation failed"))?;
+        for binding in history_bindings.iter().flatten() {
+            if !seen.insert(binding.as_slice()) {
+                return Err(HistoryError::Invalid(
+                    "history snapshot history bindings are not unique",
+                ));
+            }
+        }
+    }
+    let mut versions: Vec<SnapshotVersion> = Vec::new();
     versions
         .try_reserve_exact(version_count)
         .map_err(|_| HistoryError::Capacity("history snapshot table allocation failed"))?;
@@ -301,6 +429,13 @@ pub fn decode_history_snapshot(bytes: &[u8]) -> Result<HistorySnapshot, HistoryE
             if raw_parent as usize >= index {
                 return Err(HistoryError::Invalid(
                     "history snapshot version parent is not topologically prior",
+                ));
+            }
+            // Parenthood is history-local on the live path: a recomputed
+            // digest cannot launder a lineage the API could never create.
+            if versions[raw_parent as usize].history != HistoryId::new(history) {
+                return Err(HistoryError::Invalid(
+                    "history snapshot version parent belongs to a different history",
                 ));
             }
             Some(VersionId::new(raw_parent))
@@ -705,5 +840,47 @@ mod tests {
         assert_eq!(imported.next_history_id, 0);
         assert_eq!(imported.next_version_id, 0);
         assert!(imported.versions.is_empty());
+    }
+
+    #[test]
+    fn cross_history_parent_fails_closed_with_valid_integrity() {
+        // History 0 owns V0, history 1 owns V1 as a root. Grafting V1 under
+        // V0 by struct mutation keeps every structural rule and the digest
+        // valid, so only the lineage rule can reject — the exact lineage the
+        // live API could never create.
+        let mut store = PersistentHistoryStore::new();
+        let first = store.create_history().unwrap();
+        let second = store.create_history().unwrap();
+        store.commit(first, None, b"aaa", None, None).unwrap();
+        store.commit(second, None, b"bbb", None, None).unwrap();
+        let bytes = encode_history_snapshot(&store, 1, 64).unwrap();
+        let honest = decode_history_snapshot(&bytes).unwrap();
+        assert_eq!(honest.versions.len(), 2);
+        let mut forged = honest;
+        forged.versions[1].parent = Some(VersionId::new(0));
+        let forged_bytes = encode_history_snapshot_struct(&forged).unwrap();
+        assert!(matches!(
+            decode_history_snapshot(&forged_bytes),
+            Err(HistoryError::Invalid(_))
+        ));
+        // Import rejects the struct even without the wire round trip.
+        assert!(PersistentHistoryStore::import_snapshot(forged).is_err());
+    }
+
+    #[test]
+    fn duplicate_history_binding_fails_closed_with_valid_integrity() {
+        let mut store = PersistentHistoryStore::new();
+        store.create_history_with_binding(b"thread-a").unwrap();
+        store.create_history_with_binding(b"thread-b").unwrap();
+        let bytes = encode_history_snapshot(&store, 1, 0).unwrap();
+        let honest = decode_history_snapshot(&bytes).unwrap();
+        let mut forged = honest;
+        forged.history_bindings[1] = forged.history_bindings[0].clone();
+        let forged_bytes = encode_history_snapshot_struct(&forged).unwrap();
+        assert!(matches!(
+            decode_history_snapshot(&forged_bytes),
+            Err(HistoryError::Invalid(_))
+        ));
+        assert!(PersistentHistoryStore::import_snapshot(forged).is_err());
     }
 }
