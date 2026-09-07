@@ -1,11 +1,11 @@
 use super::*;
-use crate::persistent_history::{
+use tulya_core::persistent_history::{
     authority::{open_history_authority, seal_history_generation, OpenedHistoryStats, SealSummary},
     durable_log::{DurableError, DurableHistoryLog},
     manifest::{history_wal_filename, HISTORY_MANIFEST_FILE},
     CommitOutcome, HistoryError, PersistentHistoryStore, Version,
 };
-use crate::persistent_sequence::{
+use tulya_core::persistent_sequence::{
     LogicalLength, PersistentRoot, PersistentSequence, SequenceRange, SequenceRepresentation,
 };
 

@@ -49,36 +49,36 @@ const HISTORY_SNAPSHOT_DIGEST_DOMAIN: &[u8] = b"tulya-history/v1/snapshot\0";
 const NO_PARENT: u64 = u64::MAX;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SnapshotVersion {
-    pub(crate) history: HistoryId,
-    pub(crate) parent: Option<VersionId>,
-    pub(crate) binding: Option<Vec<u8>>,
+pub struct SnapshotVersion {
+    pub history: HistoryId,
+    pub parent: Option<VersionId>,
+    pub binding: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SnapshotActive {
-    pub(crate) request_id: Vec<u8>,
-    pub(crate) digest: [u8; 32],
-    pub(crate) version: VersionId,
+pub struct SnapshotActive {
+    pub request_id: Vec<u8>,
+    pub digest: [u8; 32],
+    pub version: VersionId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SnapshotRetired {
-    pub(crate) request_id: Vec<u8>,
-    pub(crate) digest: [u8; 32],
+pub struct SnapshotRetired {
+    pub request_id: Vec<u8>,
+    pub digest: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HistorySnapshot {
-    pub(crate) generation: u64,
-    pub(crate) represented_wal_end: u64,
-    pub(crate) next_history_id: u64,
-    pub(crate) next_version_id: u64,
-    pub(crate) history_bindings: Vec<Option<Vec<u8>>>,
-    pub(crate) versions: Vec<SnapshotVersion>,
-    pub(crate) active: Vec<SnapshotActive>,
-    pub(crate) retired: Vec<SnapshotRetired>,
-    pub(crate) image: Vec<u8>,
+pub struct HistorySnapshot {
+    pub generation: u64,
+    pub represented_wal_end: u64,
+    pub next_history_id: u64,
+    pub next_version_id: u64,
+    pub history_bindings: Vec<Option<Vec<u8>>>,
+    pub versions: Vec<SnapshotVersion>,
+    pub active: Vec<SnapshotActive>,
+    pub retired: Vec<SnapshotRetired>,
+    pub image: Vec<u8>,
 }
 
 /// Encodes the complete reconstructible state at one generation.
@@ -89,7 +89,7 @@ pub(crate) struct HistorySnapshot {
 /// self-validating. Allocation counters must currently equal their table
 /// cardinalities; any divergence fails closed rather than silently adopting
 /// a sparse identity space this schema version does not define.
-pub(crate) fn encode_history_snapshot(
+pub fn encode_history_snapshot(
     store: &PersistentHistoryStore,
     generation: u64,
     represented_wal_end: u64,
@@ -237,7 +237,7 @@ fn snapshot_digest(prefix: &[u8]) -> [u8; 32] {
 /// duplicates or active/retired overlap, bounded identifier lengths, and
 /// exact byte consumption. Semantic payload verification happens at import,
 /// where backend reads recompute every active digest.
-pub(crate) fn decode_history_snapshot(bytes: &[u8]) -> Result<HistorySnapshot, HistoryError> {
+pub fn decode_history_snapshot(bytes: &[u8]) -> Result<HistorySnapshot, HistoryError> {
     let mut cursor = SnapshotCursor { bytes, pos: 0 };
     if cursor.take(4)? != HISTORY_SNAPSHOT_MAGIC {
         return Err(HistoryError::Invalid("history snapshot magic mismatch"));

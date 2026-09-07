@@ -2098,8 +2098,8 @@ fn candidate_durable_history_survives_reopen_without_legacy_write(
     assert!(!temp.path().join("history-manifest.json").exists());
     let reopened = CheckpointStore::open(temp.path(), config)?;
     let history = reopened.history_store();
-    let first = history.lookup_version(crate::persistent_history::VersionId::new(0))?;
-    let second = history.lookup_version(crate::persistent_history::VersionId::new(1))?;
+    let first = history.lookup_version(tulya_core::persistent_history::VersionId::new(0))?;
+    let second = history.lookup_version(tulya_core::persistent_history::VersionId::new(1))?;
     assert_eq!(second.parent(), Some(first.id()));
     let mut output = Vec::new();
     history.read(first, 0, 5, &mut output)?;
@@ -2189,10 +2189,10 @@ fn candidate_seal_recycles_and_bounds_reopen() -> Result<(), Box<dyn std::error:
     assert_eq!(stats.suffix_bytes, hot_len);
     let history = reopened.history_store();
     assert_eq!(history.version_count(), 3);
-    let third = history.lookup_version(crate::persistent_history::VersionId::new(2))?;
+    let third = history.lookup_version(tulya_core::persistent_history::VersionId::new(2))?;
     assert_eq!(
         third.parent(),
-        Some(crate::persistent_history::VersionId::new(1))
+        Some(tulya_core::persistent_history::VersionId::new(1))
     );
     let mut output = Vec::new();
     reopened.read_candidate_message("thread-a", "cp-3", 0, 14, &mut output)?;
@@ -2205,8 +2205,8 @@ fn candidate_legacy_genesis_wal_is_adopted_once() -> Result<(), Box<dyn std::err
     // A P1.3-era genesis `history.wal` (valid frames, bound adapter
     // material) is adopted into generation zero on open and never read
     // again afterwards.
-    use crate::persistent_history::durable_log::DurableHistoryLog;
-    use crate::persistent_history::{CommitOutcome, PersistentHistoryStore};
+    use tulya_core::persistent_history::durable_log::DurableHistoryLog;
+    use tulya_core::persistent_history::{CommitOutcome, PersistentHistoryStore};
 
     let temp = tempfile::tempdir()?;
     let config = CheckpointStoreConfig {

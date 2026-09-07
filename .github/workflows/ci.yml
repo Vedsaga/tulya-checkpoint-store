@@ -24,9 +24,9 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --features local-server --locked -- -D warnings
-      - run: cargo test --all-targets --features local-server --locked -- --test-threads=1
-      - run: cargo test --locked --features fault-injection -- --test-threads=1
+      - run: cargo clippy --workspace --all-targets --features local-server --locked -- -D warnings
+      - run: cargo test --workspace --all-targets --features local-server --locked -- --test-threads=1
+      - run: cargo test --workspace --locked --features fault-injection -- --test-threads=1
       - run: cargo run --release --locked --example branch_forest_tulya -- --db /tmp/tulya-branch-forest-ci --corpus tests/fixtures/branch-forest/tiny.jsonl
       - run: cargo run --release --locked --example branch_forest_sqlite -- --db /tmp/sqlite-branch-forest-ci --corpus tests/fixtures/branch-forest/tiny.jsonl
       - run: python3 benchmarks/branch_forest/crash_demo.py --corpus tests/fixtures/branch-forest/tiny.jsonl --output-dir /tmp/tulya-branch-forest-crash-ci

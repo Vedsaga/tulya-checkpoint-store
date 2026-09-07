@@ -37,7 +37,7 @@ use super::{
     HistoryError, HistoryId, PersistentHistoryStore, VersionId, MAX_HISTORY_BINDING_BYTES,
     MAX_HISTORY_REQUEST_ID_BYTES,
 };
-use crate::error_classification::DurabilityOperation;
+use crate::operation::DurabilityOperation;
 use fs4::FileExt;
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -57,7 +57,7 @@ const RECORD_RETIRE: u8 = 3;
 const NO_PARENT: u64 = u64::MAX;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum HistoryLogRecord {
+pub enum HistoryLogRecord {
     CreateHistory {
         history: HistoryId,
         binding: Option<Vec<u8>>,
@@ -85,7 +85,7 @@ pub(crate) enum HistoryLogRecord {
 /// with the same request identity. `RecoveryRequired` means an earlier
 /// indeterminate outcome already poisoned this handle.
 #[derive(Debug)]
-pub(crate) enum DurableError {
+pub enum DurableError {
     Rejected(HistoryError),
     Indeterminate {
         operation: DurabilityOperation,
@@ -120,9 +120,7 @@ impl std::error::Error for DurableError {
     }
 }
 
-pub(crate) fn encode_history_log_record(
-    record: &HistoryLogRecord,
-) -> Result<Vec<u8>, HistoryError> {
+pub fn encode_history_log_record(record: &HistoryLogRecord) -> Result<Vec<u8>, HistoryError> {
     let mut output = Vec::new();
     output
         .try_reserve_exact(encoded_record_len(record)?)
@@ -247,7 +245,7 @@ fn put_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
     output.extend_from_slice(bytes);
 }
 
-pub(crate) fn decode_history_log_record(bytes: &[u8]) -> Result<HistoryLogRecord, HistoryError> {
+pub fn decode_history_log_record(bytes: &[u8]) -> Result<HistoryLogRecord, HistoryError> {
     let mut cursor = LogCursor { bytes, pos: 0 };
     let kind = cursor.take_byte()?;
     let record = match kind {
@@ -376,7 +374,7 @@ impl<'a> LogCursor<'a> {
     }
 }
 
-pub(crate) fn encode_history_log_frame(body: &[u8]) -> Result<Vec<u8>, HistoryError> {
+pub fn encode_history_log_frame(body: &[u8]) -> Result<Vec<u8>, HistoryError> {
     let frame_len = body
         .len()
         .checked_add(HISTORY_LOG_HEADER_SIZE + HISTORY_LOG_FOOTER_SIZE)
@@ -484,9 +482,7 @@ fn probe_history_log_frame(bytes: &[u8]) -> Result<FrameProbe<'_>, HistoryError>
 /// Returns the decoded records plus the exact consumed byte count, so an
 /// appender can truncate to the logical tail before writing: a torn tail must
 /// never strand garbage ahead of newer frames.
-pub(crate) fn decode_history_log(
-    bytes: &[u8],
-) -> Result<(Vec<HistoryLogRecord>, u64), HistoryError> {
+pub fn decode_history_log(bytes: &[u8]) -> Result<(Vec<HistoryLogRecord>, u64), HistoryError> {
     let mut records: Vec<HistoryLogRecord> = Vec::new();
     let mut offset = 0usize;
     while offset < bytes.len() {
@@ -513,7 +509,7 @@ pub(crate) fn decode_history_log(
 /// Every record re-validates through the store's own insertion paths with
 /// exact-identity assertions, so a reordered, truncated, or forged log fails
 /// closed instead of reconstructing a divergent store.
-pub(crate) fn recover_history_store(bytes: &[u8]) -> Result<PersistentHistoryStore, HistoryError> {
+pub fn recover_history_store(bytes: &[u8]) -> Result<PersistentHistoryStore, HistoryError> {
     let mut store = PersistentHistoryStore::new();
     replay_history_suffix(&mut store, bytes)?;
     Ok(store)
@@ -522,7 +518,7 @@ pub(crate) fn recover_history_store(bytes: &[u8]) -> Result<PersistentHistorySto
 /// Replays decoded log bytes into a live store, ignoring a torn tail exactly
 /// like full recovery. Used when a snapshot already provides the prefix and
 /// only the hot suffix needs application.
-pub(crate) fn replay_history_suffix(
+pub fn replay_history_suffix(
     store: &mut PersistentHistoryStore,
     bytes: &[u8],
 ) -> Result<(), HistoryError> {
@@ -575,7 +571,7 @@ fn apply_recovered_record(
 /// Append-only file handle for one history log, tracking the replayed logical
 /// tail so appends truncate any torn tail before writing.
 #[derive(Debug)]
-pub(crate) struct DurableHistoryLog {
+pub struct DurableHistoryLog {
     file: File,
     path: PathBuf,
     tail: u64,
@@ -584,7 +580,7 @@ pub(crate) struct DurableHistoryLog {
 impl DurableHistoryLog {
     /// Opens (creating if absent) the log file and recovers the logical tail
     /// by scanning for the last complete frame.
-    pub(crate) fn open(path: &Path) -> std::io::Result<Self> {
+    pub fn open(path: &Path) -> std::io::Result<Self> {
         // Never truncate on open: existing frames are the authority being
         // recovered. Appends truncate explicitly to the replayed tail first.
         let mut file = OpenOptions::new()
@@ -606,7 +602,7 @@ impl DurableHistoryLog {
         })
     }
 
-    pub(crate) fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         &self.path
     }
 
@@ -620,7 +616,7 @@ impl DurableHistoryLog {
     /// hold the old generation while opening the next one without
     /// self-deadlock; cross-generation safety comes from manifest-driven
     /// recovery, which never reads a superseded hot file.
-    pub(crate) fn open_write(path: &Path) -> std::io::Result<Self> {
+    pub fn open_write(path: &Path) -> std::io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -641,7 +637,7 @@ impl DurableHistoryLog {
 
     /// Returns true when the underlying lock failure signals contention
     /// rather than a genuine I/O error.
-    pub(crate) fn is_lock_contention(error: &std::io::Error) -> bool {
+    pub fn is_lock_contention(error: &std::io::Error) -> bool {
         error.kind() == std::io::ErrorKind::WouldBlock
             || error.raw_os_error() == fs4::lock_contended_error().raw_os_error()
     }
@@ -649,7 +645,7 @@ impl DurableHistoryLog {
     /// Appends one complete frame at the logical tail, discarding any torn
     /// tail beyond it first. Callers sync separately to distinguish write
     /// failures (definite reject) from barrier failures (indeterminate).
-    pub(crate) fn append_frame(&mut self, frame: &[u8]) -> std::io::Result<()> {
+    pub fn append_frame(&mut self, frame: &[u8]) -> std::io::Result<()> {
         self.file.seek(SeekFrom::Start(self.tail))?;
         self.file.set_len(self.tail)?;
         self.file.write_all(frame)?;
@@ -665,11 +661,11 @@ impl DurableHistoryLog {
 
     /// Full file durability barrier. File length changes with every append,
     /// so this is `sync_all`, not `sync_data`.
-    pub(crate) fn sync(&mut self) -> std::io::Result<()> {
+    pub fn sync(&mut self) -> std::io::Result<()> {
         self.file.sync_all()
     }
 
-    pub(crate) fn read_all(&mut self) -> std::io::Result<Vec<u8>> {
+    pub fn read_all(&mut self) -> std::io::Result<Vec<u8>> {
         self.file.seek(SeekFrom::Start(0))?;
         let mut bytes = Vec::new();
         self.file.read_to_end(&mut bytes)?;

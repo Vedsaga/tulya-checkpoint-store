@@ -34,24 +34,24 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OpenedHistoryStats {
-    pub(crate) snapshot_versions: usize,
-    pub(crate) suffix_bytes: u64,
+pub struct OpenedHistoryStats {
+    pub snapshot_versions: usize,
+    pub suffix_bytes: u64,
 }
 
 #[derive(Debug)]
-pub(crate) struct OpenedHistory {
-    pub(crate) store: PersistentHistoryStore,
-    pub(crate) generation: u64,
-    pub(crate) stats: OpenedHistoryStats,
+pub struct OpenedHistory {
+    pub store: PersistentHistoryStore,
+    pub generation: u64,
+    pub stats: OpenedHistoryStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SealSummary {
-    pub(crate) generation: u64,
-    pub(crate) represented_wal_end: u64,
-    pub(crate) snapshot_len: u64,
-    pub(crate) recycled_hot: bool,
+pub struct SealSummary {
+    pub generation: u64,
+    pub represented_wal_end: u64,
+    pub snapshot_len: u64,
+    pub recycled_hot: bool,
 }
 
 /// Opens the authoritative history for a directory: manifest generation,
@@ -60,7 +60,7 @@ pub(crate) struct SealSummary {
 /// A missing manifest means no authority was ever published: generation zero
 /// replays the genesis hot log when present, exactly like a fresh store
 /// otherwise. Every other absence or disagreement fails closed.
-pub(crate) fn open_history_authority(dir: &Path) -> Result<OpenedHistory, DurableError> {
+pub fn open_history_authority(dir: &Path) -> Result<OpenedHistory, DurableError> {
     let manifest_path = dir.join(HISTORY_MANIFEST_FILE);
     let manifest_bytes = match fs::read(&manifest_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -151,7 +151,7 @@ pub(crate) fn open_history_authority(dir: &Path) -> Result<OpenedHistory, Durabl
 /// tracking and write handle to the returned generation. All filesystem
 /// failures before manifest publication leave the old authority complete and
 /// report definite rejection.
-pub(crate) fn seal_history_generation(
+pub fn seal_history_generation(
     store: &PersistentHistoryStore,
     dir: &Path,
 ) -> Result<SealSummary, DurableError> {

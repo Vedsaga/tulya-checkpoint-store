@@ -24,7 +24,7 @@
 //! slices; this slice covers versioned payload history with exact reads and
 //! structural verification only.
 
-use crate::error_classification::DurabilityOperation;
+use crate::operation::DurabilityOperation;
 use crate::persistent_sequence::{
     BalancedSequence, LogicalLength, PersistentRoot, PersistentSequence, PersistentSequenceAppend,
     SequenceError, SequenceRange, SequenceWorkCounters,
@@ -33,10 +33,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-pub(crate) mod authority;
-pub(crate) mod durable_log;
-pub(crate) mod manifest;
-pub(crate) mod snapshot;
+pub mod authority;
+pub mod durable_log;
+pub mod manifest;
+pub mod snapshot;
 use durable_log::{DurableError, DurableHistoryLog, HistoryLogRecord};
 
 /// Domain separator for the generic history operation digest.
@@ -51,14 +51,14 @@ const MAX_HISTORY_BINDING_BYTES: usize = 4096;
 
 /// Opaque core-assigned history/object identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct HistoryId(u64);
+pub struct HistoryId(u64);
 
 impl HistoryId {
-    pub(crate) const fn id(self) -> u64 {
+    pub const fn id(self) -> u64 {
         self.0
     }
 
-    pub(crate) const fn new(id: u64) -> Self {
+    pub const fn new(id: u64) -> Self {
         Self(id)
     }
 }
@@ -73,14 +73,14 @@ impl HistoryId {
 /// relocated or fabricated identity fails closed instead of addressing the
 /// wrong record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct VersionId(u64);
+pub struct VersionId(u64);
 
 impl VersionId {
-    pub(crate) const fn id(self) -> u64 {
+    pub const fn id(self) -> u64 {
         self.0
     }
 
-    pub(crate) const fn new(id: u64) -> Self {
+    pub const fn new(id: u64) -> Self {
         Self(id)
     }
 }
@@ -88,7 +88,7 @@ impl VersionId {
 /// One committed generic version: its history, identity, optional parent,
 /// and persistent root. Payloads stay opaque bytes below the adapter layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Version {
+pub struct Version {
     history: HistoryId,
     id: VersionId,
     parent: Option<VersionId>,
@@ -96,25 +96,25 @@ pub(crate) struct Version {
 }
 
 impl Version {
-    pub(crate) const fn history(self) -> HistoryId {
+    pub const fn history(self) -> HistoryId {
         self.history
     }
 
-    pub(crate) const fn id(self) -> VersionId {
+    pub const fn id(self) -> VersionId {
         self.id
     }
 
-    pub(crate) const fn parent(self) -> Option<VersionId> {
+    pub const fn parent(self) -> Option<VersionId> {
         self.parent
     }
 
-    pub(crate) const fn root(self) -> PersistentRoot {
+    pub const fn root(self) -> PersistentRoot {
         self.root
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HistoryError {
+pub enum HistoryError {
     Sequence(SequenceError),
     Invalid(&'static str),
     Overflow(&'static str),
@@ -155,7 +155,7 @@ impl From<SequenceError> for HistoryError {
 /// input) and the request identity (which binds to the digest at the ledger).
 /// A request bound to one digest therefore replays only the identical
 /// operation and conflicts with any different history/parent/payload/binding.
-pub(crate) fn history_operation_digest(
+pub fn history_operation_digest(
     history: HistoryId,
     parent: Option<VersionId>,
     payload: &[u8],
@@ -199,38 +199,38 @@ pub(crate) fn history_operation_digest(
 /// One active request-ledger entry: the bound operation digest plus the
 /// committed version that replay must return without a second mutation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ActiveRequest {
+pub struct ActiveRequest {
     digest: [u8; 32],
     version: VersionId,
 }
 
 impl ActiveRequest {
-    pub(crate) const fn digest(self) -> [u8; 32] {
+    pub const fn digest(self) -> [u8; 32] {
         self.digest
     }
 
-    pub(crate) const fn version(self) -> VersionId {
+    pub const fn version(self) -> VersionId {
         self.version
     }
 }
 
 /// Outcome of a logical commit through the request ledger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CommitOutcome {
+pub enum CommitOutcome {
     Committed(Version),
     Replayed(Version),
     Retired,
 }
 
 impl CommitOutcome {
-    pub(crate) const fn version(self) -> Option<Version> {
+    pub const fn version(self) -> Option<Version> {
         match self {
             Self::Committed(version) | Self::Replayed(version) => Some(version),
             Self::Retired => None,
         }
     }
 
-    pub(crate) const fn replayed(self) -> bool {
+    pub const fn replayed(self) -> bool {
         match self {
             Self::Committed(_) => false,
             Self::Replayed(_) | Self::Retired => true,
@@ -266,7 +266,7 @@ struct PreparedCommit<'a> {
 /// increments, independent of live-set cardinality: removing or reclaiming a
 /// history or version later must never cause a numeric identity to be reused.
 #[derive(Debug, Default)]
-pub(crate) struct PersistentHistoryStore {
+pub struct PersistentHistoryStore {
     backend: BalancedSequence,
     histories: HashSet<HistoryId>,
     versions: Vec<Version>,
@@ -280,7 +280,7 @@ pub(crate) struct PersistentHistoryStore {
 }
 
 impl PersistentHistoryStore {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             backend: BalancedSequence::new(),
             histories: HashSet::new(),
@@ -299,7 +299,7 @@ impl PersistentHistoryStore {
     ///
     /// Identities come from a monotonic counter, never from live-set size, so
     /// a removed history's identity is never reassigned.
-    pub(crate) fn create_history(&mut self) -> Result<HistoryId, HistoryError> {
+    pub fn create_history(&mut self) -> Result<HistoryId, HistoryError> {
         self.require_unpoisoned()?;
         let id = HistoryId(self.next_history_id);
         self.next_history_id =
@@ -323,7 +323,7 @@ impl PersistentHistoryStore {
     /// after its create observes success retries with the same binding and
     /// resolves the existing logical history rather than orphaning a second
     /// one. Bindings are unique across histories by construction.
-    pub(crate) fn create_history_with_binding(
+    pub fn create_history_with_binding(
         &mut self,
         binding: &[u8],
     ) -> Result<HistoryId, HistoryError> {
@@ -357,7 +357,7 @@ impl PersistentHistoryStore {
     /// `binding` carries opaque adapter material recorded alongside the
     /// version and covered by the operation digest, so adapters rebuild their
     /// maps from the core itself after reopen.
-    pub(crate) fn commit(
+    pub fn commit(
         &mut self,
         history: HistoryId,
         parent: Option<VersionId>,
@@ -493,7 +493,7 @@ impl PersistentHistoryStore {
     /// Retirement is prepare-then-commit: every fallible reservation completes
     /// before the active entry is removed, so failure leaves both ledgers
     /// unchanged. Unknown or already-retired identities fail closed.
-    pub(crate) fn retire_request(&mut self, request_id: &[u8]) -> Result<(), HistoryError> {
+    pub fn retire_request(&mut self, request_id: &[u8]) -> Result<(), HistoryError> {
         self.require_unpoisoned()?;
         validate_request_identity(request_id)?;
         if self.retired_requests.contains_key(request_id) {
@@ -530,13 +530,13 @@ impl PersistentHistoryStore {
         Ok(())
     }
 
-    pub(crate) fn set_poisoned(&mut self) {
+    pub fn set_poisoned(&mut self) {
         self.poisoned = true;
     }
 
     /// Replays one logged history creation during recovery, restoring its
     /// adapter binding exactly.
-    pub(crate) fn replay_create(
+    pub fn replay_create(
         &mut self,
         history: HistoryId,
         binding: Option<&[u8]>,
@@ -560,7 +560,7 @@ impl PersistentHistoryStore {
     /// Replays one logged commit during recovery with exact-identity and
     /// digest assertions. Backend reconstruction revalidates parents and
     /// arena coordinates exactly as the live path does.
-    pub(crate) fn replay_commit(
+    pub fn replay_commit(
         &mut self,
         history: HistoryId,
         version: VersionId,
@@ -648,7 +648,7 @@ impl PersistentHistoryStore {
     }
 
     /// Replays one logged retirement during recovery.
-    pub(crate) fn replay_retire(
+    pub fn replay_retire(
         &mut self,
         request_id: &[u8],
         digest: [u8; 32],
@@ -683,7 +683,7 @@ impl PersistentHistoryStore {
     }
 
     /// Durably creates a history: encode, write, barrier, then apply.
-    pub(crate) fn create_history_durable(
+    pub fn create_history_durable(
         &mut self,
         log: &mut DurableHistoryLog,
     ) -> Result<HistoryId, DurableError> {
@@ -720,7 +720,7 @@ impl PersistentHistoryStore {
     /// Durably creates a history bound to opaque adapter bytes, idempotently:
     /// a retry with the same binding resolves the existing history instead of
     /// allocating a duplicate lineage, before or after any crash.
-    pub(crate) fn create_history_durable_with_binding(
+    pub fn create_history_durable_with_binding(
         &mut self,
         log: &mut DurableHistoryLog,
         binding: &[u8],
@@ -768,7 +768,7 @@ impl PersistentHistoryStore {
     /// Durably commits through the request ledger: replay and retired outcomes
     /// return without touching the log; fresh operations follow
     /// write-then-barrier-then-apply with poison on any post-barrier failure.
-    pub(crate) fn commit_durable(
+    pub fn commit_durable(
         &mut self,
         log: &mut DurableHistoryLog,
         history: HistoryId,
@@ -806,7 +806,7 @@ impl PersistentHistoryStore {
 
     /// Durably retires a request identity with the same write-then-apply
     /// discipline as commits.
-    pub(crate) fn retire_durable(
+    pub fn retire_durable(
         &mut self,
         log: &mut DurableHistoryLog,
         request_id: &[u8],
@@ -880,7 +880,7 @@ impl PersistentHistoryStore {
     }
 
     /// Reads an exact byte range of a committed version.
-    pub(crate) fn read(
+    pub fn read(
         &self,
         version: Version,
         offset: u64,
@@ -897,33 +897,33 @@ impl PersistentHistoryStore {
     }
 
     /// Recomputes every reachable node's metadata and commitment.
-    pub(crate) fn verify(&self, version: Version) -> Result<(), HistoryError> {
+    pub fn verify(&self, version: Version) -> Result<(), HistoryError> {
         let record = self.committed_version(version)?;
         self.backend.verify(record.root())?;
         Ok(())
     }
 
     /// Returns a snapshot of the backend diagnostic work counters.
-    pub(crate) fn work_counters(&self) -> SequenceWorkCounters {
+    pub fn work_counters(&self) -> SequenceWorkCounters {
         self.backend.work_counters()
     }
 
     /// Looks up a committed version by logical identity for adapter reads.
     /// Coordinate-checked like every other lookup: a fabricated identity
     /// fails closed.
-    pub(crate) fn lookup_version(&self, id: VersionId) -> Result<Version, HistoryError> {
+    pub fn lookup_version(&self, id: VersionId) -> Result<Version, HistoryError> {
         self.version_record(id)
     }
 
     /// Counts committed versions. Used for reopen statistics and tests.
-    pub(crate) fn version_count(&self) -> usize {
+    pub fn version_count(&self) -> usize {
         self.versions.len()
     }
 
     /// Lists committed history identities in stable numeric order for
     /// adapter map reconstruction. The order is deterministic so reopened
     /// adapters rebuild identical maps on every open.
-    pub(crate) fn all_histories(&self) -> Vec<HistoryId> {
+    pub fn all_histories(&self) -> Vec<HistoryId> {
         let mut histories: Vec<HistoryId> = self.histories.iter().copied().collect();
         histories.sort_by_key(|id| id.id());
         histories
@@ -931,25 +931,25 @@ impl PersistentHistoryStore {
 
     /// Borrows the opaque adapter binding recorded for a history, if any.
     /// Histories created without a binding stay invisible to adapters.
-    pub(crate) fn history_binding(&self, id: HistoryId) -> Option<&[u8]> {
+    pub fn history_binding(&self, id: HistoryId) -> Option<&[u8]> {
         self.history_bindings.get(&id).map(Vec::as_slice)
     }
 
     /// Lists committed versions in identity order for adapter map
     /// reconstruction. The dense table is already identity-ordered.
-    pub(crate) fn all_versions(&self) -> Vec<Version> {
+    pub fn all_versions(&self) -> Vec<Version> {
         self.versions.clone()
     }
 
     /// Borrows the opaque adapter binding recorded for a version, if any.
-    pub(crate) fn version_binding(&self, id: VersionId) -> Option<&[u8]> {
+    pub fn version_binding(&self, id: VersionId) -> Option<&[u8]> {
         self.version_bindings.get(&id).map(Vec::as_slice)
     }
 
     /// Resolves a version identity within an expected history for adapter
     /// reads. The returned root always comes from the committed table, so a
     /// fabricated value fails closed in [`PersistentHistoryStore::read`].
-    pub(crate) fn committed_version_for_adapter(
+    pub fn committed_version_for_adapter(
         &self,
         id: VersionId,
         history: HistoryId,
@@ -998,9 +998,7 @@ impl PersistentHistoryStore {
     /// parents, ordered ledgers, and bounds. Import additionally proves each
     /// active request digest reproduces from the imported arena, so a
     /// structurally valid snapshot with tampered payloads still fails closed.
-    pub(crate) fn import_snapshot(
-        snapshot: snapshot::HistorySnapshot,
-    ) -> Result<Self, HistoryError> {
+    pub fn import_snapshot(snapshot: snapshot::HistorySnapshot) -> Result<Self, HistoryError> {
         let (backend, roots) = if snapshot.versions.is_empty() {
             if !snapshot.image.is_empty() {
                 return Err(HistoryError::Invalid(

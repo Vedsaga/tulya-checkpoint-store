@@ -13,7 +13,7 @@ use super::image_v2::{
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum V2AvlError {
+pub enum V2AvlError {
     Format(V2FormatError),
     Image(V2ImageError),
     Invalid(&'static str),

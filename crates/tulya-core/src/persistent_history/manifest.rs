@@ -25,27 +25,27 @@ use super::HistoryError;
 use sha2::{Digest, Sha256};
 use std::fmt;
 
-pub(crate) const HISTORY_MANIFEST_FILE: &str = "history-manifest.json";
-pub(crate) const HISTORY_LOCK_FILE: &str = "history.lock";
-pub(crate) const HISTORY_FORMAT_NAME: &str = "tulya-history-store";
-pub(crate) const HISTORY_MANIFEST_SCHEMA: u64 = 1;
+pub const HISTORY_MANIFEST_FILE: &str = "history-manifest.json";
+pub const HISTORY_LOCK_FILE: &str = "history.lock";
+pub const HISTORY_FORMAT_NAME: &str = "tulya-history-store";
+pub const HISTORY_MANIFEST_SCHEMA: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ManifestSealed {
+pub struct ManifestSealed {
     byte_len: u64,
     sha256: [u8; 32],
 }
 
 impl ManifestSealed {
-    pub(crate) const fn byte_len(self) -> u64 {
+    pub const fn byte_len(self) -> u64 {
         self.byte_len
     }
 
-    pub(crate) const fn sha256(self) -> [u8; 32] {
+    pub const fn sha256(self) -> [u8; 32] {
         self.sha256
     }
 
-    pub(crate) fn for_snapshot(byte_len: u64, snapshot_bytes: &[u8]) -> Self {
+    pub fn for_snapshot(byte_len: u64, snapshot_bytes: &[u8]) -> Self {
         Self {
             byte_len,
             sha256: sealed_artifact_digest(snapshot_bytes),
@@ -54,21 +54,21 @@ impl ManifestSealed {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HistoryManifest {
+pub struct HistoryManifest {
     generation: u64,
     sealed: Option<ManifestSealed>,
 }
 
 impl HistoryManifest {
-    pub(crate) const fn generation(self) -> u64 {
+    pub const fn generation(self) -> u64 {
         self.generation
     }
 
-    pub(crate) const fn sealed(self) -> Option<ManifestSealed> {
+    pub const fn sealed(self) -> Option<ManifestSealed> {
         self.sealed
     }
 
-    pub(crate) fn for_generation(generation: u64, sealed: Option<ManifestSealed>) -> Self {
+    pub fn for_generation(generation: u64, sealed: Option<ManifestSealed>) -> Self {
         Self { generation, sealed }
     }
 }
@@ -92,16 +92,16 @@ impl fmt::Display for HistoryManifest {
 
 /// Canonical hot-log filename for a generation: fixed 20-digit zero padding
 /// covers the full `u64` range.
-pub(crate) fn history_wal_filename(generation: u64) -> String {
+pub fn history_wal_filename(generation: u64) -> String {
     format!("history-{generation:020}.wal")
 }
 
 /// Canonical sealed-snapshot filename for a generation.
-pub(crate) fn history_snapshot_filename(generation: u64) -> String {
+pub fn history_snapshot_filename(generation: u64) -> String {
     format!("history-snap-{generation:020}.ths")
 }
 
-pub(crate) fn encode_history_manifest(manifest: &HistoryManifest) -> Vec<u8> {
+pub fn encode_history_manifest(manifest: &HistoryManifest) -> Vec<u8> {
     let mut output = String::from("{\"format\":\"");
     output.push_str(HISTORY_FORMAT_NAME);
     output.push_str("\",\"manifest_schema\":");
@@ -123,7 +123,7 @@ pub(crate) fn encode_history_manifest(manifest: &HistoryManifest) -> Vec<u8> {
     output.into_bytes()
 }
 
-pub(crate) fn decode_history_manifest(bytes: &[u8]) -> Result<HistoryManifest, HistoryError> {
+pub fn decode_history_manifest(bytes: &[u8]) -> Result<HistoryManifest, HistoryError> {
     let value: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|_| HistoryError::Invalid("history manifest JSON is malformed"))?;
     let object = value.as_object().ok_or(HistoryError::Invalid(
@@ -218,7 +218,7 @@ pub(crate) fn decode_history_manifest(bytes: &[u8]) -> Result<HistoryManifest, H
 /// Binds sealed snapshot bytes to a manifest: plain SHA-256 over the exact
 /// file bytes, deliberately under a different domain role than the snapshot
 /// internal digest so the two bindings cannot be confused.
-pub(crate) fn sealed_artifact_digest(bytes: &[u8]) -> [u8; 32] {
+pub fn sealed_artifact_digest(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"tulya-history/v1/manifest-sealed\0");
     hasher.update(bytes);

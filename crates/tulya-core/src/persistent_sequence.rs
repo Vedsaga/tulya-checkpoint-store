@@ -58,21 +58,21 @@ use std::fmt;
 /// Persistent lengths stay in a fixed-width integer. Conversion to `usize`
 /// belongs at an allocation or slice boundary after explicit range checking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct LogicalLength(u64);
+pub struct LogicalLength(u64);
 
 impl LogicalLength {
     /// Creates a logical length from its persisted-width representation.
-    pub(crate) const fn new(value: u64) -> Self {
+    pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
     /// Returns the fixed-width logical length.
-    pub(crate) const fn get(self) -> u64 {
+    pub const fn get(self) -> u64 {
         self.0
     }
 
     /// Checked logical-length addition.
-    pub(crate) fn checked_add(self, other: Self) -> Option<Self> {
+    pub fn checked_add(self, other: Self) -> Option<Self> {
         self.0.checked_add(other.0).map(Self)
     }
 }
@@ -87,7 +87,7 @@ impl LogicalLength {
 /// re-entering the backend resolve their node identifier against the arena;
 /// caller-supplied lengths must agree exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum SequenceRepresentation {
+pub enum SequenceRepresentation {
     LegacyV1,
     BalancedV2,
 }
@@ -99,7 +99,7 @@ pub(crate) enum SequenceRepresentation {
 /// still have been derived by legacy traversal. A future writable format must
 /// persist enough metadata to construct this value without whole-parent work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct PersistentRoot {
+pub struct PersistentRoot {
     node_id: u64,
     logical_len: LogicalLength,
     representation: SequenceRepresentation,
@@ -107,7 +107,7 @@ pub(crate) struct PersistentRoot {
 
 impl PersistentRoot {
     /// Adapts a pre-release Format-v1 root without changing its on-disk meaning.
-    pub(crate) const fn legacy_v1(node_id: u64, logical_len: LogicalLength) -> Self {
+    pub const fn legacy_v1(node_id: u64, logical_len: LogicalLength) -> Self {
         Self {
             node_id,
             logical_len,
@@ -119,7 +119,7 @@ impl PersistentRoot {
     ///
     /// The backend resolves the identifier against its arena on every call,
     /// so a forged length fails closed instead of misdirecting traversal.
-    pub(crate) const fn balanced_v2(node_id: u64, logical_len: LogicalLength) -> Self {
+    pub const fn balanced_v2(node_id: u64, logical_len: LogicalLength) -> Self {
         Self {
             node_id,
             logical_len,
@@ -128,24 +128,24 @@ impl PersistentRoot {
     }
 
     /// Returns the physical root-node identifier.
-    pub(crate) const fn node_id(self) -> u64 {
+    pub const fn node_id(self) -> u64 {
         self.node_id
     }
 
     /// Returns the exact logical byte length represented by this root.
-    pub(crate) const fn logical_len(self) -> LogicalLength {
+    pub const fn logical_len(self) -> LogicalLength {
         self.logical_len
     }
 
     /// Returns the physical representation version for this root.
-    pub(crate) const fn representation(self) -> SequenceRepresentation {
+    pub const fn representation(self) -> SequenceRepresentation {
         self.representation
     }
 }
 
 /// Checked half-open logical byte range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SequenceRange {
+pub struct SequenceRange {
     offset: LogicalLength,
     length: LogicalLength,
     end: LogicalLength,
@@ -153,7 +153,7 @@ pub(crate) struct SequenceRange {
 
 impl SequenceRange {
     /// Creates a range only when its half-open end fits in `u64`.
-    pub(crate) fn new(offset: LogicalLength, length: LogicalLength) -> Option<Self> {
+    pub fn new(offset: LogicalLength, length: LogicalLength) -> Option<Self> {
         let end = offset.checked_add(length)?;
         Some(Self {
             offset,
@@ -163,17 +163,17 @@ impl SequenceRange {
     }
 
     /// Returns the range start.
-    pub(crate) const fn offset(self) -> LogicalLength {
+    pub const fn offset(self) -> LogicalLength {
         self.offset
     }
 
     /// Returns the range length.
-    pub(crate) const fn length(self) -> LogicalLength {
+    pub const fn length(self) -> LogicalLength {
         self.length
     }
 
     /// Returns the checked half-open range end captured at construction.
-    pub(crate) const fn end(self) -> LogicalLength {
+    pub const fn end(self) -> LogicalLength {
         self.end
     }
 }
@@ -185,7 +185,7 @@ impl SequenceRange {
 /// costs behind this interface. The later balanced writable implementation
 /// must preserve these semantics while adding the remaining target operations
 /// and logarithmic/bounded locality guarantees.
-pub(crate) trait PersistentSequence {
+pub trait PersistentSequence {
     type Error;
 
     /// Returns the exact logical length represented by `root`.
@@ -205,7 +205,7 @@ pub(crate) trait PersistentSequence {
 /// Staged backend failures surface transparently so diagnostics are never
 /// flattened at the seam boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SequenceError {
+pub enum SequenceError {
     Avl(V2AvlError),
     Invalid(&'static str),
     Capacity(&'static str),
@@ -240,12 +240,12 @@ impl From<V2AvlError> for SequenceError {
 /// Read/verify traversals accumulate under `nodes_read` instead; appends never
 /// touch that counter.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SequenceWorkCounters {
-    pub(crate) nodes_allocated: u64,
-    pub(crate) nodes_inspected: u64,
-    pub(crate) nodes_read: u64,
-    pub(crate) payload_bytes_read: u64,
-    pub(crate) payload_bytes_written: u64,
+pub struct SequenceWorkCounters {
+    pub nodes_allocated: u64,
+    pub nodes_inspected: u64,
+    pub nodes_read: u64,
+    pub payload_bytes_read: u64,
+    pub payload_bytes_written: u64,
 }
 
 /// Writable persistent byte-sequence operations.
@@ -254,7 +254,7 @@ pub(crate) struct SequenceWorkCounters {
 /// intentionally read-only behind [`PersistentSequence`]; only the balanced
 /// backend implements this trait today, and its `CheckpointStore` callers land
 /// in the next integration slice.
-pub(crate) trait PersistentSequenceAppend {
+pub trait PersistentSequenceAppend {
     type Error;
 
     /// Appends `bytes` to `parent` (or creates a root for `None`) without
@@ -276,13 +276,13 @@ pub(crate) trait PersistentSequenceAppend {
 /// canonical metadata, so forged lengths or unknown identifiers fail closed
 /// inside the core's existing checks.
 #[derive(Debug)]
-pub(crate) struct BalancedSequence {
+pub struct BalancedSequence {
     inner: V2AvlSequence,
     work: Cell<SequenceWorkCounters>,
 }
 
 impl BalancedSequence {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             inner: V2AvlSequence::default(),
             work: Cell::new(SequenceWorkCounters::default()),
@@ -290,12 +290,12 @@ impl BalancedSequence {
     }
 
     /// Returns a snapshot of the cumulative diagnostic work counters.
-    pub(crate) fn work_counters(&self) -> SequenceWorkCounters {
+    pub fn work_counters(&self) -> SequenceWorkCounters {
         self.work.get()
     }
 
     /// Reports whether the arena holds no payload or nodes.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
 
@@ -303,7 +303,7 @@ impl BalancedSequence {
     /// canonical image. The roots must arrive in the caller's canonical order
     /// (the snapshot layer uses version order); each resolves against the
     /// arena exactly like any re-entering root.
-    pub(crate) fn export_image(&self, roots: &[PersistentRoot]) -> Result<Vec<u8>, SequenceError> {
+    pub fn export_image(&self, roots: &[PersistentRoot]) -> Result<Vec<u8>, SequenceError> {
         let mut canonical = Vec::new();
         canonical
             .try_reserve_exact(roots.len())
@@ -317,7 +317,7 @@ impl BalancedSequence {
     /// Rebuilds a backend from one canonical image, returning the backend
     /// plus the image's retained roots converted to seam roots. Every node
     /// revalidates during import; the work counters start empty.
-    pub(crate) fn import_image(bytes: &[u8]) -> Result<(Self, Vec<PersistentRoot>), SequenceError> {
+    pub fn import_image(bytes: &[u8]) -> Result<(Self, Vec<PersistentRoot>), SequenceError> {
         let (inner, roots) = avl::V2AvlSequence::import_image(bytes)?;
         let mut seam_roots = Vec::new();
         seam_roots

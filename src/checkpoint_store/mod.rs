@@ -37,8 +37,8 @@ use crate::error_classification::{
     DurabilityOperation,
 };
 use crate::hot_wal_commit::{FileHotWalCommitIo, HotWalCommitter};
-use crate::persistent_history::authority::OpenedHistoryStats;
-use crate::persistent_history::{HistoryId, PersistentHistoryStore, VersionId};
+use tulya_core::persistent_history::authority::OpenedHistoryStats;
+use tulya_core::persistent_history::{HistoryId, PersistentHistoryStore, VersionId};
 
 mod storage_format;
 use storage_format::*;

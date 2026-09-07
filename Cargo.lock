@@ -576,8 +576,19 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tiny_http",
+ "tulya-core",
  "xxhash-rust",
  "zstd",
+]
+
+[[package]]
+name = "tulya-core"
+version = "0.1.0"
+dependencies = [
+ "fs4",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
