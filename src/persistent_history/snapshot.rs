@@ -166,7 +166,7 @@ pub(crate) fn encode_history_snapshot(
     }
     for (id, digest) in &retired {
         put_bytes(&mut body, id)?;
-        body.extend_from_slice(*digest);
+        body.extend_from_slice(digest.as_slice());
     }
     body.extend_from_slice(&image);
 

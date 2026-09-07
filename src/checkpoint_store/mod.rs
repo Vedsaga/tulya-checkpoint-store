@@ -37,8 +37,8 @@ use crate::error_classification::{
     DurabilityOperation,
 };
 use crate::hot_wal_commit::{FileHotWalCommitIo, HotWalCommitter};
-use crate::persistent_history::{HistoryId, PersistentHistoryStore, VersionId};
 use crate::persistent_history::authority::OpenedHistoryStats;
+use crate::persistent_history::{HistoryId, PersistentHistoryStore, VersionId};
 
 mod storage_format;
 use storage_format::*;
@@ -48,6 +48,14 @@ use fault_injection::*;
 
 mod fsck;
 pub use fsck::{fsck, FsckReport};
+
+/// Adapter identity maps rebuilt from durable history bindings on every
+/// open: checkpoint thread to generic history, and checkpoint `(thread, id)`
+/// to generic version. Derived, never persisted separately.
+type RebuiltHistoryMaps = (
+    HashMap<String, HistoryId>,
+    HashMap<(String, String), VersionId>,
+);
 
 /// Errors returned by the production checkpoint-store lifecycle.
 #[derive(Debug, Error)]
@@ -123,7 +131,9 @@ fn decode_candidate_version_binding(
         return Err(format_error("reopened version binding is truncated"));
     };
     if thread.is_empty() || checkpoint.is_empty() {
-        return Err(format_error("reopened version binding holds an empty identifier"));
+        return Err(format_error(
+            "reopened version binding holds an empty identifier",
+        ));
     }
     let thread = std::str::from_utf8(thread)
         .map_err(|_| format_error("reopened version binding thread is not valid UTF-8"))?;

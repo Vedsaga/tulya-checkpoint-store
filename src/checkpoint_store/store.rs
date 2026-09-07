@@ -645,8 +645,7 @@ impl CheckpointStore {
         let history = match self.history_ids.get(thread_id) {
             Some(id) => *id,
             None => {
-                let mut history_log =
-                    DurableHistoryLog::open(&self.candidate_hot_path())?;
+                let mut history_log = DurableHistoryLog::open(&self.candidate_hot_path())?;
                 let id = self
                     .history
                     .create_history_durable_with_binding(&mut history_log, thread_id.as_bytes())
@@ -807,13 +806,7 @@ impl CheckpointStore {
     /// version whose history disagrees with its bound thread — fails closed.
     fn rebuild_history_maps(
         history: &PersistentHistoryStore,
-    ) -> Result<
-        (
-            HashMap<String, HistoryId>,
-            HashMap<(String, String), VersionId>,
-        ),
-        CheckpointStoreError,
-    > {
+    ) -> Result<RebuiltHistoryMaps, CheckpointStoreError> {
         let mut history_ids = HashMap::new();
         for id in history.all_histories() {
             let Some(binding) = history.history_binding(id) else {

@@ -2121,8 +2121,7 @@ fn candidate_durable_history_survives_reopen_without_legacy_write(
 }
 
 #[test]
-fn candidate_first_use_retry_cannot_duplicate_history(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn candidate_first_use_retry_cannot_duplicate_history() -> Result<(), Box<dyn std::error::Error>> {
     // A crash between the durable history creation and the in-memory map
     // insert must not duplicate the lineage: the next open rebuilds the
     // maps from bindings, and first use resolves the existing history.
@@ -2154,8 +2153,7 @@ fn candidate_first_use_retry_cannot_duplicate_history(
 }
 
 #[test]
-fn candidate_seal_recycles_and_bounds_reopen(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn candidate_seal_recycles_and_bounds_reopen() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
     let config = CheckpointStoreConfig {
         wal_segment_bytes: 1024 * 1024,
@@ -2186,11 +2184,7 @@ fn candidate_seal_recycles_and_bounds_reopen(
     let reopened = CheckpointStore::open(temp.path(), config)?;
     let stats = reopened.candidate_history_open_stats();
     assert_eq!(stats.snapshot_versions, 2);
-    let hot_len = std::fs::metadata(
-        temp.path()
-            .join("history-00000000000000000001.wal"),
-    )?
-    .len();
+    let hot_len = std::fs::metadata(temp.path().join("history-00000000000000000001.wal"))?.len();
     assert!(hot_len > 0);
     assert_eq!(stats.suffix_bytes, hot_len);
     let history = reopened.history_store();
@@ -2207,8 +2201,7 @@ fn candidate_seal_recycles_and_bounds_reopen(
 }
 
 #[test]
-fn candidate_legacy_genesis_wal_is_adopted_once(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn candidate_legacy_genesis_wal_is_adopted_once() -> Result<(), Box<dyn std::error::Error>> {
     // A P1.3-era genesis `history.wal` (valid frames, bound adapter
     // material) is adopted into generation zero on open and never read
     // again afterwards.
