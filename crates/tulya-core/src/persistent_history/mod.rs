@@ -260,7 +260,15 @@ enum SplicePreview<'a> {
 
 /// A validated logical splice awaiting persistence and application. Borrows
 /// caller bytes so preparation itself never allocates payload copies.
+///
+/// The fresh version identity is allocated (checked) at preview time, before
+/// any backend mutation or authority I/O: an exhausted counter fails here,
+/// never after arena or WAL work. E3 invariant: every operation that creates
+/// a new Version must validate/reserve its logical VersionId in preparation,
+/// so fork reuses exactly this discipline.
 struct PreparedSplice<'a> {
+    version: VersionId,
+    next_version_id_after: u64,
     history: HistoryId,
     parent: Option<VersionId>,
     parent_root: Option<PersistentRoot>,
@@ -546,16 +554,31 @@ impl PersistentHistoryStore {
                 return Err(HistoryError::RequestConflict);
             }
         }
-        Ok(SplicePreview::Fresh(PreparedSplice {
-            history,
-            parent,
-            parent_root,
-            offset,
-            delete_len,
-            insert,
-            request_id,
-            binding,
-            digest,
+        Ok(SplicePreview::Fresh({
+            // Allocate the fresh identity here — after validation, before any
+            // backend mutation or authority I/O — so exhaustion fails in
+            // preview and can never strand arena work or an unrecoverable
+            // max-Version WAL record. Replay/retired outcomes above need no
+            // identity and return before this point.
+            let next_version_id_after =
+                self.next_version_id
+                    .checked_add(1)
+                    .ok_or(HistoryError::Overflow(
+                        "persistent version count exceeds u64",
+                    ))?;
+            PreparedSplice {
+                version: VersionId(self.next_version_id),
+                next_version_id_after,
+                history,
+                parent,
+                parent_root,
+                offset,
+                delete_len,
+                insert,
+                request_id,
+                binding,
+                digest,
+            }
         }))
     }
 
@@ -563,14 +586,21 @@ impl PersistentHistoryStore {
     /// in-memory and durable paths.
     ///
     /// Every fallible table/ledger/binding reservation completes before the
-    /// backend edit runs, and the identity counter advances only after the
-    /// arena edit succeeds (which rolls its own allocations back on
-    /// failure). A rejection therefore leaves the counter, tables, ledgers,
-    /// and bindings exactly as found.
+    /// backend edit runs. The live counter must still equal the prepared
+    /// identity — a mismatch fails here, before any arena mutation on the
+    /// pure in-memory path (and poisons post-barrier on the durable path via
+    /// the caller's mapping). Only after the arena edit succeeds is the
+    /// prepared successor counter adopted: there is no checked VersionId
+    /// arithmetic after the backend splice.
     fn apply_prepared_splice(
         &mut self,
         prepared: &PreparedSplice<'_>,
     ) -> Result<CommitOutcome, HistoryError> {
+        if self.next_version_id != prepared.version.id() {
+            return Err(HistoryError::Invalid(
+                "prepared splice identity disagrees with the allocation counter",
+            ));
+        }
         self.versions
             .try_reserve(1)
             .map_err(|_| HistoryError::Capacity("persistent version table allocation failed"))?;
@@ -584,22 +614,16 @@ impl PersistentHistoryStore {
                 HistoryError::Capacity("persistent version binding allocation failed")
             })?;
         }
-        let id = VersionId(self.next_version_id);
         let splice = self.backend.splice(
             prepared.parent_root,
             LogicalLength::new(prepared.offset),
             LogicalLength::new(prepared.delete_len),
             prepared.insert,
         )?;
-        self.next_version_id =
-            self.next_version_id
-                .checked_add(1)
-                .ok_or(HistoryError::Overflow(
-                    "persistent version count exceeds u64",
-                ))?;
+        self.next_version_id = prepared.next_version_id_after;
         let version = Version {
             history: prepared.history,
-            id,
+            id: prepared.version,
             parent: prepared.parent,
             root: splice.root,
         };
@@ -609,12 +633,12 @@ impl PersistentHistoryStore {
                 request.to_vec(),
                 ActiveRequest {
                     digest: prepared.digest,
-                    version: id,
+                    version: version.id(),
                 },
             );
         }
         if let Some(binding) = prepared.binding {
-            let _ = self.version_bindings.insert(id, binding.to_vec());
+            let _ = self.version_bindings.insert(version.id(), binding.to_vec());
         }
         Ok(CommitOutcome::Committed(version))
     }
@@ -1089,7 +1113,7 @@ impl PersistentHistoryStore {
         };
         let record = HistoryLogRecord::Splice {
             history: prepared.history,
-            version: VersionId(self.next_version_id),
+            version: prepared.version,
             parent: prepared.parent,
             offset: prepared.offset,
             delete_len: prepared.delete_len,
@@ -2008,9 +2032,13 @@ mod tests {
 
     #[test]
     fn splice_version_counter_overflow_leaves_no_version() {
+        // Identity allocation is preview-checked: at exhaustion the splice
+        // fails before any backend mutation, so the arena shows zero new
+        // work and every table stays exactly as found.
         let mut store = PersistentHistoryStore::new();
         let history = store.create_history().unwrap();
         let v0 = append_new(&mut store, history, None, b"abcdef");
+        let counters_before = store.work_counters();
         store.next_version_id = u64::MAX;
         assert!(matches!(
             store.splice(history, Some(v0.id()), 6, 0, b"x", None, None),
@@ -2018,6 +2046,159 @@ mod tests {
         ));
         assert_eq!(store.next_version_id, u64::MAX);
         assert_eq!(store.versions.len(), 1);
+        assert!(store.active_requests.is_empty());
+        assert!(store.retired_requests.is_empty());
+        assert!(store.version_bindings.is_empty());
+        let counters_after = store.work_counters();
+        assert_eq!(
+            counters_after.nodes_allocated,
+            counters_before.nodes_allocated
+        );
+        assert_eq!(
+            counters_after.payload_bytes_written,
+            counters_before.payload_bytes_written
+        );
+        assert_eq!(read_full(&store, v0, 6), b"abcdef");
+        store.verify(v0).unwrap();
+        assert!(!store.is_poisoned());
+        // A request-bound exhaustion fails the same way: no ledger entry.
+        assert!(matches!(
+            store.splice(history, Some(v0.id()), 6, 0, b"x", Some(b"req-1"), None),
+            Err(HistoryError::Overflow(_))
+        ));
+        assert!(!store.active_requests.contains_key(b"req-1".as_slice()));
+        // Replay and retired outcomes need no new VersionId: a bound request
+        // still replays at an exhausted counter instead of overflowing.
+        let mut live = PersistentHistoryStore::new();
+        let live_history = live.create_history().unwrap();
+        let live_v0 = append_new(&mut live, live_history, None, b"abcdef");
+        let live_v1 = match live
+            .splice(
+                live_history,
+                Some(live_v0.id()),
+                6,
+                0,
+                b"x",
+                Some(b"req-9"),
+                None,
+            )
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("fresh splice must create")
+            }
+        };
+        live.next_version_id = u64::MAX;
+        assert_eq!(
+            live.splice(
+                live_history,
+                Some(live_v0.id()),
+                6,
+                0,
+                b"x",
+                Some(b"req-9"),
+                None,
+            ),
+            Ok(CommitOutcome::Replayed(live_v1))
+        );
+    }
+
+    #[test]
+    fn durable_splice_exhaustion_writes_zero_authority_bytes() {
+        // The durable path must reject an exhausted counter before WAL
+        // record construction, append, sync, backend mutation, and
+        // poisoning: the hot log is byte-identical afterwards and no
+        // max-Version record can become authoritative.
+        let temp = tempfile::tempdir().unwrap();
+        let path = test_log_path(temp.path());
+        let mut store = PersistentHistoryStore::new();
+        let mut log = DurableHistoryLog::open(&path).unwrap();
+        let history = store.create_history_durable(&mut log).unwrap();
+        let v0 = match store
+            .append_durable(&mut log, history, None, b"abcdef", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("durable root must create")
+            }
+        };
+        let counters_before = store.work_counters();
+        let log_len_before = std::fs::metadata(&path).unwrap().len();
+        assert!(log_len_before > 0);
+        store.next_version_id = u64::MAX;
+        let error = store
+            .splice_durable(&mut log, history, Some(v0.id()), 6, 0, b"x", None, None)
+            .unwrap_err();
+        assert!(
+            matches!(error, DurableError::Rejected(HistoryError::Overflow(_))),
+            "exhaustion must reject definitely, got {error}"
+        );
+        assert!(!store.is_poisoned());
+        assert_eq!(store.next_version_id, u64::MAX);
+        assert_eq!(store.versions.len(), 1);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            log_len_before,
+            "rejected splice must not append authority bytes"
+        );
+        let counters_after = store.work_counters();
+        assert_eq!(
+            counters_after.nodes_allocated,
+            counters_before.nodes_allocated
+        );
+        assert_eq!(
+            counters_after.payload_bytes_written,
+            counters_before.payload_bytes_written
+        );
+        assert_eq!(read_full(&store, v0, 6), b"abcdef");
+        // The writer stays usable for reads and the log replays exactly the
+        // pre-exhaustion state: no unrecoverable record was emitted.
+        drop(store);
+        drop(log);
+        let bytes = std::fs::read(&path).unwrap();
+        let reopened = recover_history_store(&bytes).unwrap();
+        assert_eq!(reopened.versions.len(), 1);
+        assert_eq!(reopened.next_version_id, 1);
+    }
+
+    #[test]
+    fn replay_at_version_exhaustion_fails_before_backend_allocation() {
+        // A forged max-Version record against an exhausted counter fails at
+        // identity allocation, before any backend work: recovery may fail on
+        // impossible bytes, but the live writer must never generate them
+        // (proven by the durable test above).
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"abcdef");
+        store.next_version_id = u64::MAX;
+        let counters_before = store.work_counters();
+        let digest = history_splice_digest(history, Some(v0.id()), 6, 0, b"x", None);
+        assert!(matches!(
+            store.replay_splice(
+                history,
+                VersionId::new(u64::MAX),
+                Some(v0.id()),
+                6,
+                0,
+                b"x",
+                None,
+                None,
+                digest,
+            ),
+            Err(HistoryError::Overflow(_))
+        ));
+        assert_eq!(store.versions.len(), 1);
+        let counters_after = store.work_counters();
+        assert_eq!(
+            counters_after.nodes_allocated,
+            counters_before.nodes_allocated
+        );
+        assert_eq!(
+            counters_after.payload_bytes_written,
+            counters_before.payload_bytes_written
+        );
     }
 
     #[test]
