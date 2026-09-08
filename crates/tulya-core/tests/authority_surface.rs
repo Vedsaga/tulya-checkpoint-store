@@ -95,4 +95,27 @@ fn public_surface_covers_the_full_durable_lifecycle() {
     let read_only = open_history_authority(temp.path()).unwrap();
     assert_eq!(read_only.generation, 1);
     assert_eq!(read_only.store.version_count(), 4);
+    drop(read_only);
+
+    // Expiration and the bounded receipt horizon are part of the surface:
+    // expire through the authority, then prove the public gates hold.
+    let mut third = WritableHistoryAuthority::open(temp.path()).unwrap();
+    assert_eq!(
+        third.expire(v0.id()).unwrap(),
+        tulya_core::persistent_history::ExpireOutcome::Expired
+    );
+    assert!(third.store().is_expired(v0.id()).unwrap());
+    assert_eq!(
+        third.store().lookup_version(v0.id()),
+        Err(tulya_core::persistent_history::HistoryError::VersionExpired)
+    );
+    assert_eq!(
+        third.expire(v0.id()).unwrap(),
+        tulya_core::persistent_history::ExpireOutcome::AlreadyExpired
+    );
+    assert_eq!(
+        third.store().request_receipt_status(b"req-1"),
+        tulya_core::persistent_history::RequestReceiptStatus::Retired
+    );
+    assert_eq!(third.store().request_receipt_capacity(), 4096);
 }

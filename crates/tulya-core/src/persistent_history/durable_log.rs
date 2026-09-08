@@ -1,24 +1,27 @@
-//! Fork-epoch durable log for the domain-neutral history core.
+//! Expiration-epoch durable log for the domain-neutral history core.
 //!
 //! The log is the durability authority for generic history: a sequence of
 //! framed records replayed from genesis on open. It stores no adapter
 //! vocabulary — only numeric history/version identities, parent links,
-//! splice coordinates, inserted bytes, request identities, and operation
-//! digests. Fork records store no root or content: replay resolves the
-//! republished root from the encoded parent version.
+//! splice coordinates, inserted bytes, request identities, operation
+//! digests, and expiration marks. Fork records store no root or content:
+//! replay resolves the republished root from the encoded parent version.
+//! Receipt eviction needs no record: it is a deterministic consequence of
+//! replaying every fresh request-bearing splice/fork under the fixed staging
+//! capacity, so live execution and genesis replay land on identical horizons.
 //!
-//! Staging epoch note: the `THL3` magic and the splice/fork records below
-//! replace the E2 `THL2` splice-only grammar. Old staging logs fail closed at
-//! the frame magic and are never reinterpreted; there is deliberately no
-//! migration parser (zero external users). An E2 binary does not understand
-//! fork semantics, and a fork may exist solely in a sealed snapshot
-//! catalogue — so the epoch gate, not unknown-tag rejection, is what keeps
-//! pre-E3 code from reading E3 authority.
+//! Staging epoch note: the `THL4` magic and the splice/fork/expire records
+//! below replace the E3 `THL3` grammar. Old staging logs fail closed at the
+//! frame magic and are never reinterpreted; there is deliberately no
+//! migration parser (zero external users). An E3 binary retains receipts
+//! forever and does not understand version expiration — so the epoch gate,
+//! not unknown-tag rejection, is what keeps pre-E4 code from reading E4
+//! authority.
 //!
 //! Frame layout (all integers little-endian):
 //!
 //! ```text
-//! magic[4] = THL3
+//! magic[4] = THL4
 //! body_len[u64]
 //! body[..]
 //! footer_magic[4] = THLF
@@ -29,7 +32,7 @@
 //! Record bodies:
 //!
 //! ```text
-//! kind[u8]: 1 = create history, 4 = splice, 5 = fork, 3 = retire
+//! kind[u8]: 1 = create history, 4 = splice, 5 = fork, 6 = expire, 3 = retire
 //! create:  history_id[u64], binding-present[u8] + len[u64] + bytes
 //! splice:  history_id[u64], version_id[u64], parent[u64, MAX = none],
 //!          offset[u64], delete_len[u64], insert_len[u64], insert[..],
@@ -40,6 +43,7 @@
 //!          request_len[u64], request[..],
 //!          binding-present[u8] + len[u64] + bytes,
 //!          operation_digest[32]
+//! expire:  history_id[u64], version_id[u64]
 //! retire:  request_len[u64], request[..], operation_digest[32]
 //! ```
 //!
@@ -61,7 +65,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-const HISTORY_LOG_MAGIC: [u8; 4] = *b"THL3";
+const HISTORY_LOG_MAGIC: [u8; 4] = *b"THL4";
 const HISTORY_LOG_FOOTER_MAGIC: [u8; 4] = *b"THLF";
 const HISTORY_LOG_HEADER_SIZE: usize = 12;
 const HISTORY_LOG_FOOTER_SIZE: usize = 44;
@@ -76,6 +80,11 @@ const RECORD_SPLICE: u8 = 4;
 /// Canonical fork/publication record tag: catalogue metadata only, no root
 /// or content stored. Tag 2 stays retired and is never reused.
 const RECORD_FORK: u8 = 5;
+/// Canonical version-expiration record tag: one-way lifecycle metadata only.
+/// No digest is necessary — the version identity canonically names the
+/// irreversible target — and no request identity is recorded, since repeated
+/// expiration is intrinsically idempotent. Tag 2 stays retired.
+const RECORD_EXPIRE_VERSION: u8 = 6;
 const NO_PARENT: u64 = u64::MAX;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +111,10 @@ pub enum HistoryLogRecord {
         request_id: Option<Vec<u8>>,
         binding: Option<Vec<u8>>,
         digest: [u8; 32],
+    },
+    ExpireVersion {
+        history: HistoryId,
+        version: VersionId,
     },
     Retire {
         request_id: Vec<u8>,
@@ -261,6 +274,11 @@ pub fn encode_history_log_record(record: &HistoryLogRecord) -> Result<Vec<u8>, H
             }
             output.extend_from_slice(digest);
         }
+        HistoryLogRecord::ExpireVersion { history, version } => {
+            output.push(RECORD_EXPIRE_VERSION);
+            output.extend_from_slice(&history.id().to_le_bytes());
+            output.extend_from_slice(&version.id().to_le_bytes());
+        }
         HistoryLogRecord::Retire { request_id, digest } => {
             output.push(RECORD_RETIRE);
             if request_id.len() > MAX_HISTORY_REQUEST_ID_BYTES {
@@ -319,6 +337,12 @@ fn encoded_record_len(record: &HistoryLogRecord) -> Result<usize, HistoryError> 
             .and_then(|value| value.checked_add(8))
             .and_then(|value| value.checked_add(binding.as_ref().map_or(0, Vec::len)))
             .and_then(|value| value.checked_add(32))
+            .ok_or(HistoryError::Overflow(
+                "history log record length exceeds usize",
+            ))?,
+        HistoryLogRecord::ExpireVersion { .. } => 1usize
+            .checked_add(8)
+            .and_then(|value| value.checked_add(8))
             .ok_or(HistoryError::Overflow(
                 "history log record length exceeds usize",
             ))?,
@@ -416,6 +440,11 @@ pub fn decode_history_log_record(bytes: &[u8]) -> Result<HistoryLogRecord, Histo
                 binding,
                 digest,
             }
+        }
+        RECORD_EXPIRE_VERSION => {
+            let history = HistoryId(cursor.take_u64()?);
+            let version = VersionId(cursor.take_u64()?);
+            HistoryLogRecord::ExpireVersion { history, version }
         }
         RECORD_RETIRE => {
             let request_len = cursor.take_u64()?;
@@ -721,6 +750,9 @@ fn apply_recovered_record(
                 ));
             }
         }
+        HistoryLogRecord::ExpireVersion { history, version } => {
+            store.replay_expire(*history, *version)?;
+        }
         HistoryLogRecord::Retire { request_id, digest } => {
             store.replay_retire(request_id, *digest)?;
         }
@@ -916,6 +948,10 @@ mod tests {
             HistoryLogRecord::Retire {
                 request_id: b"req-9".to_vec(),
                 digest: [0x77; 32],
+            },
+            HistoryLogRecord::ExpireVersion {
+                history: HistoryId(2),
+                version: VersionId(5),
             },
         ] {
             let encoded = encode_history_log_record(&record).unwrap();

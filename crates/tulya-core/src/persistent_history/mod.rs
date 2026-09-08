@@ -30,7 +30,7 @@ use crate::persistent_sequence::{
     PersistentSequenceSplice, SequenceError, SequenceRange, SequenceWorkCounters,
 };
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
 pub mod authority;
@@ -134,6 +134,10 @@ pub enum HistoryError {
     Overflow(&'static str),
     Capacity(&'static str),
     RequestConflict,
+    /// A known version is logically expired and no longer available for new
+    /// public acquisition. Internal recovery/snapshot metadata lookup does
+    /// not obey this restriction; only public read/verify/acquisition does.
+    VersionExpired,
     Poisoned,
 }
 
@@ -146,6 +150,8 @@ impl fmt::Display for HistoryError {
             }
             Self::RequestConflict => formatter
                 .write_str("persistent request identity conflicts with a committed operation"),
+            Self::VersionExpired => formatter
+                .write_str("persistent version is expired and no longer available for acquisition"),
             Self::Poisoned => {
                 formatter.write_str("persistent history writer is poisoned and requires reopen")
             }
@@ -159,6 +165,55 @@ impl From<SequenceError> for HistoryError {
     fn from(error: SequenceError) -> Self {
         Self::Sequence(error)
     }
+}
+
+/// Logical lifecycle of one committed version.
+///
+/// Every version starts [`Retained`](Self::Retained). [`expire`](PersistentHistoryStore::expire)
+/// moves it to [`Expired`](Self::Expired) exactly once; there is no
+/// resurrection. Expiration is catalogue metadata only: root, parent,
+/// identity, bytes, and bindings are unchanged, and the entry stays known
+/// forever so retained descendants keep valid lineage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionLifecycle {
+    Retained,
+    Expired,
+}
+
+/// Outcome of a version-expiration request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpireOutcome {
+    /// The version transitioned retained -> expired: a durable metadata
+    /// change on the durable path, catalogue-only in memory.
+    Expired,
+    /// The version was already expired: idempotent, with zero WAL I/O and
+    /// zero metadata mutation on every path.
+    AlreadyExpired,
+}
+
+/// Exact staging capacity of the bounded request-receipt horizon: active
+/// plus retired receipts together.
+///
+/// This is NOT release-frozen; E9 may change the value or make it
+/// configurable before public Format v1. The exact promise is: exact request
+/// replay/conflict semantics are retained for the most recent
+/// `STAGING_REQUEST_RECEIPT_CAPACITY` request receipts in the current staging
+/// contract. Do NOT describe Tulya as providing "idempotency forever."
+pub const STAGING_REQUEST_RECEIPT_CAPACITY: usize = 4096;
+
+/// Visibility of one request identity under the bounded receipt horizon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestReceiptStatus {
+    /// Retained receipt resolving to its committed version: same digest
+    /// replays, different digest conflicts.
+    Active(VersionId),
+    /// Retained receipt whose version retired or expired: same digest
+    /// retires, different digest conflicts.
+    Retired,
+    /// Never observed, or previously observed but evicted from the bounded
+    /// horizon. Core cannot distinguish those after exact bounded metadata is
+    /// discarded; reuse of an unknown identity may execute a fresh operation.
+    Unknown,
 }
 
 /// Computes the canonical digest for one exact splice mutation.
@@ -373,6 +428,21 @@ struct PreparedFork<'a> {
     digest: [u8; 32],
 }
 
+/// Result of validating one expiration without mutating state.
+enum ExpirePreview {
+    AlreadyExpired,
+    Fresh(PreparedExpire),
+}
+
+/// A validated expiration awaiting persistence and application: the
+/// lifecycle target plus the single active receipt (if any) staged for the
+/// atomic active -> retired move. Order position is never touched.
+struct PreparedExpire {
+    history: HistoryId,
+    version: VersionId,
+    receipt: Option<(Vec<u8>, [u8; 32])>,
+}
+
 /// A begun durable history creation whose frame is already authoritative in
 /// the log but not yet applied in memory. The token is valid only for the
 /// store that began it and pairs strictly with one finish: finishing twice,
@@ -401,6 +471,14 @@ pub struct PersistentHistoryStore {
     next_version_id: u64,
     active_requests: HashMap<Vec<u8>, ActiveRequest>,
     retired_requests: HashMap<Vec<u8>, [u8; 32]>,
+    /// Oldest-to-newest insertion order of every retained request receipt.
+    /// Replay, retire, and expiration never reorder; only a fresh
+    /// request-bearing commit appends, and horizon eviction pops the front.
+    receipt_order: VecDeque<Vec<u8>>,
+    /// One-way version lifecycle metadata: every version starts retained,
+    /// and expiration inserts here without touching the catalogue entry.
+    /// The set stays a subset of known version identities forever.
+    expired_versions: HashSet<VersionId>,
     history_bindings: HashMap<HistoryId, Vec<u8>>,
     version_bindings: HashMap<VersionId, Vec<u8>>,
     poisoned: bool,
@@ -416,6 +494,8 @@ impl PersistentHistoryStore {
             next_version_id: 0,
             active_requests: HashMap::new(),
             retired_requests: HashMap::new(),
+            receipt_order: VecDeque::new(),
+            expired_versions: HashSet::new(),
             history_bindings: HashMap::new(),
             version_bindings: HashMap::new(),
             poisoned: false,
@@ -687,6 +767,14 @@ impl PersistentHistoryStore {
                 return Err(HistoryError::RequestConflict);
             }
         }
+        // The fresh path requires a retained parent. Ledger resolution above
+        // runs first, so an already-committed request still replays even
+        // after its historical parent expired; only unknown/fresh requests
+        // pay the retention check. Inspecting the known parent's root/length
+        // earlier was internal metadata access, not public acquisition.
+        if let Some(parent_id) = parent {
+            self.require_retained(parent_id)?;
+        }
         Ok(SplicePreview::Fresh({
             // Allocate the fresh identity here — after validation, before any
             // backend mutation or authority I/O — so exhaustion fails in
@@ -736,6 +824,9 @@ impl PersistentHistoryStore {
             self.active_requests.try_reserve(1).map_err(|_| {
                 HistoryError::Capacity("persistent active request allocation failed")
             })?;
+            self.receipt_order.try_reserve(1).map_err(|_| {
+                HistoryError::Capacity("persistent receipt order allocation failed")
+            })?;
         }
         if prepared.binding.is_some() {
             self.version_bindings.try_reserve(1).map_err(|_| {
@@ -757,13 +848,7 @@ impl PersistentHistoryStore {
         };
         self.versions.push(version);
         if let Some(request) = prepared.request_id {
-            let _ = self.active_requests.insert(
-                request.to_vec(),
-                ActiveRequest {
-                    digest: prepared.digest,
-                    version: version.id(),
-                },
-            );
+            self.push_fresh_receipt(request, prepared.digest, version.id());
         }
         if let Some(binding) = prepared.binding {
             let _ = self.version_bindings.insert(version.id(), binding.to_vec());
@@ -822,6 +907,9 @@ impl PersistentHistoryStore {
                 return Err(HistoryError::RequestConflict);
             }
         }
+        // Fresh path requires a retained parent; retained receipts replay
+        // above regardless of later parent expiration (see splice preview).
+        self.require_retained(parent)?;
         Ok(ForkPreview::Fresh({
             // Allocate the fresh identity here — after validation, before any
             // authority I/O or catalogue mutation — reusing the E2 splice
@@ -868,6 +956,9 @@ impl PersistentHistoryStore {
             self.active_requests.try_reserve(1).map_err(|_| {
                 HistoryError::Capacity("persistent active request allocation failed")
             })?;
+            self.receipt_order.try_reserve(1).map_err(|_| {
+                HistoryError::Capacity("persistent receipt order allocation failed")
+            })?;
         }
         if prepared.binding.is_some() {
             self.version_bindings.try_reserve(1).map_err(|_| {
@@ -883,13 +974,7 @@ impl PersistentHistoryStore {
         };
         self.versions.push(version);
         if let Some(request) = prepared.request_id {
-            let _ = self.active_requests.insert(
-                request.to_vec(),
-                ActiveRequest {
-                    digest: prepared.digest,
-                    version: version.id(),
-                },
-            );
+            self.push_fresh_receipt(request, prepared.digest, version.id());
         }
         if let Some(binding) = prepared.binding {
             let _ = self.version_bindings.insert(version.id(), binding.to_vec());
@@ -897,11 +982,57 @@ impl PersistentHistoryStore {
         Ok(CommitOutcome::Committed(version))
     }
 
+    /// Records a fresh request receipt for a newly committed version and
+    /// enforces the bounded horizon. Callers reserve map and order capacity
+    /// before mutating, so this never fails: insert, newest-append, then
+    /// oldest-first eviction while active + retired exceed capacity.
+    ///
+    /// Eviction is metadata-only: it removes the oldest retained receipt from
+    /// whichever ledger holds it, without expiring versions, deleting
+    /// content, or touching bindings. The evicted version stays retained
+    /// unless explicitly expired.
+    fn push_fresh_receipt(&mut self, request_id: &[u8], digest: [u8; 32], version: VersionId) {
+        let _ = self
+            .active_requests
+            .insert(request_id.to_vec(), ActiveRequest { digest, version });
+        self.receipt_order.push_back(request_id.to_vec());
+        self.enforce_receipt_horizon();
+    }
+
+    /// Evicts oldest-first while retained receipts exceed the staging
+    /// capacity. Every order entry lives in exactly one ledger, so each pop
+    /// drops the retained count by exactly one.
+    fn enforce_receipt_horizon(&mut self) {
+        while self.active_requests.len() + self.retired_requests.len()
+            > STAGING_REQUEST_RECEIPT_CAPACITY
+        {
+            let Some(oldest) = self.receipt_order.pop_front() else {
+                break;
+            };
+            if self.active_requests.remove(oldest.as_slice()).is_none() {
+                let _ = self.retired_requests.remove(oldest.as_slice());
+            }
+        }
+    }
+
+    /// Requires a known, retained version: unknown identities fail closed as
+    /// invalid, expired ones as unavailable for new acquisition. Internal
+    /// recovery/snapshot paths use [`version_record`](Self::version_record)
+    /// directly and never call this.
+    fn require_retained(&self, id: VersionId) -> Result<(), HistoryError> {
+        self.version_record(id)?;
+        if self.expired_versions.contains(&id) {
+            return Err(HistoryError::VersionExpired);
+        }
+        Ok(())
+    }
+
     /// Moves an active request identity to the retired ledger.
     ///
     /// Retirement is prepare-then-commit: every fallible reservation completes
     /// before the active entry is removed, so failure leaves both ledgers
-    /// unchanged. Unknown or already-retired identities fail closed.
+    /// unchanged. Unknown or already-retired identities fail closed. The
+    /// receipt keeps its horizon order position: retire never refreshes age.
     pub fn retire_request(&mut self, request_id: &[u8]) -> Result<(), HistoryError> {
         self.require_unpoisoned()?;
         validate_request_identity(request_id)?;
@@ -962,7 +1093,7 @@ impl PersistentHistoryStore {
     /// runs as one linear pass over the replayed store at the end of the
     /// replay suffix pass, so lifetime recovery stays linear in history
     /// count even with a binding on every history.
-    pub fn replay_create(
+    pub(crate) fn replay_create(
         &mut self,
         history: HistoryId,
         binding: Option<&[u8]>,
@@ -991,7 +1122,7 @@ impl PersistentHistoryStore {
     /// application, exact version identity, and request/binding rebuild —
     /// with all prior historical roots preserved. A complete but malformed
     /// splice frame fails closed; a torn suffix never reaches this point.
-    pub fn replay_splice(
+    pub(crate) fn replay_splice(
         &mut self,
         history: HistoryId,
         version: VersionId,
@@ -1107,13 +1238,10 @@ impl PersistentHistoryStore {
             self.active_requests.try_reserve(1).map_err(|_| {
                 HistoryError::Capacity("persistent active request allocation failed")
             })?;
-            let _ = self.active_requests.insert(
-                request.to_vec(),
-                ActiveRequest {
-                    digest,
-                    version: id,
-                },
-            );
+            self.receipt_order.try_reserve(1).map_err(|_| {
+                HistoryError::Capacity("persistent receipt order allocation failed")
+            })?;
+            self.push_fresh_receipt(request, digest, id);
         }
         if let Some(binding) = binding {
             validate_binding(binding)?;
@@ -1132,7 +1260,7 @@ impl PersistentHistoryStore {
     /// persistent root into the new version with zero backend mutation. A
     /// complete but malformed fork frame fails closed; a torn suffix never
     /// reaches this point.
-    pub fn replay_fork(
+    pub(crate) fn replay_fork(
         &mut self,
         history: HistoryId,
         version: VersionId,
@@ -1198,13 +1326,10 @@ impl PersistentHistoryStore {
             self.active_requests.try_reserve(1).map_err(|_| {
                 HistoryError::Capacity("persistent active request allocation failed")
             })?;
-            let _ = self.active_requests.insert(
-                request.to_vec(),
-                ActiveRequest {
-                    digest,
-                    version: id,
-                },
-            );
+            self.receipt_order.try_reserve(1).map_err(|_| {
+                HistoryError::Capacity("persistent receipt order allocation failed")
+            })?;
+            self.push_fresh_receipt(request, digest, id);
         }
         if let Some(binding) = binding {
             validate_binding(binding)?;
@@ -1217,7 +1342,7 @@ impl PersistentHistoryStore {
     }
 
     /// Replays one logged retirement during recovery.
-    pub fn replay_retire(
+    pub(crate) fn replay_retire(
         &mut self,
         request_id: &[u8],
         digest: [u8; 32],
@@ -1547,6 +1672,204 @@ impl PersistentHistoryStore {
             .map_err(|error| self.poison_after_barrier(error))
     }
 
+    /// Expires one known version: the one-way retained -> expired lifecycle
+    /// transition. Expiration is catalogue metadata only — root, parent,
+    /// identity, bytes, and bindings are unchanged, the entry stays known
+    /// forever, and nothing cascades to descendants. If an active request
+    /// receipt currently resolves to this version, it moves active ->
+    /// retired with its horizon order position unchanged, so retrying it
+    /// retires instead of replaying an expired version.
+    ///
+    /// Repeated expiration is idempotent (`AlreadyExpired`, zero mutation);
+    /// unknown identities fail closed. Expiration never touches the sequence
+    /// backend.
+    pub fn expire(&mut self, version: VersionId) -> Result<ExpireOutcome, HistoryError> {
+        match self.preview_expire(version)? {
+            ExpirePreview::AlreadyExpired => Ok(ExpireOutcome::AlreadyExpired),
+            ExpirePreview::Fresh(prepared) => self.apply_prepared_expire(&prepared),
+        }
+    }
+
+    /// Reports the logical lifecycle of one known version; unknown
+    /// identities fail closed.
+    pub fn version_lifecycle(&self, version: VersionId) -> Result<VersionLifecycle, HistoryError> {
+        self.version_record(version)?;
+        Ok(if self.expired_versions.contains(&version) {
+            VersionLifecycle::Expired
+        } else {
+            VersionLifecycle::Retained
+        })
+    }
+
+    /// Reports whether a known version is still retained (available for new
+    /// public acquisition); unknown identities fail closed.
+    pub fn is_retained(&self, version: VersionId) -> Result<bool, HistoryError> {
+        Ok(matches!(
+            self.version_lifecycle(version)?,
+            VersionLifecycle::Retained
+        ))
+    }
+
+    /// Reports whether a known version is expired; unknown identities fail
+    /// closed.
+    pub fn is_expired(&self, version: VersionId) -> Result<bool, HistoryError> {
+        Ok(matches!(
+            self.version_lifecycle(version)?,
+            VersionLifecycle::Expired
+        ))
+    }
+
+    /// Validates one expiration without mutating anything: the version must
+    /// be known and still retained, expired-set and retired-ledger capacity
+    /// must be reservable, and any active receipt resolving to this version
+    /// is staged for the atomic active -> retired move.
+    fn preview_expire(&mut self, version: VersionId) -> Result<ExpirePreview, HistoryError> {
+        self.require_unpoisoned()?;
+        // Unknown identities fail closed: expiration success must never be
+        // reported for a version that was never committed.
+        let record = self.version_record(version)?;
+        if self.expired_versions.contains(&version) {
+            return Ok(ExpirePreview::AlreadyExpired);
+        }
+        self.expired_versions
+            .try_reserve(1)
+            .map_err(|_| HistoryError::Capacity("persistent expired version allocation failed"))?;
+        // Live execution creates at most one fresh receipt per new version,
+        // so at most one active receipt can resolve here; the snapshot gate
+        // (E4.8 strengthening) rejects forged states with more.
+        let mut receipt = None;
+        for (id, active) in &self.active_requests {
+            if active.version() == version {
+                receipt = Some((id.clone(), active.digest()));
+                break;
+            }
+        }
+        if receipt.is_some() {
+            self.retired_requests.try_reserve(1).map_err(|_| {
+                HistoryError::Capacity("persistent retired request allocation failed")
+            })?;
+        }
+        Ok(ExpirePreview::Fresh(PreparedExpire {
+            history: record.history(),
+            version,
+            receipt,
+        }))
+    }
+
+    /// Applies a prepared expiration: inserts the lifecycle mark and moves
+    /// the staged receipt active -> retired with its order position
+    /// unchanged. All fallible reservations completed in preview, so the
+    /// paired in-memory caller cannot fail here; the durable caller maps any
+    /// post-barrier disagreement to poison per the E0 authority contract.
+    fn apply_prepared_expire(
+        &mut self,
+        prepared: &PreparedExpire,
+    ) -> Result<ExpireOutcome, HistoryError> {
+        let record = self.version_record(prepared.version)?;
+        if record.history() != prepared.history {
+            return Err(HistoryError::Invalid(
+                "prepared expiration disagrees with committed history",
+            ));
+        }
+        if self.expired_versions.contains(&prepared.version) {
+            return Err(HistoryError::Invalid(
+                "prepared expiration identity is already expired",
+            ));
+        }
+        let _ = self.expired_versions.insert(prepared.version);
+        if let Some((id, digest)) = &prepared.receipt {
+            match self.active_requests.get(id.as_slice()) {
+                Some(active)
+                    if active.digest() == *digest && active.version() == prepared.version => {}
+                _ => {
+                    return Err(HistoryError::Invalid(
+                        "prepared expiration receipt disagrees with the active ledger",
+                    ));
+                }
+            }
+            let _ = self.active_requests.remove(id.as_slice());
+            let _ = self.retired_requests.insert(id.clone(), *digest);
+        }
+        Ok(ExpireOutcome::Expired)
+    }
+
+    /// Durably expires through preview, ExpireVersion record, barrier, and
+    /// apply. Already-expired versions return before any WAL I/O with zero
+    /// new authority bytes.
+    pub(crate) fn expire_durable(
+        &mut self,
+        log: &mut DurableHistoryLog,
+        version: VersionId,
+    ) -> Result<ExpireOutcome, DurableError> {
+        self.require_unpoisoned_durable()?;
+        let prepared = match self
+            .preview_expire(version)
+            .map_err(DurableError::Rejected)?
+        {
+            ExpirePreview::AlreadyExpired => return Ok(ExpireOutcome::AlreadyExpired),
+            ExpirePreview::Fresh(prepared) => prepared,
+        };
+        let record = HistoryLogRecord::ExpireVersion {
+            history: prepared.history,
+            version: prepared.version,
+        };
+        let frame = durable_log::encode_history_log_frame(
+            &durable_log::encode_history_log_record(&record).map_err(DurableError::Rejected)?,
+        )
+        .map_err(DurableError::Rejected)?;
+        self.write_and_sync(log, &frame)?;
+        self.apply_prepared_expire(&prepared)
+            .map_err(|error| self.poison_after_barrier(error))
+    }
+
+    /// Replays one logged expiration during recovery: the version must be
+    /// known in the recorded history (wrong history or unknown version fails
+    /// closed), the lifecycle mark is inserted idempotently, and any active
+    /// receipt resolving to the version moves active -> retired with its
+    /// order position unchanged — exactly mirroring live execution so WAL
+    /// replay reproduces the identical horizon state deterministically.
+    pub(crate) fn replay_expire(
+        &mut self,
+        history: HistoryId,
+        version: VersionId,
+    ) -> Result<(), HistoryError> {
+        if !self.histories.contains(&history) {
+            return Err(HistoryError::Invalid(
+                "history log expire targets an unknown history",
+            ));
+        }
+        let record = self
+            .version_record(version)
+            .map_err(|_| HistoryError::Invalid("history log expire targets an unknown version"))?;
+        if record.history() != history {
+            return Err(HistoryError::Invalid(
+                "history log expire crosses histories",
+            ));
+        }
+        if self.expired_versions.contains(&version) {
+            return Ok(());
+        }
+        self.expired_versions
+            .try_reserve(1)
+            .map_err(|_| HistoryError::Capacity("persistent expired version allocation failed"))?;
+        let mut receipt = None;
+        for (id, active) in &self.active_requests {
+            if active.version() == version {
+                receipt = Some((id.clone(), active.digest()));
+                break;
+            }
+        }
+        if let Some((id, digest)) = receipt {
+            self.retired_requests.try_reserve(1).map_err(|_| {
+                HistoryError::Capacity("persistent retired request allocation failed")
+            })?;
+            let _ = self.active_requests.remove(id.as_slice());
+            let _ = self.retired_requests.insert(id, digest);
+        }
+        let _ = self.expired_versions.insert(version);
+        Ok(())
+    }
+
     /// Durably retires a request identity with the same write-then-apply
     /// discipline as commits.
     pub(crate) fn retire_durable(
@@ -1651,16 +1974,54 @@ impl PersistentHistoryStore {
         self.backend.work_counters()
     }
 
-    /// Looks up a committed version by logical identity for adapter reads.
+    /// Looks up a retained version by logical identity for adapter reads.
     /// Coordinate-checked like every other lookup: a fabricated identity
-    /// fails closed.
+    /// fails closed, and an expired identity fails with
+    /// [`VersionExpired`](HistoryError::VersionExpired) instead of handing
+    /// out a version that is no longer available for acquisition.
     pub fn lookup_version(&self, id: VersionId) -> Result<Version, HistoryError> {
-        self.version_record(id)
+        let record = self.version_record(id)?;
+        if self.expired_versions.contains(&id) {
+            return Err(HistoryError::VersionExpired);
+        }
+        Ok(record)
     }
 
     /// Counts committed versions. Used for reopen statistics and tests.
+    /// Expired versions stay counted: expiration never removes catalogue
+    /// entries.
     pub fn version_count(&self) -> usize {
         self.versions.len()
+    }
+
+    /// Reports the horizon visibility of one request identity.
+    ///
+    /// While a receipt is retained, exact replay/conflict semantics hold
+    /// (active: same digest replays, different conflicts; retired: same
+    /// digest retires, different conflicts). After the receipt falls outside
+    /// the [`STAGING_REQUEST_RECEIPT_CAPACITY`] horizon it reads
+    /// [`Unknown`](RequestReceiptStatus::Unknown) — indistinguishable from
+    /// never-observed — and reuse may execute a fresh operation, possibly
+    /// creating a new version. This boundedness is deliberate, not a bug.
+    pub fn request_receipt_status(&self, request_id: &[u8]) -> RequestReceiptStatus {
+        if let Some(active) = self.active_requests.get(request_id) {
+            return RequestReceiptStatus::Active(active.version());
+        }
+        if self.retired_requests.contains_key(request_id) {
+            return RequestReceiptStatus::Retired;
+        }
+        RequestReceiptStatus::Unknown
+    }
+
+    /// Counts retained request receipts (active + retired together), always
+    /// `<= STAGING_REQUEST_RECEIPT_CAPACITY` after any successful operation.
+    pub fn request_receipt_count(&self) -> usize {
+        self.active_requests.len() + self.retired_requests.len()
+    }
+
+    /// Reports the exact staging receipt capacity. Not release-frozen.
+    pub const fn request_receipt_capacity(&self) -> usize {
+        STAGING_REQUEST_RECEIPT_CAPACITY
     }
 
     /// Lists committed history identities in stable numeric order for
@@ -1703,6 +2064,9 @@ impl PersistentHistoryStore {
                 "persistent version belongs to a different history",
             ));
         }
+        if self.expired_versions.contains(&id) {
+            return Err(HistoryError::VersionExpired);
+        }
         Ok(record)
     }
 
@@ -1724,6 +2088,9 @@ impl PersistentHistoryStore {
 
     /// Resolves a caller-held version against the committed table so a
     /// fabricated or stale value fails closed instead of addressing the arena.
+    /// Expired versions fail with [`VersionExpired`](HistoryError::VersionExpired):
+    /// public read/verify acquire live state, while internal metadata paths
+    /// use [`version_record`](Self::version_record) directly.
     fn committed_version(&self, version: Version) -> Result<Version, HistoryError> {
         let record = self.version_record(version.id())?;
         if record != version {
@@ -1731,16 +2098,23 @@ impl PersistentHistoryStore {
                 "persistent version does not match committed history",
             ));
         }
+        if self.expired_versions.contains(&version.id()) {
+            return Err(HistoryError::VersionExpired);
+        }
         Ok(record)
     }
 
-    /// Rebuilds a store from a decoded snapshot, revalidating every active
-    /// digest against freshly read payload bytes.
+    /// Rebuilds a store from a decoded snapshot, restoring lifecycle
+    /// marks, ledgers, and the exact receipt order.
     ///
     /// Decode already enforced wire structure, dense tables, topological
-    /// parents, ordered ledgers, and bounds. Import additionally proves each
-    /// active request digest reproduces from the imported arena, so a
-    /// structurally valid snapshot with tampered payloads still fails closed.
+    /// parents, ordered ledgers, receipt-horizon agreement, and bounds.
+    /// Import rechecks lineage and receipt consistency defensively (this
+    /// struct may not have come from decode), rebuilds the expired set and
+    /// horizon order, and preserves ledger digests byte-exact: digests bind
+    /// commit deltas that version content cannot reproduce, so their
+    /// authenticity traces to commit-time and log-replay validation while
+    /// the artifact digest protects these bytes.
     pub fn import_snapshot(snapshot: snapshot::HistorySnapshot) -> Result<Self, HistoryError> {
         let (backend, roots) = if snapshot.versions.is_empty() {
             if !snapshot.image.is_empty() {
@@ -1765,6 +2139,8 @@ impl PersistentHistoryStore {
             next_version_id: snapshot.next_version_id,
             active_requests: HashMap::new(),
             retired_requests: HashMap::new(),
+            receipt_order: VecDeque::new(),
+            expired_versions: HashSet::new(),
             history_bindings: HashMap::new(),
             version_bindings: HashMap::new(),
             poisoned: false,
@@ -1830,6 +2206,12 @@ impl PersistentHistoryStore {
                     ));
                 }
             }
+            if entry.lifecycle == VersionLifecycle::Expired {
+                store.expired_versions.try_reserve(1).map_err(|_| {
+                    HistoryError::Capacity("history snapshot import allocation failed")
+                })?;
+                let _ = store.expired_versions.insert(id);
+            }
             store.versions.push(Version {
                 history: entry.history,
                 id,
@@ -1889,6 +2271,34 @@ impl PersistentHistoryStore {
                     "history snapshot retired request identity is duplicated",
                 ));
             }
+        }
+        // The horizon order round-trips exactly: decode already enforced it
+        // for wire bytes, and the shared validator below rechecks forged
+        // structs that bypassed decode.
+        store
+            .receipt_order
+            .try_reserve(snapshot.receipt_order.len())
+            .map_err(|_| HistoryError::Capacity("history snapshot import allocation failed"))?;
+        for id in &snapshot.receipt_order {
+            if id.is_empty() || id.len() > MAX_HISTORY_REQUEST_ID_BYTES {
+                return Err(HistoryError::Invalid(
+                    "history snapshot request identity is outside bounds",
+                ));
+            }
+            store.receipt_order.push_back(id.clone());
+        }
+        snapshot::validate_snapshot_receipt_consistency(
+            &snapshot.versions,
+            &snapshot.active,
+            &snapshot.retired,
+            &snapshot.receipt_order,
+        )?;
+        // Defense in depth: the expired set built above must stay a subset
+        // of known identities, which dense construction guarantees.
+        if store.expired_versions.len() > store.versions.len() {
+            return Err(HistoryError::Invalid(
+                "history snapshot expired versions disagree with its table",
+            ));
         }
         Ok(store)
     }
@@ -4259,11 +4669,11 @@ mod tests {
     }
 
     #[test]
-    fn staging_epoch_gates_reject_thl2_and_schema2() {
-        // A THL2 log is byte-identical to THL3 except the frame magic (record
-        // layouts for pre-fork kinds are unchanged), so patching the magic on
-        // valid bytes is a faithful old-epoch control: the E3 reader must
-        // fail at the epoch gate, before any record parsing.
+    fn staging_epoch_gates_reject_thl3_and_schema3() {
+        // A THL3 log is byte-identical to THL4 except the frame magic
+        // (record layouts for pre-expire kinds are unchanged), so patching
+        // the magic on valid bytes is a faithful old-epoch control: the E4
+        // reader must fail at the epoch gate, before any record parsing.
         let temp = tempfile::tempdir().unwrap();
         let path = test_log_path(temp.path());
         let mut store = PersistentHistoryStore::new();
@@ -4274,41 +4684,41 @@ mod tests {
             .unwrap();
         drop(store);
         drop(log);
-        let thl3_bytes = std::fs::read(&path).unwrap();
-        assert!(recover_history_store(&thl3_bytes).is_ok());
-        let mut thl2_bytes = thl3_bytes.clone();
+        let thl4_bytes = std::fs::read(&path).unwrap();
+        assert!(recover_history_store(&thl4_bytes).is_ok());
+        let mut thl3_bytes = thl4_bytes.clone();
         // Every frame opens with its 4-byte magic; patch all of them.
         let mut offset = 0usize;
         let mut patched = 0u32;
-        while offset + 4 <= thl2_bytes.len() {
-            assert_eq!(&thl2_bytes[offset..offset + 4], b"THL3");
-            thl2_bytes[offset..offset + 4].copy_from_slice(b"THL2");
+        while offset + 4 <= thl3_bytes.len() {
+            assert_eq!(&thl3_bytes[offset..offset + 4], b"THL4");
+            thl3_bytes[offset..offset + 4].copy_from_slice(b"THL3");
             patched += 1;
             let body_len =
-                u64::from_le_bytes(thl2_bytes[offset + 4..offset + 12].try_into().unwrap())
+                u64::from_le_bytes(thl3_bytes[offset + 4..offset + 12].try_into().unwrap())
                     as usize;
             offset += 12 + body_len + 44;
         }
         assert!(patched >= 2);
         assert!(matches!(
-            recover_history_store(&thl2_bytes),
+            recover_history_store(&thl3_bytes),
             Err(HistoryError::Invalid(_))
         ));
-        // Schema-2 snapshot: patch the schema u32 (magic 0..4, total_len
+        // Schema-3 snapshot: patch the schema u32 (magic 0..4, total_len
         // 4..12, schema 12..16) on valid bytes. Decode checks the schema
         // before the trailing digest, so no digest recompute is needed: the
         // gate must fire first.
         let mut snap_store = PersistentHistoryStore::new();
         let snap_history = snap_store.create_history().unwrap();
         append_new(&mut snap_store, snap_history, None, b"epoch-base");
-        let schema3_bytes =
-            snapshot::encode_history_snapshot(&snap_store, 0, thl3_bytes.len() as u64).unwrap();
-        assert!(snapshot::decode_history_snapshot(&schema3_bytes).is_ok());
-        let mut schema2_bytes = schema3_bytes.clone();
-        assert_eq!(&schema2_bytes[0..4], b"THS1");
-        schema2_bytes[12..16].copy_from_slice(&2u32.to_le_bytes());
+        let schema4_bytes =
+            snapshot::encode_history_snapshot(&snap_store, 0, thl4_bytes.len() as u64).unwrap();
+        assert!(snapshot::decode_history_snapshot(&schema4_bytes).is_ok());
+        let mut schema3_bytes = schema4_bytes.clone();
+        assert_eq!(&schema3_bytes[0..4], b"THS1");
+        schema3_bytes[12..16].copy_from_slice(&3u32.to_le_bytes());
         assert!(matches!(
-            snapshot::decode_history_snapshot(&schema2_bytes),
+            snapshot::decode_history_snapshot(&schema3_bytes),
             Err(HistoryError::Invalid(_))
         ));
     }
@@ -4370,5 +4780,999 @@ mod tests {
             )
             .unwrap();
         assert_eq!(output, &parent_payload[..16]);
+    }
+
+    // ---- E4 expiration + receipt-horizon tests ----
+
+    fn expire_new(store: &mut PersistentHistoryStore, version: VersionId) {
+        assert_eq!(store.expire(version), Ok(ExpireOutcome::Expired));
+    }
+
+    #[test]
+    fn expire_basic_lifecycle_is_one_way_metadata_only() {
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"expire-base");
+        assert_eq!(
+            store.version_lifecycle(v0.id()),
+            Ok(VersionLifecycle::Retained)
+        );
+        assert_eq!(store.is_retained(v0.id()), Ok(true));
+        assert_eq!(store.is_expired(v0.id()), Ok(false));
+        let counters_before = store.work_counters();
+        expire_new(&mut store, v0.id());
+        let counters_after = store.work_counters();
+        assert_eq!(
+            store.version_lifecycle(v0.id()),
+            Ok(VersionLifecycle::Expired)
+        );
+        assert_eq!(store.is_retained(v0.id()), Ok(false));
+        assert_eq!(store.is_expired(v0.id()), Ok(true));
+        // Catalogue entry intact: root, parent, binding, and table position.
+        let record = store.version_record(v0.id()).unwrap();
+        assert_eq!(record, v0);
+        assert_eq!(store.versions.len(), 1);
+        assert_eq!(store.next_version_id, 1);
+        assert!(store.expired_versions.contains(&v0.id()));
+        // Zero sequence work: expiration is catalogue metadata only.
+        assert_eq!(
+            counters_after.nodes_allocated,
+            counters_before.nodes_allocated
+        );
+        assert_eq!(
+            counters_after.nodes_inspected,
+            counters_before.nodes_inspected
+        );
+        assert_eq!(counters_after.nodes_read, counters_before.nodes_read);
+        assert_eq!(
+            counters_after.payload_bytes_read,
+            counters_before.payload_bytes_read
+        );
+        assert_eq!(
+            counters_after.payload_bytes_written,
+            counters_before.payload_bytes_written
+        );
+        assert!(!store.is_poisoned());
+        // Public acquisition fails; internal metadata stays reachable.
+        assert_eq!(
+            store.read(v0, 0, 1, &mut Vec::new()),
+            Err(HistoryError::VersionExpired)
+        );
+        assert_eq!(store.verify(v0), Err(HistoryError::VersionExpired));
+        assert_eq!(
+            store.lookup_version(v0.id()),
+            Err(HistoryError::VersionExpired)
+        );
+        assert_eq!(
+            store.committed_version_for_adapter(v0.id(), history),
+            Err(HistoryError::VersionExpired)
+        );
+        // Repeated expiration is idempotent, not a second mutation.
+        assert_eq!(store.expire(v0.id()), Ok(ExpireOutcome::AlreadyExpired));
+        assert_eq!(store.versions.len(), 1);
+        // Unknown identities fail closed, never as silent success.
+        assert!(matches!(
+            store.expire(VersionId::new(99)),
+            Err(HistoryError::Invalid(_))
+        ));
+        assert!(store.version_lifecycle(VersionId::new(99)).is_err());
+        assert!(store.is_retained(VersionId::new(99)).is_err());
+    }
+
+    #[test]
+    fn expire_does_not_cascade_and_descendants_stay_usable() {
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let other = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"chain-base!");
+        let v1 = splice_new(&mut store, history, Some(v0.id()), 0, 5, b"CHAIN");
+        let v2 = splice_new(&mut store, history, Some(v1.id()), 6, 0, b"[t]");
+        let sibling = fork_new(&mut store, history, v0.id(), None, None);
+        let foreign = append_new(&mut store, other, None, b"foreign");
+        expire_new(&mut store, v1.id());
+        // Only the target changed lifecycle.
+        assert_eq!(store.is_retained(v0.id()), Ok(true));
+        assert_eq!(store.is_expired(v1.id()), Ok(true));
+        assert_eq!(store.is_retained(v2.id()), Ok(true));
+        assert_eq!(store.is_retained(sibling.id()), Ok(true));
+        assert_eq!(store.is_retained(foreign.id()), Ok(true));
+        // Lineage metadata is unchanged: the retained child still names its
+        // expired parent, and the parent need only be known, not retained.
+        assert_eq!(v2.parent(), Some(v1.id()));
+        assert_eq!(
+            store.version_record(v2.id()).unwrap().parent(),
+            Some(v1.id())
+        );
+        // The retained descendant stays fully usable as live state.
+        assert_eq!(read_full(&store, v2, 14), b"CHAIN-[t]base!");
+        store.verify(v2).unwrap();
+        let v3 = splice_new(&mut store, history, Some(v2.id()), 0, 0, b"+");
+        assert_eq!(v3.parent(), Some(v2.id()));
+        let v4 = fork_new(&mut store, history, v2.id(), None, None);
+        assert_eq!(v4.root(), v2.root());
+        // The expired version itself rejects every fresh acquisition.
+        assert_eq!(
+            store.splice(history, Some(v1.id()), 0, 0, b"x", Some(b"fresh-req"), None),
+            Err(HistoryError::VersionExpired)
+        );
+        assert_eq!(
+            store.fork(history, v1.id(), Some(b"fresh-fork"), None),
+            Err(HistoryError::VersionExpired)
+        );
+        assert_eq!(
+            store.read(v1, 0, 1, &mut Vec::new()),
+            Err(HistoryError::VersionExpired)
+        );
+        // Cross-history expiry never applied: foreign lineage untouched.
+        assert_eq!(read_full(&store, foreign, 7), b"foreign");
+    }
+
+    #[test]
+    fn retained_receipt_replays_after_parent_expiration() {
+        // E4.7 ordering: ledger resolution precedes the fresh-parent
+        // retention check, so an already-committed request replays even
+        // after its historical parent expired — for splice and fork alike.
+        for is_fork in [false, true] {
+            let mut store = PersistentHistoryStore::new();
+            let history = store.create_history().unwrap();
+            let v0 = append_new(&mut store, history, None, b"replay-base");
+            let v1 = if is_fork {
+                fork_new(&mut store, history, v0.id(), Some(b"req-r"), None)
+            } else {
+                match store
+                    .splice(history, Some(v0.id()), 6, 0, b"[e]", Some(b"req-r"), None)
+                    .unwrap()
+                {
+                    CommitOutcome::Committed(version) => version,
+                    CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                        panic!("fresh request must create")
+                    }
+                }
+            };
+            expire_new(&mut store, v0.id());
+            // Same retained receipt + same digest replays the retained
+            // result despite the expired historical parent.
+            let replayed = if is_fork {
+                store.fork(history, v0.id(), Some(b"req-r"), None).unwrap()
+            } else {
+                store
+                    .splice(history, Some(v0.id()), 6, 0, b"[e]", Some(b"req-r"), None)
+                    .unwrap()
+            };
+            assert_eq!(replayed, CommitOutcome::Replayed(v1));
+            // An unknown/fresh request on the expired parent fails.
+            let fresh = if is_fork {
+                store.fork(history, v0.id(), Some(b"req-new"), None)
+            } else {
+                store.splice(history, Some(v0.id()), 6, 0, b"[e]", Some(b"req-new"), None)
+            };
+            assert_eq!(fresh, Err(HistoryError::VersionExpired));
+        }
+    }
+
+    #[test]
+    fn expiring_result_version_retires_its_active_receipt() {
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"receipt-base");
+        let v1 = match store
+            .splice(history, Some(v0.id()), 7, 0, b"[e]", Some(b"req-v"), None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("fresh request must create")
+            }
+        };
+        assert_eq!(
+            store.request_receipt_status(b"req-v"),
+            RequestReceiptStatus::Active(v1.id())
+        );
+        let counters_before = store.work_counters();
+        expire_new(&mut store, v1.id());
+        let counters_after = store.work_counters();
+        // The receipt moved active -> retired with no content work.
+        assert_eq!(
+            store.request_receipt_status(b"req-v"),
+            RequestReceiptStatus::Retired
+        );
+        assert_eq!(
+            counters_after.nodes_allocated,
+            counters_before.nodes_allocated
+        );
+        assert_eq!(
+            counters_after.nodes_inspected,
+            counters_before.nodes_inspected
+        );
+        assert_eq!(
+            counters_after.payload_bytes_written,
+            counters_before.payload_bytes_written
+        );
+        // Retrying the exact receipt retires; a different digest conflicts —
+        // never a replay of the expired version.
+        assert_eq!(
+            store.splice(history, Some(v0.id()), 7, 0, b"[e]", Some(b"req-v"), None),
+            Ok(CommitOutcome::Retired)
+        );
+        assert_eq!(
+            store.splice(
+                history,
+                Some(v0.id()),
+                7,
+                0,
+                b"[other]",
+                Some(b"req-v"),
+                None
+            ),
+            Err(HistoryError::RequestConflict)
+        );
+        assert_eq!(
+            store.fork(history, v0.id(), Some(b"req-v"), None),
+            Err(HistoryError::RequestConflict)
+        );
+        // The expired result itself stays expired and unacquirable.
+        assert_eq!(store.is_expired(v1.id()), Ok(true));
+        assert_eq!(
+            store.read(v1, 0, 1, &mut Vec::new()),
+            Err(HistoryError::VersionExpired)
+        );
+    }
+
+    #[test]
+    fn internal_expired_root_bytes_are_unchanged() {
+        // E4.23: public acquisition fails, but the immutable root and its
+        // logical bytes are byte-identical before and after expiration.
+        // Internal paths keep using version_record, never the public gates.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"stable-bytes-1234");
+        let root_before = store.version_record(v0.id()).unwrap().root();
+        let mut bytes_before = Vec::new();
+        store
+            .backend
+            .read_range(
+                root_before,
+                SequenceRange::new(LogicalLength::new(0), LogicalLength::new(17)).unwrap(),
+                &mut bytes_before,
+            )
+            .unwrap();
+        expire_new(&mut store, v0.id());
+        let root_after = store.version_record(v0.id()).unwrap().root();
+        assert_eq!(root_after, root_before);
+        let mut bytes_after = Vec::new();
+        store
+            .backend
+            .read_range(
+                root_after,
+                SequenceRange::new(LogicalLength::new(0), LogicalLength::new(17)).unwrap(),
+                &mut bytes_after,
+            )
+            .unwrap();
+        assert_eq!(bytes_after, bytes_before);
+        assert_eq!(bytes_after, b"stable-bytes-1234");
+        // The expired set stays a subset of known identities.
+        assert!(store
+            .expired_versions
+            .iter()
+            .all(|id| store.version_record(*id).is_ok()));
+    }
+
+    fn fork_request_id(index: usize) -> Vec<u8> {
+        format!("horizon-req-{index:05}").into_bytes()
+    }
+
+    #[test]
+    fn receipt_horizon_boundary_4097_forks() {
+        // Zero-content forks keep the 4097-receipt boundary cheap: after
+        // completion exactly the newest 4096 receipts are retained, the
+        // oldest is Unknown, and reuse takes the documented path per case.
+        let mut store = PersistentHistoryStore::new();
+        assert_eq!(store.request_receipt_capacity(), 4096);
+        assert_eq!(
+            store.request_receipt_capacity(),
+            STAGING_REQUEST_RECEIPT_CAPACITY
+        );
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"horizon-base");
+        let mut committed = Vec::new();
+        for index in 0..4097 {
+            let version = fork_new(
+                &mut store,
+                history,
+                v0.id(),
+                Some(&fork_request_id(index)),
+                None,
+            );
+            committed.push(version);
+        }
+        assert_eq!(store.versions.len(), 4098);
+        assert_eq!(store.request_receipt_count(), 4096);
+        assert_eq!(store.receipt_order.len(), 4096);
+        // Boundary statuses: oldest evicted, rest active.
+        assert_eq!(
+            store.request_receipt_status(&fork_request_id(0)),
+            RequestReceiptStatus::Unknown
+        );
+        assert_eq!(
+            store.request_receipt_status(&fork_request_id(1)),
+            RequestReceiptStatus::Active(committed[1].id())
+        );
+        assert_eq!(
+            store.request_receipt_status(&fork_request_id(4096)),
+            RequestReceiptStatus::Active(committed[4096].id())
+        );
+        assert_eq!(store.receipt_order[0], fork_request_id(1));
+        assert_eq!(store.receipt_order[4095], fork_request_id(4096));
+        // Retained retry replays without touching the order...
+        assert_eq!(
+            store.fork(history, v0.id(), Some(&fork_request_id(1)), None),
+            Ok(CommitOutcome::Replayed(committed[1]))
+        );
+        assert_eq!(store.receipt_order[0], fork_request_id(1));
+        assert_eq!(store.request_receipt_count(), 4096);
+        // ...while the evicted retry takes the fresh path and becomes
+        // newest, evicting the then-oldest retained receipt.
+        let fresh = match store
+            .fork(history, v0.id(), Some(&fork_request_id(0)), None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("evicted request must take the fresh path")
+            }
+        };
+        assert_ne!(fresh.id(), committed[0].id());
+        assert_eq!(fresh.parent(), Some(v0.id()));
+        assert_eq!(fresh.root(), v0.root());
+        assert_eq!(
+            store.request_receipt_status(&fork_request_id(0)),
+            RequestReceiptStatus::Active(fresh.id())
+        );
+        assert_eq!(
+            store.request_receipt_status(&fork_request_id(1)),
+            RequestReceiptStatus::Unknown
+        );
+        assert_eq!(store.request_receipt_count(), 4096);
+        assert_eq!(store.receipt_order[0], fork_request_id(2));
+        assert_eq!(store.receipt_order[4095], fork_request_id(0));
+        // Every evicted version stays retained: eviction never expires.
+        assert_eq!(store.is_retained(committed[0].id()), Ok(true));
+        assert_eq!(store.is_retained(committed[1].id()), Ok(true));
+    }
+
+    #[test]
+    fn retired_receipts_count_and_evict() {
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"retire-base");
+        let v1 = match store
+            .splice(
+                history,
+                Some(v0.id()),
+                6,
+                0,
+                b"[e]",
+                Some(b"req-doomed"),
+                None,
+            )
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("fresh request must create")
+            }
+        };
+        store.retire_request(b"req-doomed").unwrap();
+        // While retained, retired semantics hold and the order is untouched.
+        assert_eq!(
+            store.request_receipt_status(b"req-doomed"),
+            RequestReceiptStatus::Retired
+        );
+        assert_eq!(store.receipt_order.len(), 1);
+        assert_eq!(
+            store.splice(
+                history,
+                Some(v0.id()),
+                6,
+                0,
+                b"[e]",
+                Some(b"req-doomed"),
+                None
+            ),
+            Ok(CommitOutcome::Retired)
+        );
+        assert_eq!(
+            store.splice(
+                history,
+                Some(v0.id()),
+                6,
+                0,
+                b"[other]",
+                Some(b"req-doomed"),
+                None
+            ),
+            Err(HistoryError::RequestConflict)
+        );
+        let _ = v1;
+        // Retired receipts are not immortal: 4096 newer receipts evict the
+        // retired one, and reuse then takes the fresh path.
+        for index in 0..4096 {
+            fork_new(
+                &mut store,
+                history,
+                v0.id(),
+                Some(&fork_request_id(index)),
+                None,
+            );
+        }
+        assert_eq!(store.request_receipt_count(), 4096);
+        assert_eq!(
+            store.request_receipt_status(b"req-doomed"),
+            RequestReceiptStatus::Unknown
+        );
+        let reused = match store
+            .splice(
+                history,
+                Some(v0.id()),
+                6,
+                0,
+                b"[e]",
+                Some(b"req-doomed"),
+                None,
+            )
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("evicted retired request must take the fresh path")
+            }
+        };
+        assert_eq!(
+            store.request_receipt_status(b"req-doomed"),
+            RequestReceiptStatus::Active(reused.id())
+        );
+        assert_eq!(store.request_receipt_count(), 4096);
+    }
+
+    #[test]
+    fn request_receipt_status_api_distinguishes_only_retained() {
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"status-base");
+        // Never observed reads Unknown.
+        assert_eq!(
+            store.request_receipt_status(b"never-seen"),
+            RequestReceiptStatus::Unknown
+        );
+        assert_eq!(store.request_receipt_count(), 0);
+        // No-request operations create no receipt.
+        fork_new(&mut store, history, v0.id(), None, None);
+        assert_eq!(store.request_receipt_count(), 0);
+        // Fresh request-bearing commit reads Active with its version.
+        let v1 = fork_new(&mut store, history, v0.id(), Some(b"req-s"), None);
+        assert_eq!(
+            store.request_receipt_status(b"req-s"),
+            RequestReceiptStatus::Active(v1.id())
+        );
+        assert_eq!(store.request_receipt_count(), 1);
+        // Explicit retire reads Retired with the order position unchanged.
+        let order_before: Vec<Vec<u8>> = store.receipt_order.iter().cloned().collect();
+        store.retire_request(b"req-s").unwrap();
+        assert_eq!(
+            store.request_receipt_status(b"req-s"),
+            RequestReceiptStatus::Retired
+        );
+        assert_eq!(store.request_receipt_count(), 1);
+        let order_after: Vec<Vec<u8>> = store.receipt_order.iter().cloned().collect();
+        assert_eq!(order_before, order_after);
+        // Version expiration retires the receipt, order still unchanged.
+        let v2 = fork_new(&mut store, history, v0.id(), Some(b"req-t"), None);
+        let _ = v2;
+        expire_new(&mut store, v1.id());
+        assert_eq!(
+            store.request_receipt_status(b"req-s"),
+            RequestReceiptStatus::Retired
+        );
+        let order_expired: Vec<Vec<u8>> = store.receipt_order.iter().cloned().collect();
+        assert_eq!(order_before.len() + 1, order_expired.len());
+        assert_eq!(order_expired[0], order_before[0]);
+    }
+
+    #[test]
+    fn exhaustion_distinguishes_retained_from_evicted_receipts() {
+        // Retained receipts replay/retire at MAX with no new identity; an
+        // evicted receipt takes the fresh path and overflows there.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"exhaust-base");
+        for index in 0..4096 {
+            fork_new(
+                &mut store,
+                history,
+                v0.id(),
+                Some(&fork_request_id(index)),
+                None,
+            );
+        }
+        // Two newer receipts evict req-0 and req-1; one stays active, the
+        // other retires while retained.
+        let live_fork = fork_new(&mut store, history, v0.id(), Some(b"req-live"), None);
+        fork_new(&mut store, history, v0.id(), Some(b"req-old"), None);
+        store.retire_request(b"req-old").unwrap();
+        assert_eq!(store.request_receipt_count(), 4096);
+        assert_eq!(
+            store.request_receipt_status(&fork_request_id(0)),
+            RequestReceiptStatus::Unknown
+        );
+        store.next_version_id = u64::MAX;
+        // Evicted receipt at exhaustion: fresh path, definite overflow —
+        // never an accidental replay.
+        assert!(matches!(
+            store.fork(history, v0.id(), Some(&fork_request_id(0)), None),
+            Err(HistoryError::Overflow(_))
+        ));
+        // Retained receipts need no new identity: replay and retire succeed.
+        assert_eq!(
+            store.fork(history, v0.id(), Some(b"req-live"), None),
+            Ok(CommitOutcome::Replayed(live_fork))
+        );
+        assert_eq!(
+            store.fork(history, v0.id(), Some(b"req-old"), None),
+            Ok(CommitOutcome::Retired)
+        );
+        assert_eq!(store.next_version_id, u64::MAX);
+        assert!(!store.is_poisoned());
+    }
+
+    #[test]
+    fn durable_expire_reopen_repeat_is_idempotent_with_zero_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = test_log_path(temp.path());
+        let mut store = PersistentHistoryStore::new();
+        let mut log = DurableHistoryLog::open(&path).unwrap();
+        let history = store.create_history_durable(&mut log).unwrap();
+        let v0 = match store
+            .append_durable(&mut log, history, None, b"expire-durable", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("durable root must create")
+            }
+        };
+        let v1 = match store
+            .fork_durable(&mut log, history, v0.id(), Some(b"req-e"), None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("durable fork must create")
+            }
+        };
+        let counters_before = store.work_counters();
+        assert!(matches!(
+            store.expire_durable(&mut log, v0.id()),
+            Ok(ExpireOutcome::Expired)
+        ));
+        let counters_after = store.work_counters();
+        assert_eq!(
+            counters_after.nodes_allocated,
+            counters_before.nodes_allocated
+        );
+        assert_eq!(
+            counters_after.nodes_inspected,
+            counters_before.nodes_inspected
+        );
+        assert_eq!(
+            counters_after.payload_bytes_written,
+            counters_before.payload_bytes_written
+        );
+        // The fork receipt is untouched (different result version); expiry of
+        // the fork result would retire it instead (covered live above).
+        assert_eq!(
+            store.request_receipt_status(b"req-e"),
+            RequestReceiptStatus::Active(v1.id())
+        );
+        // Repeated durable expiration writes zero new authority bytes.
+        let len_before = std::fs::metadata(&path).unwrap().len();
+        assert!(matches!(
+            store.expire_durable(&mut log, v0.id()),
+            Ok(ExpireOutcome::AlreadyExpired)
+        ));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len_before);
+        assert!(!store.is_poisoned());
+        // Unknown versions fail closed without WAL bytes.
+        assert!(matches!(
+            store.expire_durable(&mut log, VersionId::new(99)),
+            Err(DurableError::Rejected(HistoryError::Invalid(_)))
+        ));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len_before);
+        drop(store);
+        drop(log);
+        let bytes = std::fs::read(&path).unwrap();
+        let reopened = recover_history_store(&bytes).unwrap();
+        assert_eq!(reopened.is_expired(v0.id()), Ok(true));
+        assert_eq!(reopened.is_retained(v1.id()), Ok(true));
+        assert_eq!(
+            reopened.request_receipt_status(b"req-e"),
+            RequestReceiptStatus::Active(v1.id())
+        );
+        // Repeated expiration after reopen stays idempotent.
+        let mut store = reopened;
+        let mut log = DurableHistoryLog::open(&path).unwrap();
+        let len_reopen = std::fs::metadata(&path).unwrap().len();
+        assert!(matches!(
+            store.expire_durable(&mut log, v0.id()),
+            Ok(ExpireOutcome::AlreadyExpired)
+        ));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len_reopen);
+    }
+
+    #[test]
+    fn live_execution_and_genesis_replay_agree_on_horizon() {
+        // E4.21: eviction is a deterministic consequence of replay order —
+        // live maps, retired maps, receipt order, and lifecycle must match
+        // genesis replay exactly, including retire and expire effects.
+        let temp = tempfile::tempdir().unwrap();
+        let path = test_log_path(temp.path());
+        let mut store = PersistentHistoryStore::new();
+        let mut log = DurableHistoryLog::open(&path).unwrap();
+        let history = store.create_history_durable(&mut log).unwrap();
+        let v0 = match store
+            .append_durable(&mut log, history, None, b"determinism", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("durable root must create")
+            }
+        };
+        for index in 0..24 {
+            match store
+                .fork_durable(
+                    &mut log,
+                    history,
+                    v0.id(),
+                    Some(&fork_request_id(index)),
+                    None,
+                )
+                .unwrap()
+            {
+                CommitOutcome::Committed(_) => {}
+                CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                    panic!("fresh fork must create")
+                }
+            }
+        }
+        store.retire_durable(&mut log, &fork_request_id(3)).unwrap();
+        store.retire_durable(&mut log, &fork_request_id(7)).unwrap();
+        assert!(matches!(
+            store.expire_durable(&mut log, VersionId::new(5)),
+            Ok(ExpireOutcome::Expired)
+        ));
+        // Expiring V5 (created by horizon-req-00004) retires that receipt live.
+        assert_eq!(
+            store.request_receipt_status(&fork_request_id(4)),
+            RequestReceiptStatus::Retired
+        );
+        // Capture the genuine live maps before teardown.
+        let live_active = store.active_requests.clone();
+        let live_retired = store.retired_requests.clone();
+        let live_order: Vec<Vec<u8>> = store.receipt_order.iter().cloned().collect();
+        let live_expired = store.expired_versions.clone();
+        let live_versions = store.versions.clone();
+        drop(store);
+        let bytes = log.read_all().unwrap();
+        drop(log);
+        let replayed = recover_history_store(&bytes).unwrap();
+        assert_eq!(replayed.active_requests, live_active);
+        assert_eq!(replayed.retired_requests, live_retired);
+        assert_eq!(
+            replayed.receipt_order.iter().cloned().collect::<Vec<_>>(),
+            live_order
+        );
+        assert_eq!(replayed.expired_versions, live_expired);
+        assert_eq!(replayed.versions, live_versions);
+        // Spot behavior: active replays, retired retires, expired result's
+        // receipt retires, unknown conflicts appropriately.
+        let mut probe = replayed;
+        assert!(matches!(
+            probe.fork(history, v0.id(), Some(&fork_request_id(0)), None),
+            Ok(CommitOutcome::Replayed(_))
+        ));
+        assert_eq!(
+            probe.fork(history, v0.id(), Some(&fork_request_id(3)), None),
+            Ok(CommitOutcome::Retired)
+        );
+        assert_eq!(
+            probe.fork(history, v0.id(), Some(&fork_request_id(4)), None),
+            Ok(CommitOutcome::Retired)
+        );
+    }
+
+    #[test]
+    fn expire_wal_corruption_vectors_fail_closed() {
+        fn expire_frame(history: HistoryId, version: VersionId) -> Vec<u8> {
+            durable_log::encode_history_log_frame(
+                &durable_log::encode_history_log_record(&HistoryLogRecord::ExpireVersion {
+                    history,
+                    version,
+                })
+                .unwrap(),
+            )
+            .unwrap()
+        }
+        fn base_log() -> (Vec<u8>, HistoryId, HistoryId) {
+            let mut store = PersistentHistoryStore::new();
+            let first = store.create_history().unwrap();
+            let second = store.create_history().unwrap();
+            append_new(&mut store, first, None, b"first-base");
+            append_new(&mut store, second, None, b"second-base");
+            let mut bytes = durable_log::encode_history_log_frame(
+                &durable_log::encode_history_log_record(&HistoryLogRecord::CreateHistory {
+                    history: first,
+                    binding: None,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            bytes.extend_from_slice(
+                &durable_log::encode_history_log_frame(
+                    &durable_log::encode_history_log_record(&HistoryLogRecord::CreateHistory {
+                        history: second,
+                        binding: None,
+                    })
+                    .unwrap(),
+                )
+                .unwrap(),
+            );
+            let first_digest = history_splice_digest(first, None, 0, 0, b"first-base", None);
+            bytes.extend_from_slice(
+                &durable_log::encode_history_log_frame(
+                    &durable_log::encode_history_log_record(&HistoryLogRecord::Splice {
+                        history: first,
+                        version: VersionId::new(0),
+                        parent: None,
+                        offset: 0,
+                        delete_len: 0,
+                        insert: b"first-base".to_vec(),
+                        request_id: None,
+                        binding: None,
+                        digest: first_digest,
+                    })
+                    .unwrap(),
+                )
+                .unwrap(),
+            );
+            let second_digest = history_splice_digest(second, None, 0, 0, b"second-base", None);
+            bytes.extend_from_slice(
+                &durable_log::encode_history_log_frame(
+                    &durable_log::encode_history_log_record(&HistoryLogRecord::Splice {
+                        history: second,
+                        version: VersionId::new(1),
+                        parent: None,
+                        offset: 0,
+                        delete_len: 0,
+                        insert: b"second-base".to_vec(),
+                        request_id: None,
+                        binding: None,
+                        digest: second_digest,
+                    })
+                    .unwrap(),
+                )
+                .unwrap(),
+            );
+            (bytes, first, second)
+        }
+        // Control: honest expiration replays to an expired V0.
+        let (mut honest, first, second) = base_log();
+        honest.extend_from_slice(&expire_frame(first, VersionId::new(0)));
+        let recovered = recover_history_store(&honest).unwrap();
+        assert_eq!(recovered.is_expired(VersionId::new(0)), Ok(true));
+        assert_eq!(recovered.is_retained(VersionId::new(1)), Ok(true));
+        // Unknown version.
+        let (base, _, _) = base_log();
+        let mut bad = base.clone();
+        bad.extend_from_slice(&expire_frame(first, VersionId::new(99)));
+        assert!(recover_history_store(&bad).is_err());
+        // Wrong history for a known version.
+        let mut crossed = base.clone();
+        crossed.extend_from_slice(&expire_frame(second, VersionId::new(0)));
+        assert!(recover_history_store(&crossed).is_err());
+        // Unknown history.
+        let mut lost = base;
+        lost.extend_from_slice(&expire_frame(HistoryId::new(99), VersionId::new(0)));
+        assert!(recover_history_store(&lost).is_err());
+        // Duplicate expiration frames stay idempotent, not an error.
+        let mut twice = honest.clone();
+        twice.extend_from_slice(&expire_frame(first, VersionId::new(0)));
+        assert!(recover_history_store(&twice).is_ok());
+        // Truncated expire body fails closed.
+        let encoded = durable_log::encode_history_log_record(&HistoryLogRecord::ExpireVersion {
+            history: first,
+            version: VersionId::new(0),
+        })
+        .unwrap();
+        assert!(durable_log::decode_history_log_record(&encoded[..encoded.len() - 1]).is_err());
+        let mut trailed = encoded.clone();
+        trailed.push(0x00);
+        assert!(durable_log::decode_history_log_record(&trailed).is_err());
+    }
+
+    #[test]
+    fn snapshot_horizon_round_trip_preserves_exact_receipt_state() {
+        // E4.29 (store-level): 4100 receipts with mixed retire/expire, then
+        // snapshot encode/decode/import must preserve count, statuses,
+        // order, and behavior — without resurrecting the 4 evicted receipts.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"snapshot-horizon");
+        let mut committed = Vec::new();
+        for index in 0..4100 {
+            let version = fork_new(
+                &mut store,
+                history,
+                v0.id(),
+                Some(&fork_request_id(index)),
+                None,
+            );
+            committed.push(version);
+        }
+        store.retire_request(&fork_request_id(100)).unwrap();
+        store.retire_request(&fork_request_id(200)).unwrap();
+        expire_new(&mut store, committed[300].id());
+        assert_eq!(store.request_receipt_count(), 4096);
+        // Evicted: req-0..req-3. Oldest retained: req-4.
+        assert_eq!(
+            store.request_receipt_status(&fork_request_id(3)),
+            RequestReceiptStatus::Unknown
+        );
+        assert_eq!(
+            store.request_receipt_status(&fork_request_id(4)),
+            RequestReceiptStatus::Active(committed[4].id())
+        );
+        assert_eq!(
+            store.request_receipt_status(&fork_request_id(100)),
+            RequestReceiptStatus::Retired
+        );
+        assert_eq!(
+            store.request_receipt_status(&fork_request_id(300)),
+            RequestReceiptStatus::Retired
+        );
+        let order_before: Vec<Vec<u8>> = store.receipt_order.iter().cloned().collect();
+        assert_eq!(order_before.len(), 4096);
+        assert_eq!(order_before[0], fork_request_id(4));
+        assert_eq!(order_before[4095], fork_request_id(4099));
+        let bytes = snapshot::encode_history_snapshot(&store, 2, 8192).unwrap();
+        let snapshot = snapshot::decode_history_snapshot(&bytes).unwrap();
+        assert_eq!(snapshot.receipt_order, order_before);
+        let mut imported = PersistentHistoryStore::import_snapshot(snapshot).unwrap();
+        assert_eq!(imported.request_receipt_count(), 4096);
+        assert_eq!(
+            imported.request_receipt_status(&fork_request_id(3)),
+            RequestReceiptStatus::Unknown
+        );
+        assert_eq!(
+            imported.request_receipt_status(&fork_request_id(4)),
+            RequestReceiptStatus::Active(committed[4].id())
+        );
+        assert_eq!(
+            imported.request_receipt_status(&fork_request_id(100)),
+            RequestReceiptStatus::Retired
+        );
+        assert_eq!(
+            imported.request_receipt_status(&fork_request_id(300)),
+            RequestReceiptStatus::Retired
+        );
+        assert_eq!(
+            imported.receipt_order.iter().cloned().collect::<Vec<_>>(),
+            order_before
+        );
+        assert_eq!(imported.is_expired(committed[300].id()), Ok(true));
+        // Behavior parity: retained replay, retired retire, evicted fresh.
+        assert_eq!(
+            imported.fork(history, v0.id(), Some(&fork_request_id(4)), None),
+            Ok(CommitOutcome::Replayed(committed[4]))
+        );
+        assert_eq!(
+            imported.fork(history, v0.id(), Some(&fork_request_id(100)), None),
+            Ok(CommitOutcome::Retired)
+        );
+        assert!(matches!(
+            imported.fork(history, v0.id(), Some(&fork_request_id(3)), None),
+            Ok(CommitOutcome::Committed(_))
+        ));
+        // Snapshot-only reopen did not resurrect evicted receipts.
+        assert_eq!(imported.request_receipt_count(), 4096);
+    }
+
+    #[test]
+    fn snapshot_receipt_corruption_vectors_fail_closed() {
+        // Each vector keeps wire integrity (struct round trip) while breaking
+        // exactly one horizon invariant: decode and import must both fail.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"corrupt-horizon");
+        let v1 = fork_new(&mut store, history, v0.id(), Some(b"req-a"), None);
+        let v2 = fork_new(&mut store, history, v0.id(), Some(b"req-b"), None);
+        let _ = v2;
+        store.retire_request(b"req-b").unwrap();
+        let honest_bytes = snapshot::encode_history_snapshot(&store, 0, 0).unwrap();
+        let honest = snapshot::decode_history_snapshot(&honest_bytes).unwrap();
+        assert_eq!(
+            honest.receipt_order,
+            vec![b"req-a".to_vec(), b"req-b".to_vec()]
+        );
+        let round_trip = |forged: snapshot::HistorySnapshot| {
+            let bytes = snapshot::encode_history_snapshot_struct(&forged).unwrap();
+            let decoded = snapshot::decode_history_snapshot(&bytes);
+            let imported = PersistentHistoryStore::import_snapshot(forged);
+            (decoded.is_err(), imported.is_err())
+        };
+        // Order missing the active ID.
+        let mut forged = honest.clone();
+        forged.receipt_order.remove(0);
+        assert_eq!(round_trip(forged), (true, true));
+        // Order missing the retired ID.
+        let mut forged = honest.clone();
+        forged.receipt_order.remove(1);
+        assert_eq!(round_trip(forged), (true, true));
+        // Order duplicate ID.
+        let mut forged = honest.clone();
+        forged.receipt_order.push(b"req-a".to_vec());
+        assert_eq!(round_trip(forged), (true, true));
+        // Order ID present in neither ledger.
+        let mut forged = honest.clone();
+        forged.receipt_order[1] = b"req-ghost".to_vec();
+        assert_eq!(round_trip(forged), (true, true));
+        // Ledger ID absent from the order (extra active entry, order short).
+        let mut forged = honest.clone();
+        forged.active.push(snapshot::SnapshotActive {
+            request_id: b"req-extra".to_vec(),
+            digest: history_fork_digest(history, v0.id(), None),
+            version: v1.id(),
+        });
+        assert_eq!(round_trip(forged), (true, true));
+        // Active receipt referencing an expired version.
+        let mut forged = honest.clone();
+        forged.versions[1].lifecycle = VersionLifecycle::Expired;
+        assert_eq!(round_trip(forged), (true, true));
+        // Active receipt referencing a missing version.
+        let mut forged = honest.clone();
+        forged.active[0].version = VersionId::new(99);
+        // Struct encode rejects the dangling reference before decode runs;
+        // import of the struct still fails closed.
+        assert!(snapshot::encode_history_snapshot_struct(&forged).is_err());
+        assert!(PersistentHistoryStore::import_snapshot(forged).is_err());
+        // Two active receipts claiming one version.
+        let mut forged = honest.clone();
+        forged.active.push(snapshot::SnapshotActive {
+            request_id: b"req-clone".to_vec(),
+            digest: forged.active[0].digest,
+            version: v1.id(),
+        });
+        forged.receipt_order.push(b"req-clone".to_vec());
+        assert_eq!(round_trip(forged), (true, true));
+        // Active/retired overlap (single-entry retired keeps wire order).
+        let mut forged = honest.clone();
+        forged.retired[0].request_id = b"req-a".to_vec();
+        forged.retired[0].digest = forged.active[0].digest;
+        assert_eq!(round_trip(forged), (true, true));
+        // Receipt count beyond capacity with valid integrity.
+        let mut forged = honest.clone();
+        forged.receipt_order = (0..4097)
+            .map(|index| format!("flood-{index:05}").into_bytes())
+            .collect();
+        forged.active = forged
+            .receipt_order
+            .iter()
+            .map(|id| snapshot::SnapshotActive {
+                request_id: id.clone(),
+                digest: [0x11; 32],
+                version: v0.id(),
+            })
+            .collect();
+        forged.retired = Vec::new();
+        assert_eq!(round_trip(forged), (true, true));
     }
 }

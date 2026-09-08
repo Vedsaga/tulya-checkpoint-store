@@ -11,27 +11,35 @@
 //! ```text
 //! magic[4] = THS1
 //! total_len[u64]          (exact byte length of the whole artifact)
-//! schema[u32] = 3         (staging epoch: 1 = pre-E2 append grammar, rejected;
-//!                          2 = E2 splice-only grammar, rejected: an E3 sealed
-//!                          snapshot may catalogue a forked child sharing its
-//!                          parent root, which E2 binaries cannot interpret)
+//! schema[u32] = 4         (staging epoch: 1 = pre-E2 append grammar, rejected;
+//!                          2 = E2 splice-only grammar, rejected; 3 = E3
+//!                          fork grammar without lifecycle/receipt bounds,
+//!                          rejected: an E4 snapshot may mark versions expired
+//!                          and prunes receipts to the staging horizon, which
+//!                          E3 binaries cannot interpret)
 //! generation[u64]
 //! represented_wal_end[u64](exact hot-log prefix byte length represented)
 //! history_count[u64]
 //! version_count[u64]
 //! active_count[u64]
 //! retired_count[u64]
+//! receipt_order_count[u64]
 //! image_len[u64]
 //! next_history_id[u64]
 //! next_version_id[u64]
 //! histories:  per entry: binding-present[u8] + len[u64] + bytes
 //! versions:   per entry: history[u64] + parent[u64, MAX = none] +
-//!                            binding-present[u8] + len[u64] + bytes
+//!                            binding-present[u8] + len[u64] + bytes +
+//!                            lifecycle[u8] (0 = retained, 1 = expired)
 //! active:     per entry, strictly ascending request id:
 //!             req_len[u64] + req + digest[32] + version[u64]
 //! retired:    per entry, strictly ascending request id:
 //!             req_len[u64] + req + digest[32]
-//! image[..]               (canonical T2I2 bytes, empty iff no versions)
+//! receipt_order: oldest-to-newest retained receipt ids, in insertion order:
+//!             per entry: req_len[u64] + req
+//! image[..]               (canonical T2I2 bytes, empty iff no versions;
+//!                          may still cover expired versions: expiration
+//!                          reclaims nothing, E5 owns reclamation)
 //! sha256[32] over everything before it
 //! ```
 //!
@@ -39,21 +47,23 @@
 //! bindings are opaque bytes the core never interprets.
 
 use super::{
-    HistoryError, HistoryId, PersistentHistoryStore, VersionId, MAX_HISTORY_BINDING_BYTES,
-    MAX_HISTORY_REQUEST_ID_BYTES,
+    HistoryError, HistoryId, PersistentHistoryStore, VersionId, VersionLifecycle,
+    MAX_HISTORY_BINDING_BYTES, MAX_HISTORY_REQUEST_ID_BYTES, STAGING_REQUEST_RECEIPT_CAPACITY,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
 const HISTORY_SNAPSHOT_MAGIC: [u8; 4] = *b"THS1";
-/// Staging snapshot schema epoch: 3 covers the splice + fork operation
-/// grammar. Schema-1 snapshots carry append-grammar request digests and
-/// schema-2 snapshots carry splice-only catalogues; both fail closed at
-/// decode because an E3 snapshot may catalogue a forked child sharing its
-/// parent root. There is deliberately no migration (zero external users).
+/// Staging snapshot schema epoch: 4 covers splice + fork plus version
+/// lifecycle and the bounded receipt horizon. Schemas 1-3 fail closed at
+/// decode: schema-1 carries append-grammar digests, schema-2 carries
+/// splice-only catalogues, and schema-3 carries unbounded receipts with no
+/// lifecycle marks — an E4 snapshot may mark versions expired and prune
+/// receipts to the staging horizon, which older binaries cannot interpret.
+/// There is deliberately no migration (zero external users).
 /// NOT a release format version; E9 freezes release Format v1.
-const HISTORY_SNAPSHOT_SCHEMA: u32 = 3;
-const HISTORY_SNAPSHOT_HEADER_SIZE: usize = 88;
+const HISTORY_SNAPSHOT_SCHEMA: u32 = 4;
+const HISTORY_SNAPSHOT_HEADER_SIZE: usize = 96;
 const HISTORY_SNAPSHOT_DIGEST_DOMAIN: &[u8] = b"tulya-history/v1/snapshot\0";
 const NO_PARENT: u64 = u64::MAX;
 
@@ -62,6 +72,9 @@ pub struct SnapshotVersion {
     pub history: HistoryId,
     pub parent: Option<VersionId>,
     pub binding: Option<Vec<u8>>,
+    /// One-way lifecycle mark. The immutable `Version` itself is unchanged;
+    /// this byte is the separate lifecycle metadata E4 adds.
+    pub lifecycle: VersionLifecycle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +100,9 @@ pub struct HistorySnapshot {
     pub versions: Vec<SnapshotVersion>,
     pub active: Vec<SnapshotActive>,
     pub retired: Vec<SnapshotRetired>,
+    /// Oldest-to-newest retained receipt identities, in insertion order
+    /// (not sorted): replay, retire, and expiration never reorder.
+    pub receipt_order: Vec<Vec<u8>>,
     pub image: Vec<u8>,
 }
 
@@ -172,7 +188,19 @@ pub fn encode_history_snapshot(
             history: record.history(),
             parent: record.parent(),
             binding: store.version_bindings.get(&record.id()).cloned(),
+            lifecycle: if store.expired_versions.contains(&record.id()) {
+                VersionLifecycle::Expired
+            } else {
+                VersionLifecycle::Retained
+            },
         });
+    }
+    // The live horizon invariant the decoder rechecks: every retained
+    // receipt appears exactly once in insertion order.
+    if store.receipt_order.len() != store.active_requests.len() + store.retired_requests.len() {
+        return Err(HistoryError::Invalid(
+            "history snapshot source receipt order disagrees with its ledgers",
+        ));
     }
     let snapshot = HistorySnapshot {
         generation,
@@ -196,6 +224,7 @@ pub fn encode_history_snapshot(
                 digest: **digest,
             })
             .collect(),
+        receipt_order: store.receipt_order.iter().cloned().collect(),
         image,
     };
     encode_history_snapshot_struct(&snapshot)
@@ -233,6 +262,12 @@ pub fn encode_history_snapshot_struct(snapshot: &HistorySnapshot) -> Result<Vec<
         put_u64(&mut body, record.history.id())?;
         put_u64(&mut body, record.parent.map_or(NO_PARENT, VersionId::id))?;
         put_optional_bytes(&mut body, record.binding.as_deref())?;
+        body.try_reserve_exact(1)
+            .map_err(|_| HistoryError::Capacity("history snapshot allocation failed"))?;
+        body.push(match record.lifecycle {
+            VersionLifecycle::Retained => 0,
+            VersionLifecycle::Expired => 1,
+        });
     }
     let mut previous_active: Option<&[u8]> = None;
     for record in &snapshot.active {
@@ -275,6 +310,14 @@ pub fn encode_history_snapshot_struct(snapshot: &HistorySnapshot) -> Result<Vec<
         previous_retired = Some(&record.request_id);
         put_bytes(&mut body, &record.request_id)?;
         body.extend_from_slice(&record.digest);
+    }
+    for request_id in &snapshot.receipt_order {
+        if request_id.is_empty() || request_id.len() > MAX_HISTORY_REQUEST_ID_BYTES {
+            return Err(HistoryError::Invalid(
+                "history snapshot request identity is outside bounds",
+            ));
+        }
+        put_bytes(&mut body, request_id)?;
     }
     if snapshot.versions.is_empty() && !snapshot.image.is_empty() {
         return Err(HistoryError::Invalid(
@@ -322,6 +365,12 @@ pub fn encode_history_snapshot_struct(snapshot: &HistorySnapshot) -> Result<Vec<
         &mut output,
         u64::try_from(snapshot.retired.len())
             .map_err(|_| HistoryError::Overflow("history snapshot retired count exceeds u64"))?,
+    )?;
+    put_u64(
+        &mut output,
+        u64::try_from(snapshot.receipt_order.len()).map_err(|_| {
+            HistoryError::Overflow("history snapshot receipt order length exceeds u64")
+        })?,
     )?;
     put_u64(
         &mut output,
@@ -383,6 +432,8 @@ pub fn decode_history_snapshot(bytes: &[u8]) -> Result<HistorySnapshot, HistoryE
     let version_count = cursor.bounded_count("history snapshot version count is excessive")?;
     let active_count = cursor.bounded_count("history snapshot active count is excessive")?;
     let retired_count = cursor.bounded_count("history snapshot retired count is excessive")?;
+    let receipt_order_count =
+        cursor.bounded_count("history snapshot receipt order is excessive")?;
     let image_len = cursor.bounded_count("history snapshot image length is excessive")?;
     let next_history_id = cursor.take_u64()?;
     let next_version_id = cursor.take_u64()?;
@@ -449,10 +500,21 @@ pub fn decode_history_snapshot(bytes: &[u8]) -> Result<HistorySnapshot, HistoryE
             }
             Some(VersionId::new(raw_parent))
         };
+        let binding = cursor.take_optional_bytes()?;
+        let lifecycle = match cursor.take(1)? {
+            [0] => VersionLifecycle::Retained,
+            [1] => VersionLifecycle::Expired,
+            _ => {
+                return Err(HistoryError::Invalid(
+                    "history snapshot version lifecycle is unsupported",
+                ));
+            }
+        };
         versions.push(SnapshotVersion {
             history: HistoryId::new(history),
             parent,
-            binding: cursor.take_optional_bytes()?,
+            binding,
+            lifecycle,
         });
     }
     let mut active: Vec<SnapshotActive> = Vec::new();
@@ -511,12 +573,20 @@ pub fn decode_history_snapshot(bytes: &[u8]) -> Result<HistorySnapshot, HistoryE
         let digest = cursor.take_array::<32>()?;
         retired.push(SnapshotRetired { request_id, digest });
     }
+    let mut receipt_order: Vec<Vec<u8>> = Vec::new();
+    receipt_order
+        .try_reserve_exact(receipt_order_count)
+        .map_err(|_| HistoryError::Capacity("history snapshot table allocation failed"))?;
+    for _ in 0..receipt_order_count {
+        receipt_order.push(cursor.take_request_id()?);
+    }
     let image = cursor.take(image_len)?.to_vec();
     if versions.is_empty() && !image.is_empty() {
         return Err(HistoryError::Invalid(
             "history snapshot image without versions is malformed",
         ));
     }
+    validate_snapshot_receipt_consistency(&versions, &active, &retired, &receipt_order)?;
     let digest_start = bytes.len().checked_sub(32).ok_or(HistoryError::Invalid(
         "history snapshot digest is truncated",
     ))?;
@@ -542,8 +612,100 @@ pub fn decode_history_snapshot(bytes: &[u8]) -> Result<HistorySnapshot, HistoryE
         versions,
         active,
         retired,
+        receipt_order,
         image,
     })
+}
+
+/// Validates the bounded receipt horizon as a whole: capacity, exact
+/// two-way agreement between the order and the ledgers, ledger disjointness,
+/// and the live-execution invariant that every active receipt resolves to a
+/// known retained version with no version claimed twice.
+///
+/// Shared by decode (wire bytes) and import (already-built structs, which
+/// may not have come from decode), so forged structs fail closed on both
+/// paths.
+pub(crate) fn validate_snapshot_receipt_consistency(
+    versions: &[SnapshotVersion],
+    active: &[SnapshotActive],
+    retired: &[SnapshotRetired],
+    receipt_order: &[Vec<u8>],
+) -> Result<(), HistoryError> {
+    if receipt_order.len() > STAGING_REQUEST_RECEIPT_CAPACITY {
+        return Err(HistoryError::Invalid(
+            "history snapshot receipt horizon exceeds its staging capacity",
+        ));
+    }
+    let mut ordered: HashSet<&[u8]> = HashSet::new();
+    ordered
+        .try_reserve(receipt_order.len())
+        .map_err(|_| HistoryError::Capacity("history snapshot table allocation failed"))?;
+    for id in receipt_order {
+        if !ordered.insert(id.as_slice()) {
+            return Err(HistoryError::Invalid(
+                "history snapshot receipt order is duplicated",
+            ));
+        }
+    }
+    if ordered.len() != active.len() + retired.len() {
+        return Err(HistoryError::Invalid(
+            "history snapshot receipt order disagrees with its ledgers",
+        ));
+    }
+    let mut active_ids: HashSet<&[u8]> = HashSet::new();
+    active_ids
+        .try_reserve(active.len())
+        .map_err(|_| HistoryError::Capacity("history snapshot table allocation failed"))?;
+    for record in active {
+        if !ordered.contains(record.request_id.as_slice()) {
+            return Err(HistoryError::Invalid(
+                "history snapshot active request is absent from its receipt order",
+            ));
+        }
+        if !active_ids.insert(record.request_id.as_slice()) {
+            return Err(HistoryError::Invalid(
+                "history snapshot active request identity is duplicated",
+            ));
+        }
+    }
+    for record in retired {
+        if !ordered.contains(record.request_id.as_slice()) {
+            return Err(HistoryError::Invalid(
+                "history snapshot retired request is absent from its receipt order",
+            ));
+        }
+        if active_ids.contains(record.request_id.as_slice()) {
+            return Err(HistoryError::Invalid(
+                "history snapshot request identity is both active and retired",
+            ));
+        }
+    }
+    // Every active receipt must resolve to a known retained version claimed
+    // by no other active receipt: expiring a result retires its receipt, so
+    // a valid snapshot never parks an active receipt on an expired version,
+    // and live execution creates at most one receipt per version.
+    let mut claimed: HashSet<u64> = HashSet::new();
+    claimed
+        .try_reserve(active.len())
+        .map_err(|_| HistoryError::Capacity("history snapshot table allocation failed"))?;
+    for record in active {
+        let entry = versions
+            .get(record.version.id() as usize)
+            .ok_or(HistoryError::Invalid(
+                "history snapshot active request references a missing version",
+            ))?;
+        if entry.lifecycle != VersionLifecycle::Retained {
+            return Err(HistoryError::Invalid(
+                "history snapshot active request references an expired version",
+            ));
+        }
+        if !claimed.insert(record.version.id()) {
+            return Err(HistoryError::Invalid(
+                "history snapshot active requests claim one version twice",
+            ));
+        }
+    }
+    Ok(())
 }
 
 struct SnapshotCursor<'a> {
@@ -874,6 +1036,36 @@ mod tests {
         ));
         // Import rejects the struct even without the wire round trip.
         assert!(PersistentHistoryStore::import_snapshot(forged).is_err());
+    }
+
+    #[test]
+    fn invalid_lifecycle_byte_fails_closed_with_valid_integrity() {
+        // Patch a version lifecycle byte to a reserved value and recompute
+        // the artifact digest: integrity passes, so only the lifecycle gate
+        // can reject — proving the gate is load-bearing, not the digest.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        store.append(history, None, b"data", None, None).unwrap();
+        let bytes = encode_history_snapshot(&store, 1, 0).unwrap();
+        let honest = decode_history_snapshot(&bytes).unwrap();
+        assert_eq!(honest.versions.len(), 1);
+        // Versions section starts after the 96-byte header plus the history
+        // table (one entry, no binding: present-flag u64 = 8 bytes): the
+        // entry is history u64 + parent u64 + binding u64 + lifecycle u8.
+        let lifecycle_offset = HISTORY_SNAPSHOT_HEADER_SIZE + 8 + 8 + 8 + 8;
+        assert_eq!(bytes[lifecycle_offset], 0);
+        let mut forged = bytes.clone();
+        forged[lifecycle_offset] = 2;
+        let digest_start = forged.len() - 32;
+        let mut hasher = Sha256::new();
+        hasher.update(HISTORY_SNAPSHOT_DIGEST_DOMAIN);
+        hasher.update(&forged[..digest_start]);
+        let digest = hasher.finalize();
+        forged[digest_start..].copy_from_slice(&digest);
+        assert!(matches!(
+            decode_history_snapshot(&forged),
+            Err(HistoryError::Invalid(_))
+        ));
     }
 
     #[test]

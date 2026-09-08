@@ -33,7 +33,7 @@ use super::{
         HISTORY_MANIFEST_FILE,
     },
     snapshot::{decode_history_snapshot, encode_history_snapshot},
-    CommitOutcome, HistoryError, HistoryId, PersistentHistoryStore, VersionId,
+    CommitOutcome, ExpireOutcome, HistoryError, HistoryId, PersistentHistoryStore, VersionId,
 };
 use fs4::FileExt;
 use std::fs::{self, File, OpenOptions};
@@ -209,6 +209,13 @@ impl WritableHistoryAuthority {
     ) -> Result<CommitOutcome, DurableError> {
         self.store
             .fork_durable(&mut self.hot, history, parent, request_id, binding)
+    }
+
+    /// Durably expires one known version through the owned writable log:
+    /// one-way lifecycle metadata, no cascade, no content change. See
+    /// [`PersistentHistoryStore::expire`].
+    pub fn expire(&mut self, version: VersionId) -> Result<ExpireOutcome, DurableError> {
+        self.store.expire_durable(&mut self.hot, version)
     }
 
     /// Durably retires a request identity through the owned writable log.
@@ -641,6 +648,8 @@ mod tests {
         assert_eq!(actual.next_version_id, expected.next_version_id);
         assert_eq!(actual.active_requests, expected.active_requests);
         assert_eq!(actual.retired_requests, expected.retired_requests);
+        assert_eq!(actual.receipt_order, expected.receipt_order);
+        assert_eq!(actual.expired_versions, expected.expired_versions);
         assert_eq!(actual.history_bindings, expected.history_bindings);
         assert_eq!(actual.version_bindings, expected.version_bindings);
         for version in &expected.versions {
@@ -1405,6 +1414,315 @@ mod tests {
             assert_eq!(output, b"sealed-fork-base");
             reopened.store.verify(got).unwrap();
         }
+    }
+
+    #[test]
+    fn expire_reopen_seal_matrix_preserves_lifecycle() {
+        // Retain V, expire V, close, reopen: still expired. Seal with the
+        // expiration in the suffix, reopen: still expired. Expire, seal,
+        // reopen from snapshot only: still expired with zero suffix.
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority
+            .append(history, None, b"expire-matrix", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        let v1 = authority_forked(&mut authority, history, v0.id());
+        assert_eq!(
+            authority.expire(v0.id()).unwrap(),
+            crate::persistent_history::ExpireOutcome::Expired
+        );
+        assert!(authority.store().is_expired(v0.id()).unwrap());
+        drop(authority);
+        let reopened = open_history_authority(temp.path()).unwrap();
+        assert_eq!(reopened.store.is_expired(v0.id()), Ok(true));
+        assert_eq!(reopened.store.is_retained(v1.id()), Ok(true));
+        // Repeated expiration after reopen writes zero new WAL bytes.
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let hot_len_before =
+            std::fs::metadata(temp.path().join(history_wal_filename(reopened.generation)))
+                .unwrap()
+                .len();
+        assert_eq!(
+            authority.expire(v0.id()).unwrap(),
+            crate::persistent_history::ExpireOutcome::AlreadyExpired
+        );
+        assert_eq!(
+            std::fs::metadata(temp.path().join(history_wal_filename(reopened.generation)))
+                .unwrap()
+                .len(),
+            hot_len_before
+        );
+        // Seal with the expiration in the suffix, then reopen.
+        let summary = authority.seal().unwrap();
+        drop(authority);
+        let sealed = open_history_authority(temp.path()).unwrap();
+        assert_eq!(sealed.generation, summary.generation);
+        assert_eq!(sealed.store.is_expired(v0.id()), Ok(true));
+        assert_eq!(sealed.stats.suffix_bytes, 0);
+    }
+
+    #[test]
+    fn expire_suffix_after_seal_reopens_expired() {
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority
+            .append(history, None, b"suffix-expire", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        authority.seal().unwrap();
+        assert_eq!(
+            authority.expire(v0.id()).unwrap(),
+            crate::persistent_history::ExpireOutcome::Expired
+        );
+        drop(authority);
+        let reopened = open_history_authority(temp.path()).unwrap();
+        assert_eq!(reopened.store.is_expired(v0.id()), Ok(true));
+        assert!(reopened.stats.suffix_bytes > 0);
+        assert_eq!(
+            reopened.store.lookup_version(v0.id()),
+            Err(crate::persistent_history::HistoryError::VersionExpired)
+        );
+    }
+
+    #[test]
+    fn expire_moves_receipt_durable_across_seal_reopen() {
+        // E4.25 durable half: request R creates V1, expire V1, seal, reopen —
+        // R stays retired with identical behavior on both sides of the seal.
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority
+            .append(history, None, b"receipt-expire", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        let v1 = match authority
+            .splice(
+                history,
+                Some(v0.id()),
+                7,
+                0,
+                b"[e]",
+                Some(b"req-seal"),
+                None,
+            )
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("request splice must create")
+            }
+        };
+        authority.expire(v1.id()).unwrap();
+        assert_eq!(
+            authority.store().request_receipt_status(b"req-seal"),
+            crate::persistent_history::RequestReceiptStatus::Retired
+        );
+        authority.seal().unwrap();
+        drop(authority);
+        let reopened = open_history_authority(temp.path()).unwrap();
+        assert_eq!(reopened.store.is_expired(v1.id()), Ok(true));
+        assert_eq!(
+            reopened.store.request_receipt_status(b"req-seal"),
+            crate::persistent_history::RequestReceiptStatus::Retired
+        );
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        assert!(matches!(
+            authority.splice(
+                history,
+                Some(v0.id()),
+                7,
+                0,
+                b"[e]",
+                Some(b"req-seal"),
+                None
+            ),
+            Ok(CommitOutcome::Retired)
+        ));
+        assert!(matches!(
+            authority.splice(
+                history,
+                Some(v0.id()),
+                7,
+                0,
+                b"[x]",
+                Some(b"req-seal"),
+                None
+            ),
+            Err(
+                crate::persistent_history::durable_log::DurableError::Rejected(
+                    crate::persistent_history::HistoryError::RequestConflict
+                )
+            )
+        ));
+    }
+
+    #[test]
+    fn seal_reopen_preserves_horizon_across_capacity() {
+        // E4.29 with a real seal: 4100 request forks, seal, close, reopen —
+        // exact same count, statuses, order, and retry behavior; evicted
+        // receipts stay unknown without resurrection.
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority
+            .append(history, None, b"horizon-seal", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        for index in 0..4100 {
+            let request = format!("seal-req-{index:05}");
+            match authority
+                .fork(history, v0.id(), Some(request.as_bytes()), None)
+                .unwrap()
+            {
+                CommitOutcome::Committed(_) => {}
+                CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                    panic!("fresh fork must create")
+                }
+            }
+        }
+        assert_eq!(authority.store().request_receipt_count(), 4096);
+        let order_before: Vec<Vec<u8>> = authority.store().receipt_order.iter().cloned().collect();
+        authority.seal().unwrap();
+        drop(authority);
+        let reopened = open_history_authority(temp.path()).unwrap();
+        assert_eq!(reopened.stats.snapshot_versions, 4101);
+        assert_eq!(reopened.stats.suffix_bytes, 0);
+        assert_eq!(reopened.store.request_receipt_count(), 4096);
+        assert_eq!(
+            reopened
+                .store
+                .receipt_order
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            order_before
+        );
+        assert_eq!(
+            reopened.store.request_receipt_status(b"seal-req-00003"),
+            crate::persistent_history::RequestReceiptStatus::Unknown
+        );
+        assert!(matches!(
+            reopened.store.request_receipt_status(b"seal-req-00004"),
+            crate::persistent_history::RequestReceiptStatus::Active(_)
+        ));
+        // Retained replay and evicted-fresh behavior survive the seal.
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        assert!(matches!(
+            authority.fork(history, v0.id(), Some(b"seal-req-00004"), None),
+            Ok(CommitOutcome::Replayed(_))
+        ));
+        assert!(matches!(
+            authority.fork(history, v0.id(), Some(b"seal-req-00003"), None),
+            Ok(CommitOutcome::Committed(_))
+        ));
+        assert_eq!(authority.store().request_receipt_count(), 4096);
+    }
+
+    #[test]
+    fn suffix_replay_reproduces_horizon_across_capacity() {
+        // E4.30: seal a base near the horizon, cross the boundary in the hot
+        // suffix, reopen — snapshot + suffix replay equals the live horizon
+        // exactly, with no resurrected receipts.
+        let temp = fixture_dir();
+        let mut live = PersistentHistoryStore::new();
+        let history = live.create_history().unwrap();
+        let v0 = match live
+            .append(history, None, b"suffix-horizon", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        for index in 0..4000 {
+            let request = format!("suffix-req-{index:05}");
+            match live
+                .fork(history, v0.id(), Some(request.as_bytes()), None)
+                .unwrap()
+            {
+                CommitOutcome::Committed(_) => {}
+                CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                    panic!("fresh fork must create")
+                }
+            }
+        }
+        assert_eq!(live.request_receipt_count(), 4000);
+        let summary = seal_history_generation(&mut live, temp.path()).unwrap();
+        assert_eq!(summary.generation, 1);
+        // 200 request forks in the generation-1 hot suffix cross the 4096
+        // boundary: the oldest 104 base receipts evict.
+        let opened = open_history_authority(temp.path()).unwrap();
+        let mut store = opened.store;
+        let mut log = DurableHistoryLog::open(&temp.path().join(history_wal_filename(1))).unwrap();
+        for index in 4000..4200 {
+            let request = format!("suffix-req-{index:05}");
+            match store
+                .fork_durable(&mut log, history, v0.id(), Some(request.as_bytes()), None)
+                .unwrap()
+            {
+                CommitOutcome::Committed(_) => {}
+                CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                    panic!("fresh suffix fork must create")
+                }
+            }
+        }
+        // The live reference performs the same 200 operations in memory.
+        for index in 4000..4200 {
+            let request = format!("suffix-req-{index:05}");
+            match live
+                .fork(history, v0.id(), Some(request.as_bytes()), None)
+                .unwrap()
+            {
+                CommitOutcome::Committed(_) => {}
+                CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                    panic!("fresh live fork must create")
+                }
+            }
+        }
+        assert_eq!(live.request_receipt_count(), 4096);
+        drop(store);
+        drop(log);
+        let reopened = open_history_authority(temp.path()).unwrap();
+        assert_eq!(reopened.store.request_receipt_count(), 4096);
+        assert_eq!(reopened.store.active_requests, live.active_requests);
+        assert_eq!(reopened.store.retired_requests, live.retired_requests);
+        assert_eq!(reopened.store.receipt_order, live.receipt_order);
+        assert_eq!(
+            reopened.store.request_receipt_status(b"suffix-req-00000"),
+            crate::persistent_history::RequestReceiptStatus::Unknown
+        );
+        assert_eq!(
+            reopened.store.request_receipt_status(b"suffix-req-00103"),
+            crate::persistent_history::RequestReceiptStatus::Unknown
+        );
+        assert!(matches!(
+            reopened.store.request_receipt_status(b"suffix-req-00104"),
+            crate::persistent_history::RequestReceiptStatus::Active(_)
+        ));
     }
 
     #[test]
