@@ -584,10 +584,14 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::durable_log::DurableHistoryLog;
+    use super::super::durable_log::{
+        encode_history_log_frame, encode_history_log_record, DurableHistoryLog, HistoryLogRecord,
+    };
     use super::super::manifest::ManifestSealed;
     use super::super::snapshot::{decode_history_snapshot, encode_history_snapshot_struct};
-    use super::super::{CommitOutcome, HistoryId, VersionId};
+    use super::super::{
+        history_fork_digest, history_splice_digest, CommitOutcome, HistoryId, VersionId,
+    };
     use super::*;
 
     fn fixture_dir() -> tempfile::TempDir {
@@ -1722,6 +1726,98 @@ mod tests {
         assert!(matches!(
             reopened.store.request_receipt_status(b"suffix-req-00104"),
             crate::persistent_history::RequestReceiptStatus::Active(_)
+        ));
+    }
+
+    /// Crafts one valid THL4 suffix frame for the current-generation hot
+    /// log: used to prove lifecycle state imported from the sealed base is
+    /// respected by suffix replay.
+    fn append_suffix_frame(dir: &Path, generation: u64, record: &HistoryLogRecord) {
+        let frame = encode_history_log_frame(&encode_history_log_record(record).unwrap()).unwrap();
+        let mut log = DurableHistoryLog::open(&dir.join(history_wal_filename(generation))).unwrap();
+        log.append_frame(&frame).unwrap();
+        log.sync().unwrap();
+    }
+
+    #[test]
+    fn suffix_splice_after_snapshot_expired_parent_is_rejected() {
+        // Seal carries V0 as expired in the snapshot catalogue; a framed,
+        // digest-valid suffix splice V1 from V0 must still fail reopen —
+        // the live authority could never have emitted it.
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority
+            .append(history, None, b"expire-suffix-base", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        authority.expire(v0.id()).unwrap();
+        let summary = authority.seal().unwrap();
+        drop(authority);
+        let digest = history_splice_digest(history, Some(v0.id()), 18, 0, b"[e]", None);
+        append_suffix_frame(
+            temp.path(),
+            summary.generation,
+            &HistoryLogRecord::Splice {
+                history,
+                version: VersionId::new(1),
+                parent: Some(v0.id()),
+                offset: 18,
+                delete_len: 0,
+                insert: b"[e]".to_vec(),
+                request_id: None,
+                binding: None,
+                digest,
+            },
+        );
+        assert!(matches!(
+            open_history_authority(temp.path()),
+            Err(DurableError::Rejected(
+                crate::persistent_history::HistoryError::Invalid(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn suffix_fork_after_snapshot_expired_parent_is_rejected() {
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority
+            .append(history, None, b"expire-suffix-base", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        authority.expire(v0.id()).unwrap();
+        let summary = authority.seal().unwrap();
+        drop(authority);
+        let digest = history_fork_digest(history, v0.id(), None);
+        append_suffix_frame(
+            temp.path(),
+            summary.generation,
+            &HistoryLogRecord::Fork {
+                history,
+                version: VersionId::new(1),
+                parent: v0.id(),
+                request_id: None,
+                binding: None,
+                digest,
+            },
+        );
+        assert!(matches!(
+            open_history_authority(temp.path()),
+            Err(DurableError::Rejected(
+                crate::persistent_history::HistoryError::Invalid(_)
+            ))
         ));
     }
 

@@ -1148,6 +1148,15 @@ impl PersistentHistoryStore {
                         "history log parent version belongs to a different history",
                     ));
                 }
+                // Fresh-operation equivalence: live preview rejects an
+                // expired parent on the fresh path, so replay must reject a
+                // parent already expired by an earlier record — before any
+                // backend inspection, counter advancement, or mutation.
+                if self.expired_versions.contains(&id) {
+                    return Err(HistoryError::Invalid(
+                        "history log splice parent is expired",
+                    ));
+                }
                 let len = self.backend.logical_len(record.root())?.get();
                 (Some(record.root()), len)
             }
@@ -1281,6 +1290,11 @@ impl PersistentHistoryStore {
             return Err(HistoryError::Invalid(
                 "history log fork parent belongs to a different history",
             ));
+        }
+        // Fresh-operation equivalence, mirroring replay_splice: a parent
+        // expired by an earlier record cannot source a fresh replayed fork.
+        if self.expired_versions.contains(&parent) {
+            return Err(HistoryError::Invalid("history log fork parent is expired"));
         }
         let root = parent_record.root();
         if history_fork_digest(history, parent, binding) != digest {
@@ -5597,6 +5611,226 @@ mod tests {
         let mut trailed = encoded.clone();
         trailed.push(0x00);
         assert!(durable_log::decode_history_log_record(&trailed).is_err());
+    }
+
+    /// Builds an integrity-valid THL4 log ending right after `ExpireVersion
+    /// V0`: create, root splice, expire. Callers append one forged fresh
+    /// child operation to prove replay rejects it.
+    fn expired_parent_log_prefix() -> (Vec<u8>, HistoryId, VersionId) {
+        let mut bytes = durable_log::encode_history_log_frame(
+            &durable_log::encode_history_log_record(&HistoryLogRecord::CreateHistory {
+                history: HistoryId::new(0),
+                binding: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let history = HistoryId::new(0);
+        let root_digest = history_splice_digest(history, None, 0, 0, b"expire-base", None);
+        bytes.extend_from_slice(
+            &durable_log::encode_history_log_frame(
+                &durable_log::encode_history_log_record(&HistoryLogRecord::Splice {
+                    history,
+                    version: VersionId::new(0),
+                    parent: None,
+                    offset: 0,
+                    delete_len: 0,
+                    insert: b"expire-base".to_vec(),
+                    request_id: None,
+                    binding: None,
+                    digest: root_digest,
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        bytes.extend_from_slice(
+            &durable_log::encode_history_log_frame(
+                &durable_log::encode_history_log_record(&HistoryLogRecord::ExpireVersion {
+                    history,
+                    version: VersionId::new(0),
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        (bytes, history, VersionId::new(0))
+    }
+
+    fn frame_record(record: &HistoryLogRecord) -> Vec<u8> {
+        durable_log::encode_history_log_frame(
+            &durable_log::encode_history_log_record(record).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn replay_rejects_splice_after_parent_expiration() {
+        // The forged child is valid in every respect except lifecycle
+        // ordering: correct coordinates, correct digest, correct identity,
+        // valid framing. Recovery must fail at the expired-parent gate the
+        // live writer enforces — a sequence the live authority could never
+        // emit.
+        let (mut bytes, history, v0) = expired_parent_log_prefix();
+        let digest = history_splice_digest(history, Some(v0), 11, 0, b"[e]", None);
+        bytes.extend_from_slice(&frame_record(&HistoryLogRecord::Splice {
+            history,
+            version: VersionId::new(1),
+            parent: Some(v0),
+            offset: 11,
+            delete_len: 0,
+            insert: b"[e]".to_vec(),
+            request_id: None,
+            binding: None,
+            digest,
+        }));
+        assert!(matches!(
+            recover_history_store(&bytes),
+            Err(HistoryError::Invalid(
+                "history log splice parent is expired"
+            ))
+        ));
+    }
+
+    #[test]
+    fn replay_rejects_fork_after_parent_expiration() {
+        let (mut bytes, history, v0) = expired_parent_log_prefix();
+        let digest = history_fork_digest(history, v0, None);
+        bytes.extend_from_slice(&frame_record(&HistoryLogRecord::Fork {
+            history,
+            version: VersionId::new(1),
+            parent: v0,
+            request_id: None,
+            binding: None,
+            digest,
+        }));
+        assert!(matches!(
+            recover_history_store(&bytes),
+            Err(HistoryError::Invalid("history log fork parent is expired"))
+        ));
+    }
+
+    #[test]
+    fn replay_expired_parent_rejection_changes_nothing() {
+        // Direct helper regression: the rejection precedes backend work, so
+        // counters, tables, ledgers, and order are all untouched.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"expire-base");
+        expire_new(&mut store, v0.id());
+        let counters_before = store.work_counters();
+        let splice_digest = history_splice_digest(history, Some(v0.id()), 11, 0, b"[e]", None);
+        assert_eq!(
+            store.replay_splice(
+                history,
+                VersionId::new(1),
+                Some(v0.id()),
+                11,
+                0,
+                b"[e]",
+                None,
+                None,
+                splice_digest,
+            ),
+            Err(HistoryError::Invalid(
+                "history log splice parent is expired"
+            ))
+        );
+        let fork_digest = history_fork_digest(history, v0.id(), None);
+        assert_eq!(
+            store.replay_fork(history, VersionId::new(1), v0.id(), None, None, fork_digest),
+            Err(HistoryError::Invalid("history log fork parent is expired"))
+        );
+        assert_eq!(store.next_version_id, 1);
+        assert_eq!(store.versions.len(), 1);
+        assert!(store.active_requests.is_empty());
+        assert!(store.retired_requests.is_empty());
+        assert!(store.receipt_order.is_empty());
+        let counters_after = store.work_counters();
+        assert_eq!(
+            counters_after.nodes_allocated,
+            counters_before.nodes_allocated
+        );
+        assert_eq!(
+            counters_after.nodes_inspected,
+            counters_before.nodes_inspected
+        );
+        assert_eq!(counters_after.nodes_read, counters_before.nodes_read);
+        assert_eq!(
+            counters_after.payload_bytes_read,
+            counters_before.payload_bytes_read
+        );
+        assert_eq!(
+            counters_after.payload_bytes_written,
+            counters_before.payload_bytes_written
+        );
+        assert!(!store.is_poisoned());
+    }
+
+    #[test]
+    fn replay_accepts_operation_before_expiration() {
+        // Valid ordering control: child operations committed before the
+        // parent expires replay fine — only expire-then-child is impossible.
+        let history = HistoryId::new(0);
+        let mut bytes = durable_log::encode_history_log_frame(
+            &durable_log::encode_history_log_record(&HistoryLogRecord::CreateHistory {
+                history,
+                binding: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let root_digest = history_splice_digest(history, None, 0, 0, b"expire-base", None);
+        bytes.extend_from_slice(&frame_record(&HistoryLogRecord::Splice {
+            history,
+            version: VersionId::new(0),
+            parent: None,
+            offset: 0,
+            delete_len: 0,
+            insert: b"expire-base".to_vec(),
+            request_id: None,
+            binding: None,
+            digest: root_digest,
+        }));
+        let child_digest =
+            history_splice_digest(history, Some(VersionId::new(0)), 11, 0, b"[e]", None);
+        bytes.extend_from_slice(&frame_record(&HistoryLogRecord::Splice {
+            history,
+            version: VersionId::new(1),
+            parent: Some(VersionId::new(0)),
+            offset: 11,
+            delete_len: 0,
+            insert: b"[e]".to_vec(),
+            request_id: None,
+            binding: None,
+            digest: child_digest,
+        }));
+        let fork_digest = history_fork_digest(history, VersionId::new(0), None);
+        bytes.extend_from_slice(&frame_record(&HistoryLogRecord::Fork {
+            history,
+            version: VersionId::new(2),
+            parent: VersionId::new(0),
+            request_id: None,
+            binding: None,
+            digest: fork_digest,
+        }));
+        bytes.extend_from_slice(&frame_record(&HistoryLogRecord::ExpireVersion {
+            history,
+            version: VersionId::new(0),
+        }));
+        let recovered = recover_history_store(&bytes).unwrap();
+        assert_eq!(recovered.versions.len(), 3);
+        assert_eq!(recovered.is_expired(VersionId::new(0)), Ok(true));
+        assert_eq!(recovered.is_retained(VersionId::new(1)), Ok(true));
+        assert_eq!(recovered.is_retained(VersionId::new(2)), Ok(true));
+        // The retained child of the expired parent still names it.
+        assert_eq!(
+            recovered
+                .lookup_version(VersionId::new(1))
+                .unwrap()
+                .parent(),
+            Some(VersionId::new(0))
+        );
     }
 
     #[test]
