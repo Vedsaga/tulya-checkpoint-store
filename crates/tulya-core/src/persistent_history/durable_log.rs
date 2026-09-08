@@ -10,13 +10,15 @@
 //! replaying every fresh request-bearing splice/fork under the fixed staging
 //! capacity, so live execution and genesis replay land on identical horizons.
 //!
-//! Staging epoch note: the `THL4` magic and the splice/fork/expire records
-//! below replace the E3 `THL3` grammar. Old staging logs fail closed at the
-//! frame magic and are never reinterpreted; there is deliberately no
-//! migration parser (zero external users). An E3 binary retains receipts
-//! forever and does not understand version expiration — so the epoch gate,
-//! not unknown-tag rejection, is what keeps pre-E4 code from reading E4
-//! authority.
+//! Staging epoch note: the `THL5` magic replaces the E5 `THL4` grammar.
+//! Old staging logs fail closed at the frame magic and are never
+//! reinterpreted; there is deliberately no migration parser (zero external
+//! users). The splice record gains authoritative physical placement and
+//! frontier fields (E6); fork/expire/retire/create keep their logical
+//! semantics with no new fields. A splice record whose physical placement is
+//! absent names an ephemeral memory-backend operation (tests/tooling), never
+//! durable authority: physical backends reject it, and memory backends
+//! reject a present placement.
 //!
 //! Frame layout (all integers little-endian):
 //!
@@ -38,7 +40,12 @@
 //!          offset[u64], delete_len[u64], insert_len[u64], insert[..],
 //!          request_len[u64], request[..],
 //!          binding-present[u8] + len[u64] + bytes,
-//!          operation_digest[32]
+//!          operation_digest[32],
+//!          physical-present[u8] (0 = ephemeral memory op, 1 = durable),
+//!          if present: physical_generation[u64],
+//!                      payload_start[u64], payload_end[u64],
+//!                      node_start[u64], node_end[u64],
+//!                      physical_delta_digest[32], result_root[56]
 //! fork:    history_id[u64], version_id[u64], parent[u64],
 //!          request_len[u64], request[..],
 //!          binding-present[u8] + len[u64] + bytes,
@@ -58,6 +65,7 @@ use super::{
     MAX_HISTORY_REQUEST_ID_BYTES,
 };
 use crate::operation::DurabilityOperation;
+use crate::persistent_sequence::V2_ROOT_RECORD_SIZE;
 use fs4::FileExt;
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -65,7 +73,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-const HISTORY_LOG_MAGIC: [u8; 4] = *b"THL4";
+const HISTORY_LOG_MAGIC: [u8; 4] = *b"THL5";
 const HISTORY_LOG_FOOTER_MAGIC: [u8; 4] = *b"THLF";
 const HISTORY_LOG_HEADER_SIZE: usize = 12;
 const HISTORY_LOG_FOOTER_SIZE: usize = 44;
@@ -103,6 +111,9 @@ pub enum HistoryLogRecord {
         request_id: Option<Vec<u8>>,
         binding: Option<Vec<u8>>,
         digest: [u8; 32],
+        /// Authoritative physical placement for durable backends; `None`
+        /// for ephemeral memory-backend operations only.
+        physical: Option<PhysicalPlacement>,
     },
     Fork {
         history: HistoryId,
@@ -120,6 +131,22 @@ pub enum HistoryLogRecord {
         request_id: Vec<u8>,
         digest: [u8; 32],
     },
+}
+
+/// Authoritative physical placement published by one durable splice: the
+/// physical generation, the exact fresh payload/node ranges the delta
+/// occupies, the digest binding the exact byte realization, and the
+/// canonical result root record. Part of the THL5 splice record (staging);
+/// not a second semantic operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhysicalPlacement {
+    pub generation: u64,
+    pub payload_start: u64,
+    pub payload_end: u64,
+    pub node_start: u64,
+    pub node_end: u64,
+    pub delta_digest: [u8; 32],
+    pub result_root: [u8; V2_ROOT_RECORD_SIZE],
 }
 
 /// Durability outcome for a mutating history operation.
@@ -202,6 +229,7 @@ pub fn encode_history_log_record(record: &HistoryLogRecord) -> Result<Vec<u8>, H
             request_id,
             binding,
             digest,
+            physical,
         } => {
             output.push(RECORD_SPLICE);
             output.extend_from_slice(&history.id().to_le_bytes());
@@ -235,6 +263,19 @@ pub fn encode_history_log_record(record: &HistoryLogRecord) -> Result<Vec<u8>, H
                 None => put_u64(&mut output, 0),
             }
             output.extend_from_slice(digest);
+            match physical {
+                Some(placement) => {
+                    output.push(1);
+                    output.extend_from_slice(&placement.generation.to_le_bytes());
+                    output.extend_from_slice(&placement.payload_start.to_le_bytes());
+                    output.extend_from_slice(&placement.payload_end.to_le_bytes());
+                    output.extend_from_slice(&placement.node_start.to_le_bytes());
+                    output.extend_from_slice(&placement.node_end.to_le_bytes());
+                    output.extend_from_slice(&placement.delta_digest);
+                    output.extend_from_slice(&placement.result_root);
+                }
+                None => output.push(0),
+            }
         }
         HistoryLogRecord::Fork {
             history,
@@ -307,6 +348,7 @@ fn encoded_record_len(record: &HistoryLogRecord) -> Result<usize, HistoryError> 
             insert,
             request_id,
             binding,
+            physical,
             ..
         } => 1usize
             .checked_add(8)
@@ -321,6 +363,13 @@ fn encoded_record_len(record: &HistoryLogRecord) -> Result<usize, HistoryError> 
             .and_then(|value| value.checked_add(8))
             .and_then(|value| value.checked_add(binding.as_ref().map_or(0, Vec::len)))
             .and_then(|value| value.checked_add(32))
+            .and_then(|value| {
+                value.checked_add(if physical.is_some() {
+                    1 + 8 + 8 + 8 + 8 + 8 + 32 + V2_ROOT_RECORD_SIZE
+                } else {
+                    1
+                })
+            })
             .ok_or(HistoryError::Overflow(
                 "history log record length exceeds usize",
             ))?,
@@ -402,6 +451,32 @@ pub fn decode_history_log_record(bytes: &[u8]) -> Result<HistoryLogRecord, Histo
             };
             let binding = decode_optional_binding(&mut cursor)?;
             let digest = cursor.take_array::<32>()?;
+            let physical = match cursor.take_byte()? {
+                0 => None,
+                1 => {
+                    let generation = cursor.take_u64()?;
+                    let payload_start = cursor.take_u64()?;
+                    let payload_end = cursor.take_u64()?;
+                    let node_start = cursor.take_u64()?;
+                    let node_end = cursor.take_u64()?;
+                    let delta_digest = cursor.take_array::<32>()?;
+                    let result_root = cursor.take_array::<V2_ROOT_RECORD_SIZE>()?;
+                    Some(PhysicalPlacement {
+                        generation,
+                        payload_start,
+                        payload_end,
+                        node_start,
+                        node_end,
+                        delta_digest,
+                        result_root,
+                    })
+                }
+                _ => {
+                    return Err(HistoryError::Invalid(
+                        "history log splice physical presence is unsupported",
+                    ));
+                }
+            };
             HistoryLogRecord::Splice {
                 history,
                 version,
@@ -412,6 +487,7 @@ pub fn decode_history_log_record(bytes: &[u8]) -> Result<HistoryLogRecord, Histo
                 request_id,
                 binding,
                 digest,
+                physical,
             }
         }
         RECORD_FORK => {
@@ -710,6 +786,7 @@ fn apply_recovered_record(
             request_id,
             binding,
             digest,
+            physical,
         } => {
             let assigned = store.replay_splice(
                 *history,
@@ -721,6 +798,7 @@ fn apply_recovered_record(
                 request_id.as_deref(),
                 binding.as_deref(),
                 *digest,
+                physical.clone(),
             )?;
             if assigned != *version {
                 return Err(HistoryError::Invalid(
@@ -767,6 +845,8 @@ pub(crate) struct DurableHistoryLog {
     file: File,
     tail: u64,
     fail_next_append: bool,
+    #[cfg(test)]
+    fail_next_sync: bool,
 }
 
 impl DurableHistoryLog {
@@ -796,6 +876,7 @@ impl DurableHistoryLog {
             file,
             tail,
             fail_next_append: false,
+            fail_next_sync: false,
         })
     }
 
@@ -821,6 +902,8 @@ impl DurableHistoryLog {
             file,
             tail: 0,
             fail_next_append: false,
+            #[cfg(test)]
+            fail_next_sync: false,
         };
         log.tail = scan_log_tail(&log.read_all()?).map_err(|error| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
@@ -837,6 +920,14 @@ impl DurableHistoryLog {
     #[cfg(test)]
     pub(crate) fn arm_fail_next_append(&mut self) {
         self.fail_next_append = true;
+    }
+
+    /// Arms a one-shot deterministic barrier failure for the next
+    /// [`sync`](Self::sync): the bytes may already be durable, so the
+    /// caller must poison and reopen. Test seam only.
+    #[cfg(test)]
+    pub(crate) fn arm_fail_next_sync(&mut self) {
+        self.fail_next_sync = true;
     }
 
     /// Returns true when the underlying lock failure signals contention
@@ -873,6 +964,14 @@ impl DurableHistoryLog {
     /// Full file durability barrier. File length changes with every append,
     /// so this is `sync_all`, not `sync_data`.
     pub(crate) fn sync(&mut self) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.fail_next_sync {
+            self.fail_next_sync = false;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "injected fault: history log sync rejected",
+            ));
+        }
         self.file.sync_all()
     }
 
@@ -903,6 +1002,7 @@ mod tests {
             request_id: Some(b"req-1".to_vec()),
             binding: Some(b"bind-1".to_vec()),
             digest: [0x33; 32],
+            physical: None,
         }
     }
 
@@ -944,6 +1044,7 @@ mod tests {
                 request_id: None,
                 binding: None,
                 digest: [0x00; 32],
+                physical: None,
             },
             HistoryLogRecord::Retire {
                 request_id: b"req-9".to_vec(),
