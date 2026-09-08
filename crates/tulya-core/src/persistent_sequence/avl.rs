@@ -6,6 +6,9 @@
 //! snapshot while later appends allocate only a new leaf and the changed AVL
 //! path.
 
+use super::compaction_v2::{
+    plan_reachable_arena, rebuild_compact_records, remapped_node_id, repack_compact_ranges,
+};
 use super::format_v2::{V2FormatError, V2NodeRecord, V2RootRecord, MAX_LEAF_PAYLOAD_BYTES};
 use super::image_v2::{
     decode_v2_image, encode_v2_image, v2_node_fields, V2ImageError, V2NodeFields, V2SequenceImage,
@@ -18,6 +21,7 @@ pub enum V2AvlError {
     Image(V2ImageError),
     Invalid(&'static str),
     Overflow(&'static str),
+    Capacity(&'static str),
 }
 
 impl fmt::Display for V2AvlError {
@@ -25,7 +29,9 @@ impl fmt::Display for V2AvlError {
         match self {
             Self::Format(error) => write!(formatter, "{error}"),
             Self::Image(error) => write!(formatter, "{error}"),
-            Self::Invalid(message) | Self::Overflow(message) => formatter.write_str(message),
+            Self::Invalid(message) | Self::Overflow(message) | Self::Capacity(message) => {
+                formatter.write_str(message)
+            }
         }
     }
 }
@@ -41,6 +47,27 @@ impl From<V2FormatError> for V2AvlError {
 impl From<V2ImageError> for V2AvlError {
     fn from(error: V2ImageError) -> Self {
         Self::Image(error)
+    }
+}
+
+/// Maps the shared compaction-core error into the AVL seam error: the
+/// string-carrying variants transfer exactly, while checkpoint-shaped
+/// wrappers (unreachable from the generic mark/repack/rebuild path) map to
+/// static context messages.
+impl From<super::compaction_v2::V2CompactionError> for V2AvlError {
+    fn from(error: super::compaction_v2::V2CompactionError) -> Self {
+        use super::compaction_v2::V2CompactionError as Source;
+        match error {
+            Source::Image(inner) => Self::Image(inner),
+            Source::Format(inner) => Self::Format(inner),
+            Source::Invalid(message) => Self::Invalid(message),
+            Source::Overflow(message) => Self::Overflow(message),
+            Source::Capacity(message) => Self::Capacity(message),
+            Source::Publication(_)
+            | Source::Commit(_)
+            | Source::Snapshot(_)
+            | Source::Backend(_) => Self::Invalid("v2 history compaction hit checkpoint state"),
+        }
     }
 }
 
@@ -509,6 +536,135 @@ impl V2AvlSequence {
 
     pub(super) fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    pub(super) fn payload_len(&self) -> usize {
+        self.payload.len()
+    }
+
+    /// Rebuilds a compact replacement arena from explicit retained roots.
+    ///
+    /// Generic history-core GC entry: validates every seed root against the
+    /// live arena, marks reachable nodes/payload through the shared
+    /// compaction core, repacks payload densely, canonically rebuilds nodes
+    /// with remapped children, and remaps each input root. Unreachable nodes
+    /// and payload bytes are discarded; an empty seed list yields an empty
+    /// backend. Rebuilt records preserve source height, logical length, and
+    /// commitment (enforced by the rebuild core); root commitments and
+    /// lengths are rechecked across relocation below. No work counters move:
+    /// callers account GC maintenance separately from foreground locality.
+    pub(super) fn compact_to_roots(
+        &self,
+        roots: &[V2RootRecord],
+    ) -> Result<(Self, Vec<V2RootRecord>), V2AvlError> {
+        let mut seeds: Vec<u64> = Vec::new();
+        seeds
+            .try_reserve_exact(roots.len())
+            .map_err(|_| V2AvlError::Capacity("v2 history compaction seed allocation failed"))?;
+        for root in roots {
+            // Validates representation, node identity, and exact length: a
+            // forged or dangling root fails here, before any plan work.
+            self.node_for_root(*root)?;
+            seeds.push(root.node_id());
+        }
+        let mut records: Vec<V2NodeRecord> = Vec::new();
+        records
+            .try_reserve_exact(self.nodes.len())
+            .map_err(|_| V2AvlError::Capacity("v2 history compaction record allocation failed"))?;
+        records.extend(self.nodes.iter().map(ArenaNode::record));
+        let (retained, ranges) = plan_reachable_arena(&self.payload, &records, &seeds)?;
+        let (compact_payload, payload_mapping) = repack_compact_ranges(&self.payload, &ranges)?;
+        let (compact_records, node_mapping) =
+            rebuild_compact_records(&records, &retained, &compact_payload, &payload_mapping)?;
+        // Convert canonical records back to arena nodes; ascending order
+        // guarantees branch children already exist for reconstruction.
+        let mut nodes: Vec<ArenaNode> = Vec::new();
+        nodes
+            .try_reserve_exact(compact_records.len())
+            .map_err(|_| V2AvlError::Capacity("v2 history compaction node allocation failed"))?;
+        for record in &compact_records {
+            nodes.push(Self::compact_arena_node(&nodes, *record)?);
+        }
+        // Fully-swept recheck: exactly the retained set was rebuilt, dense
+        // by construction, with no extra nodes admitted.
+        if nodes.len() != retained.len() {
+            return Err(V2AvlError::Invalid(
+                "v2 history compaction node table disagrees with its retained set",
+            ));
+        }
+        let mut new_roots: Vec<V2RootRecord> = Vec::new();
+        new_roots
+            .try_reserve_exact(roots.len())
+            .map_err(|_| V2AvlError::Capacity("v2 history compaction root allocation failed"))?;
+        for root in roots {
+            let new_id = remapped_node_id(&node_mapping, root.node_id())?;
+            let index = usize::try_from(new_id).map_err(|_| {
+                V2AvlError::Overflow("v2 history compaction node identifier exceeds usize")
+            })?;
+            let record = nodes
+                .get(index)
+                .ok_or(V2AvlError::Invalid(
+                    "v2 history compaction remapped root is absent",
+                ))?
+                .record();
+            new_roots.push(V2RootRecord::from_node(new_id, record)?);
+        }
+        // Relocation must preserve content identity byte-exact.
+        for (old, new) in roots.iter().zip(new_roots.iter()) {
+            if old.commitment() != new.commitment() || old.logical_len() != new.logical_len() {
+                return Err(V2AvlError::Invalid(
+                    "v2 history compaction root disagrees with its source",
+                ));
+            }
+        }
+        Ok((
+            Self {
+                payload: compact_payload,
+                nodes,
+            },
+            new_roots,
+        ))
+    }
+
+    /// Converts one canonically rebuilt record into a live arena node,
+    /// resolving branch children against already-built compact nodes.
+    fn compact_arena_node(
+        built: &[ArenaNode],
+        record: V2NodeRecord,
+    ) -> Result<ArenaNode, V2AvlError> {
+        match v2_node_fields(record)? {
+            V2NodeFields::Leaf {
+                payload_offset,
+                payload_len,
+            } => Ok(ArenaNode::Leaf {
+                payload_offset,
+                payload_len,
+                record,
+            }),
+            V2NodeFields::Branch {
+                left_node_id,
+                right_node_id,
+                ..
+            } => {
+                let left_index = usize::try_from(left_node_id).map_err(|_| {
+                    V2AvlError::Overflow("v2 history compaction node identifier exceeds usize")
+                })?;
+                let right_index = usize::try_from(right_node_id).map_err(|_| {
+                    V2AvlError::Overflow("v2 history compaction node identifier exceeds usize")
+                })?;
+                let left = built.get(left_index).ok_or(V2AvlError::Invalid(
+                    "v2 history compaction branch child is absent",
+                ))?;
+                let right = built.get(right_index).ok_or(V2AvlError::Invalid(
+                    "v2 history compaction branch child is absent",
+                ))?;
+                Ok(ArenaNode::Branch {
+                    left: V2RootRecord::from_node(left_node_id, left.record())?,
+                    right: V2RootRecord::from_node(right_node_id, right.record())?,
+                    record,
+                })
+            }
+        }
     }
 
     pub(super) fn is_empty(&self) -> bool {

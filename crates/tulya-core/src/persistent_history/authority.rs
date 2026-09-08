@@ -33,7 +33,8 @@ use super::{
         HISTORY_MANIFEST_FILE,
     },
     snapshot::{decode_history_snapshot, encode_history_snapshot},
-    CommitOutcome, ExpireOutcome, HistoryError, HistoryId, PersistentHistoryStore, VersionId,
+    CommitOutcome, ExpireOutcome, GcStats, HistoryError, HistoryId, PersistentHistoryStore,
+    VersionId,
 };
 use fs4::FileExt;
 use std::fs::{self, File, OpenOptions};
@@ -59,6 +60,22 @@ pub struct SealSummary {
     pub represented_wal_end: u64,
     pub snapshot_len: u64,
     pub recycled_hot: bool,
+}
+
+/// Summary of one quiescent GC cycle: the compact generation publication
+/// plus maintenance statistics and superseded-generation cleanup outcome.
+///
+/// `cleanup_complete` reports post-authority file cleanup only: when false
+/// the compact generation is still fully authoritative and correct, but
+/// obsolete generation files still occupy storage, so no disk-reclamation
+/// claim may rest on such a cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GcSummary {
+    pub generation: u64,
+    pub represented_wal_end: u64,
+    pub snapshot_len: u64,
+    pub stats: GcStats,
+    pub cleanup_complete: bool,
 }
 
 /// Single-writer authority over one history directory: a store-wide writer
@@ -232,6 +249,81 @@ impl WritableHistoryAuthority {
     pub fn seal(&mut self) -> Result<SealSummary, DurableError> {
         let dir = self.dir.clone();
         self.seal_with_sync(|| sync_dir(&dir))
+    }
+
+    /// Runs one quiescent GC cycle: compacts the complete current logical
+    /// state (sealed snapshot plus hot suffix, as held in memory) into a new
+    /// generation with an empty hot suffix, then reclaims superseded
+    /// generation files.
+    ///
+    /// Quiescent contract: the caller must ensure no concurrent read-only
+    /// authority or open operation depends on superseded generations while
+    /// reclamation runs. E5 implements no reader pins, grace periods, or
+    /// concurrent reclamation. The writer lease stays held throughout; only
+    /// logical VersionIds, lineage, bindings, receipts, and retained bytes
+    /// survive — physical placement changes and expired content drops.
+    pub fn gc_quiescent(&mut self) -> Result<GcSummary, DurableError> {
+        let dir = self.dir.clone();
+        self.gc_with_sync(|| sync_dir(&dir))
+    }
+
+    /// GC orchestration with an injectable manifest directory sync: the
+    /// deterministic test seam for the rename-ok/dirsync-fail cut.
+    /// Crate-private; external writers use [`gc_quiescent`](Self::gc_quiescent).
+    pub(crate) fn gc_with_sync(
+        &mut self,
+        sync_dir_once: impl FnOnce() -> std::io::Result<()>,
+    ) -> Result<GcSummary, DurableError> {
+        if self.store.is_poisoned() {
+            return Err(DurableError::RecoveryRequired);
+        }
+        // Pure in-memory preparation: the live store, manifest, and files
+        // are untouched, so any failure here is a definite rejection.
+        let prepared = self.store.prepare_gc().map_err(DurableError::Rejected)?;
+        let current = current_generation(&self.dir)?;
+        let generation =
+            current
+                .checked_add(1)
+                .ok_or(DurableError::Rejected(HistoryError::Overflow(
+                    "history generation exceeds u64",
+                )))?;
+        let represented_wal_end = current_hot_wal_end(&self.dir, current)?;
+        let snapshot = encode_history_snapshot(prepared.store(), generation, represented_wal_end)
+            .map_err(DurableError::Rejected)?;
+        let staged = publish_staged_files(
+            &self.dir,
+            current,
+            generation,
+            represented_wal_end,
+            &snapshot,
+        )?;
+        // Open and lock the next hot log BEFORE the manifest commits: any
+        // failure here still sees manifest N, so it stays a definite
+        // rejection with the old handle and generation fully operational.
+        let next_hot =
+            DurableHistoryLog::open_write(&self.dir.join(history_wal_filename(staged.generation)))
+                .map_err(map_hot_open_error)?;
+        commit_staged_manifest(&mut self.store, &self.dir, &staged, sync_dir_once)?;
+        // Infallible adoption: compact backend plus rebuilt catalogue move
+        // in; the next handle is already open and locked, so no fallible
+        // step remains between durable authority and memory.
+        let stats = prepared.stats();
+        self.store.apply_prepared_gc(prepared);
+        self.hot = next_hot;
+        self.generation = staged.generation;
+        self.stats = OpenedHistoryStats {
+            snapshot_versions: self.store.version_count(),
+            suffix_bytes: 0,
+        };
+        let _ = recycle_superseded_hot(&self.dir, staged.previous);
+        let cleanup_complete = cleanup_superseded_generations(&self.dir, staged.generation);
+        Ok(GcSummary {
+            generation: staged.generation,
+            represented_wal_end: staged.represented_wal_end,
+            snapshot_len: staged.snapshot_len,
+            stats,
+            cleanup_complete,
+        })
     }
 
     /// Seal orchestration with an injectable manifest directory sync: the
@@ -419,6 +511,16 @@ fn stage_sealed_generation(
             .ok_or(DurableError::Rejected(HistoryError::Overflow(
                 "history generation exceeds u64",
             )))?;
+    let represented_wal_end = current_hot_wal_end(dir, current)?;
+    let snapshot = encode_history_snapshot(store, generation, represented_wal_end)
+        .map_err(DurableError::Rejected)?;
+    publish_staged_files(dir, current, generation, represented_wal_end, &snapshot)
+}
+
+/// Reads the current-generation hot log and reports its exact logical tail:
+/// the snapshot's represented prefix. Shared by seal and quiescent GC, which
+/// both publish the full current in-memory state against this prefix.
+fn current_hot_wal_end(dir: &Path, current: u64) -> Result<u64, DurableError> {
     let hot_current = dir.join(history_wal_filename(current));
     let hot_bytes = match fs::read(&hot_current) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -439,12 +541,24 @@ fn stage_sealed_generation(
     };
     let (_, represented_wal_end) =
         decode_history_log(&hot_bytes).map_err(DurableError::Rejected)?;
+    Ok(represented_wal_end)
+}
 
-    let snapshot = encode_history_snapshot(store, generation, represented_wal_end)
-        .map_err(DurableError::Rejected)?;
+/// Publishes one staged generation's files short of manifest authority:
+/// verified snapshot, empty next hot log, sealed digest. Shared by seal
+/// (live snapshot bytes) and quiescent GC (compact snapshot bytes), so both
+/// paths carry identical publication and failure semantics: every failure
+/// here predates any new authority and reports definite rejection.
+fn publish_staged_files(
+    dir: &Path,
+    current: u64,
+    generation: u64,
+    represented_wal_end: u64,
+    snapshot: &[u8],
+) -> Result<StagedSeal, DurableError> {
     let snap_path = dir.join(history_snapshot_filename(generation));
     let snap_tmp = tmp_path(&snap_path);
-    write_file_synced(&snap_tmp, &snapshot).map_err(|_| {
+    write_file_synced(&snap_tmp, snapshot).map_err(|_| {
         DurableError::Rejected(HistoryError::Invalid("history seal snapshot write failed"))
     })?;
     let sealed_back = fs::read(&snap_tmp).map_err(|_| {
@@ -487,7 +601,7 @@ fn stage_sealed_generation(
         ))
     })?;
 
-    let sealed = ManifestSealed::for_snapshot(snapshot.len() as u64, &snapshot);
+    let sealed = ManifestSealed::for_snapshot(snapshot.len() as u64, snapshot);
     Ok(StagedSeal {
         previous: current,
         generation,
@@ -495,6 +609,91 @@ fn stage_sealed_generation(
         sealed,
         snapshot_len: snapshot.len() as u64,
     })
+}
+
+/// Removes superseded Tulya generation files after a compact generation is
+/// authoritative: old sealed snapshots, old hot logs, and stale GC temp
+/// artifacts. Only exact generation filename patterns are ever removed; the
+/// manifest, lock, current files, and unrelated files are never touched.
+///
+/// Post-authority by contract: returns whether cleanup completed fully
+/// instead of failing, so a cleanup shortfall reports through the GC
+/// summary without invalidating the committed compact generation.
+fn cleanup_superseded_generations(dir: &Path, current: u64) -> bool {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    let mut complete = true;
+    for entry in entries {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        };
+        let name = match path.file_name().and_then(|name| name.to_str()) {
+            Some(name) => name,
+            None => continue,
+        };
+        if !superseded_generation_file(name, current) && !stale_tulya_temp_file(name) {
+            continue;
+        }
+        if fs::remove_file(&path).is_err() {
+            complete = false;
+        }
+    }
+    if sync_dir(dir).is_err() {
+        complete = false;
+    }
+    complete
+}
+
+/// Reports whether a directory entry is a stale Tulya temp artifact:
+/// exactly the canonical generation temp names the staging path itself
+/// writes (`history-{u64}.wal.tmp`, `history-snap-{u64}.ths.tmp`, and the
+/// manifest temp), never a prefix family. Unrelated application files that
+/// merely share a prefix are never matched.
+fn stale_tulya_temp_file(name: &str) -> bool {
+    let Some(base) = name.strip_suffix(".tmp") else {
+        return false;
+    };
+    if base == HISTORY_MANIFEST_FILE {
+        return true;
+    }
+    for (prefix, suffix) in [("history-", ".wal"), ("history-snap-", ".ths")] {
+        if let Some(rest) = base
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(suffix))
+        {
+            if rest.parse::<u64>().is_ok() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Reports whether a directory entry is a superseded Tulya generation file:
+/// a well-formed snapshot or hot-log name for a generation other than the
+/// current authority.
+fn superseded_generation_file(name: &str, current: u64) -> bool {
+    const WAL_PREFIX: &str = "history-";
+    const WAL_SUFFIX: &str = ".wal";
+    const SNAP_PREFIX: &str = "history-snap-";
+    const SNAP_SUFFIX: &str = ".ths";
+    for (prefix, suffix) in [(WAL_PREFIX, WAL_SUFFIX), (SNAP_PREFIX, SNAP_SUFFIX)] {
+        if let Some(rest) = name
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(suffix))
+        {
+            if let Ok(generation) = rest.parse::<u64>() {
+                return generation != current;
+            }
+        }
+    }
+    false
 }
 
 /// Commits a staged seal to manifest authority: tmp write and sync, atomic
@@ -584,10 +783,17 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::durable_log::DurableHistoryLog;
+    use super::super::durable_log::{
+        encode_history_log_frame, encode_history_log_record, DurableHistoryLog, HistoryLogRecord,
+    };
     use super::super::manifest::ManifestSealed;
+    use super::super::manifest::{
+        decode_history_manifest, encode_history_manifest, HistoryManifest, HISTORY_MANIFEST_FILE,
+    };
     use super::super::snapshot::{decode_history_snapshot, encode_history_snapshot_struct};
-    use super::super::{CommitOutcome, HistoryId, VersionId};
+    use super::super::{
+        history_fork_digest, history_splice_digest, CommitOutcome, HistoryId, VersionId,
+    };
     use super::*;
 
     fn fixture_dir() -> tempfile::TempDir {
@@ -652,16 +858,21 @@ mod tests {
         assert_eq!(actual.expired_versions, expected.expired_versions);
         assert_eq!(actual.history_bindings, expected.history_bindings);
         assert_eq!(actual.version_bindings, expected.version_bindings);
-        for version in &expected.versions {
+        for record in &expected.versions {
+            let version = record.version();
             let reopened = actual.lookup_version(version.id()).unwrap();
-            assert_eq!(reopened, *version);
+            assert_eq!(reopened, version);
+            assert_eq!(
+                actual.physical_root(version.id()),
+                expected.physical_root(version.id())
+            );
             let mut expected_bytes = Vec::new();
             let mut actual_bytes = Vec::new();
             expected
                 .read(
-                    *version,
+                    version,
                     0,
-                    version.root().logical_len().get(),
+                    expected.logical_len(version).unwrap().get(),
                     &mut expected_bytes,
                 )
                 .unwrap();
@@ -669,7 +880,7 @@ mod tests {
                 .read(
                     reopened,
                     0,
-                    reopened.root().logical_len().get(),
+                    actual.logical_len(reopened).unwrap().get(),
                     &mut actual_bytes,
                 )
                 .unwrap();
@@ -1181,16 +1392,17 @@ mod tests {
         assert_eq!(opened.store.retired_requests, store.retired_requests);
         assert_eq!(opened.store.history_bindings, store.history_bindings);
         assert_eq!(opened.store.version_bindings, store.version_bindings);
-        for version in &store.versions {
+        for record in &store.versions {
+            let version = record.version();
             let reopened = opened.store.lookup_version(version.id()).unwrap();
-            assert_eq!(reopened, *version);
+            assert_eq!(reopened, version);
             let mut expected = Vec::new();
             let mut actual = Vec::new();
             store
                 .read(
-                    *version,
+                    version,
                     0,
-                    version.root().logical_len().get(),
+                    store.logical_len(version).unwrap().get(),
                     &mut expected,
                 )
                 .unwrap();
@@ -1199,7 +1411,7 @@ mod tests {
                 .read(
                     reopened,
                     0,
-                    reopened.root().logical_len().get(),
+                    opened.store.logical_len(reopened).unwrap().get(),
                     &mut actual,
                 )
                 .unwrap();
@@ -1260,7 +1472,7 @@ mod tests {
             .read(
                 suffix_v6,
                 0,
-                suffix_v6.root().logical_len().get(),
+                reopened.store.logical_len(suffix_v6).unwrap().get(),
                 &mut output,
             )
             .unwrap();
@@ -1303,7 +1515,12 @@ mod tests {
         let mut output = Vec::new();
         reopened
             .store
-            .read(got, 0, got.root().logical_len().get(), &mut output)
+            .read(
+                got,
+                0,
+                reopened.store.logical_len(got).unwrap().get(),
+                &mut output,
+            )
             .unwrap();
         assert_eq!(output, b"abcdeXYhij");
         // The pre-seal root is untouched by the suffix splice.
@@ -1311,7 +1528,12 @@ mod tests {
         let mut expected = Vec::new();
         reopened
             .store
-            .read(base, 0, base.root().logical_len().get(), &mut expected)
+            .read(
+                base,
+                0,
+                reopened.store.logical_len(base).unwrap().get(),
+                &mut expected,
+            )
             .unwrap();
         assert_eq!(expected, b"abcdefghij");
     }
@@ -1350,7 +1572,10 @@ mod tests {
         assert_eq!(summary.generation, 1);
         let v1 = authority_forked(&mut authority, history, v0.id());
         assert_eq!(v1.parent(), Some(v0.id()));
-        assert_eq!(v1.root(), v0.root());
+        assert_eq!(
+            authority.store().physical_root(v1.id()),
+            authority.store().physical_root(v0.id())
+        );
         drop(authority);
         let reopened = open_history_authority(temp.path()).unwrap();
         assert_eq!(reopened.generation, 1);
@@ -1360,13 +1585,18 @@ mod tests {
         let got = reopened.store.lookup_version(v1.id()).unwrap();
         assert_eq!(got.parent(), Some(v0.id()));
         assert_eq!(
-            got.root(),
-            reopened.store.lookup_version(v0.id()).unwrap().root()
+            reopened.store.physical_root(got.id()),
+            reopened.store.physical_root(v0.id())
         );
         let mut output = Vec::new();
         reopened
             .store
-            .read(got, 0, got.root().logical_len().get(), &mut output)
+            .read(
+                got,
+                0,
+                reopened.store.logical_len(got).unwrap().get(),
+                &mut output,
+            )
             .unwrap();
         assert_eq!(output, b"fork-suffix-base");
     }
@@ -1403,13 +1633,18 @@ mod tests {
             assert_eq!(got, forked);
             assert_eq!(got.parent(), Some(v0.id()));
             assert_eq!(
-                got.root(),
-                reopened.store.lookup_version(v0.id()).unwrap().root()
+                reopened.store.physical_root(got.id()),
+                reopened.store.physical_root(v0.id())
             );
             let mut output = Vec::new();
             reopened
                 .store
-                .read(got, 0, got.root().logical_len().get(), &mut output)
+                .read(
+                    got,
+                    0,
+                    reopened.store.logical_len(got).unwrap().get(),
+                    &mut output,
+                )
                 .unwrap();
             assert_eq!(output, b"sealed-fork-base");
             reopened.store.verify(got).unwrap();
@@ -1725,6 +1960,733 @@ mod tests {
         ));
     }
 
+    /// Crafts one valid THL4 suffix frame for the current-generation hot
+    /// log: used to prove lifecycle state imported from the sealed base is
+    /// respected by suffix replay.
+    fn append_suffix_frame(dir: &Path, generation: u64, record: &HistoryLogRecord) {
+        let frame = encode_history_log_frame(&encode_history_log_record(record).unwrap()).unwrap();
+        let mut log = DurableHistoryLog::open(&dir.join(history_wal_filename(generation))).unwrap();
+        log.append_frame(&frame).unwrap();
+        log.sync().unwrap();
+    }
+
+    #[test]
+    fn suffix_splice_after_snapshot_expired_parent_is_rejected() {
+        // Seal carries V0 as expired in the snapshot catalogue; a framed,
+        // digest-valid suffix splice V1 from V0 must still fail reopen —
+        // the live authority could never have emitted it.
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority
+            .append(history, None, b"expire-suffix-base", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        authority.expire(v0.id()).unwrap();
+        let summary = authority.seal().unwrap();
+        drop(authority);
+        let digest = history_splice_digest(history, Some(v0.id()), 18, 0, b"[e]", None);
+        append_suffix_frame(
+            temp.path(),
+            summary.generation,
+            &HistoryLogRecord::Splice {
+                history,
+                version: VersionId::new(1),
+                parent: Some(v0.id()),
+                offset: 18,
+                delete_len: 0,
+                insert: b"[e]".to_vec(),
+                request_id: None,
+                binding: None,
+                digest,
+            },
+        );
+        assert!(matches!(
+            open_history_authority(temp.path()),
+            Err(DurableError::Rejected(
+                crate::persistent_history::HistoryError::Invalid(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn suffix_fork_after_snapshot_expired_parent_is_rejected() {
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority
+            .append(history, None, b"expire-suffix-base", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        authority.expire(v0.id()).unwrap();
+        let summary = authority.seal().unwrap();
+        drop(authority);
+        let digest = history_fork_digest(history, v0.id(), None);
+        append_suffix_frame(
+            temp.path(),
+            summary.generation,
+            &HistoryLogRecord::Fork {
+                history,
+                version: VersionId::new(1),
+                parent: v0.id(),
+                request_id: None,
+                binding: None,
+                digest,
+            },
+        );
+        assert!(matches!(
+            open_history_authority(temp.path()),
+            Err(DurableError::Rejected(
+                crate::persistent_history::HistoryError::Invalid(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn gc_quiescent_reopen_is_exact() {
+        // E5.28: branch fleet, expired losers, gc, close, reopen — logical
+        // state identical, arena compact, hot suffix empty.
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let base_payload = vec![0x66u8; 64 * 1024];
+        let base = match authority
+            .append(history, None, &base_payload, None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        let mut survivors = Vec::new();
+        for index in 0..16usize {
+            let mut insert = vec![0u8; 4096];
+            let tag = format!("gc-{index:02}");
+            insert[..tag.len()].copy_from_slice(tag.as_bytes());
+            let offset = (index as u64 * 31337) % (64 * 1024 - 4096);
+            let branch = match authority
+                .splice(history, Some(base.id()), offset, 4096, &insert, None, None)
+                .unwrap()
+            {
+                CommitOutcome::Committed(version) => version,
+                CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                    panic!("branch splice must create")
+                }
+            };
+            if index < 14 {
+                authority.expire(branch.id()).unwrap();
+            } else {
+                survivors.push((branch, insert, offset));
+            }
+        }
+        let counters_before = authority.store().work_counters();
+        let summary = authority.gc_quiescent().unwrap();
+        assert_eq!(summary.generation, 1);
+        assert!(summary.stats.nodes_reclaimed > 0);
+        assert!(summary.stats.payload_bytes_reclaimed > 0);
+        assert_eq!(summary.stats.retained_versions, 3);
+        assert_eq!(summary.stats.expired_versions, 14);
+        assert!(summary.cleanup_complete);
+        assert_eq!(authority.store().work_counters(), counters_before);
+        assert_eq!(authority.generation(), 1);
+        assert_eq!(authority.stats().suffix_bytes, 0);
+        drop(authority);
+        let reopened = open_history_authority(temp.path()).unwrap();
+        assert_eq!(reopened.generation, 1);
+        assert_eq!(reopened.stats.snapshot_versions, 17);
+        assert_eq!(reopened.stats.suffix_bytes, 0);
+        assert_eq!(reopened.store.version_count(), 17);
+        assert_eq!(reopened.store.next_version_id, 17);
+        for (branch, insert, offset) in &survivors {
+            let got = reopened.store.lookup_version(branch.id()).unwrap();
+            assert_eq!(got, *branch);
+            let len = reopened.store.logical_len(got).unwrap().get();
+            assert_eq!(len, 64 * 1024);
+            let mut output = Vec::new();
+            reopened.store.read(got, 0, len, &mut output).unwrap();
+            let mut expected = base_payload.clone();
+            let start = *offset as usize;
+            expected[start..start + insert.len()].copy_from_slice(insert);
+            assert_eq!(output, expected);
+            reopened.store.verify(got).unwrap();
+        }
+        // Expired losers resolve logically, then fail acquisition — never
+        // unknown, never arbitrary content.
+        for id in 1..15u64 {
+            let expired = VersionId::new(id);
+            if survivors
+                .iter()
+                .any(|(branch, _, _)| branch.id() == expired)
+            {
+                continue;
+            }
+            assert_eq!(reopened.store.is_expired(expired), Ok(true));
+            assert_eq!(
+                reopened.store.lookup_version(expired),
+                Err(crate::persistent_history::HistoryError::VersionExpired)
+            );
+        }
+        // Bindings and receipts survive GC byte-exact.
+        assert_eq!(
+            reopened.store.history_binding(history),
+            Some(b"thread-a".as_slice())
+        );
+    }
+
+    #[test]
+    fn gc_compacts_suffix_state_not_just_snapshot() {
+        // E5.29: seal a base, then create/splice/fork/expire in the hot
+        // suffix — the compact generation must include all of it.
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let _seal_base = match authority
+            .append(history, None, b"suffix-gc-base", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        authority.seal().unwrap();
+        let v0 = match authority
+            .append(history, None, &vec![0x77u8; 64 * 1024], None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        // Suffix work: V1 replaces the first half of V0 (leaving V0-only
+        // nodes behind), V2 forks V1, then V0 expires.
+        let v1 = match authority
+            .splice(
+                history,
+                Some(v0.id()),
+                0,
+                32 * 1024,
+                b"HALF",
+                Some(b"suffix-req"),
+                None,
+            )
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("suffix splice must create")
+            }
+        };
+        let v2 = authority_forked(&mut authority, history, v1.id());
+        authority.expire(v0.id()).unwrap();
+        let summary = authority.gc_quiescent().unwrap();
+        assert_eq!(summary.generation, 2);
+        drop(authority);
+        let reopened = open_history_authority(temp.path()).unwrap();
+        assert_eq!(reopened.generation, 2);
+        assert_eq!(reopened.stats.suffix_bytes, 0);
+        // Suffix semantics present: V1 bytes, V2 fork, V0 expired.
+        let got_v1 = reopened.store.lookup_version(v1.id()).unwrap();
+        let mut output = Vec::new();
+        reopened
+            .store
+            .read(
+                got_v1,
+                0,
+                reopened.store.logical_len(got_v1).unwrap().get(),
+                &mut output,
+            )
+            .unwrap();
+        assert_eq!(output.len(), 32 * 1024 + 4);
+        assert_eq!(&output[..4], b"HALF");
+        assert!(output[4..].iter().all(|byte| *byte == 0x77));
+        let got_v2 = reopened.store.lookup_version(v2.id()).unwrap();
+        assert_eq!(got_v2.parent(), Some(v1.id()));
+        assert_eq!(reopened.store.is_expired(v0.id()), Ok(true));
+        assert_eq!(
+            reopened.store.request_receipt_status(b"suffix-req"),
+            crate::persistent_history::RequestReceiptStatus::Active(v1.id())
+        );
+        // Expired suffix content reclaimed: only V1+V2 content remains.
+        assert!(summary.stats.nodes_reclaimed > 0);
+    }
+
+    #[test]
+    fn gc_then_continue_writing() {
+        // E5.30: splice, fork, and expire through the compact backend and
+        // current hot handle after GC; close/reopen exact.
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority
+            .append(history, None, b"continue-base", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        let v1 = match authority
+            .append(history, Some(v0.id()), b"-one", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("second append must create")
+            }
+        };
+        authority.expire(v0.id()).unwrap();
+        authority.gc_quiescent().unwrap();
+        let v2 = match authority
+            .splice(history, Some(v1.id()), 13, 0, b"-two", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("post-GC splice must create")
+            }
+        };
+        let v3 = authority_forked(&mut authority, history, v2.id());
+        authority.expire(v1.id()).unwrap();
+        drop(authority);
+        let reopened = open_history_authority(temp.path()).unwrap();
+        let got = reopened.store.lookup_version(v2.id()).unwrap();
+        let mut output = Vec::new();
+        reopened
+            .store
+            .read(
+                got,
+                0,
+                reopened.store.logical_len(got).unwrap().get(),
+                &mut output,
+            )
+            .unwrap();
+        assert_eq!(output, b"continue-base-two-one");
+        assert_eq!(
+            reopened.store.lookup_version(v3.id()).unwrap().parent(),
+            Some(v2.id())
+        );
+        assert_eq!(reopened.store.is_expired(v0.id()), Ok(true));
+        assert_eq!(reopened.store.is_expired(v1.id()), Ok(true));
+        assert!(reopened.stats.suffix_bytes > 0);
+    }
+
+    #[test]
+    fn gc_cleans_superseded_generations() {
+        // E5.32: ordinary seals accumulate old snapshots; GC leaves only the
+        // current authoritative files plus manifest/lock.
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let mut parent = match authority
+            .append(history, None, b"gen-0", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        for index in 1..4u64 {
+            let payload = format!("gen-{index}");
+            parent = match authority
+                .append(history, Some(parent.id()), payload.as_bytes(), None, None)
+                .unwrap()
+            {
+                CommitOutcome::Committed(version) => version,
+                CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                    panic!("append must create")
+                }
+            };
+            authority.seal().unwrap();
+        }
+        assert_eq!(authority.generation(), 3);
+        let size_before: u64 = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum();
+        let old_snaps = fs::read_dir(temp.path())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("history-snap-")
+            })
+            .count();
+        assert!(old_snaps >= 3);
+        let summary = authority.gc_quiescent().unwrap();
+        assert_eq!(summary.generation, 4);
+        assert!(summary.cleanup_complete);
+        let mut names: Vec<String> = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "history-00000000000000000004.wal".to_string(),
+                "history-manifest.json".to_string(),
+                "history-snap-00000000000000000004.ths".to_string(),
+                "history.lock".to_string(),
+            ]
+        );
+        let size_after: u64 = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum();
+        assert!(size_after < size_before);
+        drop(authority);
+        let reopened = open_history_authority(temp.path()).unwrap();
+        assert_eq!(reopened.store.version_count(), 4);
+    }
+
+    #[test]
+    fn gc_manifest_dirsync_failure_poisons_and_reopen_resolves() {
+        // E5.31: rename-ok/dirsync-fail during GC publication is
+        // indeterminate — poison locally, then reopen to exactly one valid
+        // authority (old or new), both logically complete.
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority
+            .append(history, None, b"fault-gc-base", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        let v1 = authority_forked(&mut authority, history, v0.id());
+        authority.expire(v0.id()).unwrap();
+        let failure = authority.gc_with_sync(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "injected dirsync fault",
+            ))
+        });
+        assert!(matches!(failure, Err(DurableError::Indeterminate { .. })));
+        assert!(authority.store().is_poisoned());
+        assert!(matches!(
+            authority.gc_quiescent(),
+            Err(DurableError::RecoveryRequired)
+        ));
+        drop(authority);
+        let reopened = open_history_authority(temp.path()).unwrap();
+        assert!(reopened.generation == 0 || reopened.generation == 1);
+        // Both outcomes carry the full logical state: fork, expiry, bytes.
+        assert_eq!(reopened.store.version_count(), 2);
+        assert_eq!(reopened.store.is_expired(v0.id()), Ok(true));
+        let got = reopened.store.lookup_version(v1.id()).unwrap();
+        let mut output = Vec::new();
+        reopened
+            .store
+            .read(
+                got,
+                0,
+                reopened.store.logical_len(got).unwrap().get(),
+                &mut output,
+            )
+            .unwrap();
+        assert_eq!(output, b"fault-gc-base");
+    }
+
+    #[test]
+    fn gc_blocked_next_hot_rejects_with_old_authority_intact() {
+        // A non-empty next-generation hot file fails staging before any new
+        // authority: definite rejection, old manifest/store/hot untouched.
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority
+            .append(history, None, b"blocked-gc", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        std::fs::write(temp.path().join(history_wal_filename(1)), b"stale-nonempty").unwrap();
+        assert!(matches!(
+            authority.gc_quiescent(),
+            Err(DurableError::Rejected(_))
+        ));
+        assert!(!authority.store().is_poisoned());
+        assert_eq!(authority.generation(), 0);
+        // The old authority still accepts writes on the old hot handle.
+        let v1 = match authority
+            .append(history, Some(v0.id()), b"-more", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("old authority must stay writable")
+            }
+        };
+        drop(authority);
+        let reopened = open_history_authority(temp.path()).unwrap();
+        assert_eq!(reopened.generation, 0);
+        assert_eq!(reopened.store.version_count(), 2);
+        let got = reopened.store.lookup_version(v1.id()).unwrap();
+        let mut output = Vec::new();
+        reopened
+            .store
+            .read(
+                got,
+                0,
+                reopened.store.logical_len(got).unwrap().get(),
+                &mut output,
+            )
+            .unwrap();
+        assert_eq!(output, b"blocked-gc-more");
+    }
+
+    #[test]
+    fn gc_cleanup_failure_reports_without_invalidating() {
+        // An undeletable superseded file (a directory wearing a snapshot
+        // name) makes cleanup incomplete while the compact generation stays
+        // fully authoritative and correct.
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority
+            .append(history, None, b"cleanup-flag", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        // Plant an undeletable stale generation file up front: no seal or
+        // GC staging ever touches generation 0 snapshot names, but
+        // post-authority cleanup must attempt the entry and fail on it.
+        std::fs::create_dir(temp.path().join(history_snapshot_filename(0))).unwrap();
+        authority.seal().unwrap();
+        authority.expire(v0.id()).unwrap();
+        let summary = authority.gc_quiescent().unwrap();
+        assert_eq!(summary.generation, 2);
+        assert!(!summary.cleanup_complete);
+        assert!(!authority.store().is_poisoned());
+        drop(authority);
+        let reopened = open_history_authority(temp.path()).unwrap();
+        assert_eq!(reopened.generation, 2);
+        assert_eq!(reopened.store.is_expired(v0.id()), Ok(true));
+        assert_eq!(reopened.store.version_count(), 1);
+    }
+
+    /// Rewrites the sealed generation-1 snapshot with a forged catalogue
+    /// length, keeping artifact integrity valid, and rebinds the manifest
+    /// sealed digest to match: reopen must fail at snapshot import with the
+    /// length-disagreement error, not at manifest/integrity checks.
+    fn reopen_with_forged_sealed_len(
+        dir: &Path,
+        version_index: usize,
+        delta: u64,
+    ) -> Result<OpenedHistory, DurableError> {
+        let snap_path = dir.join(history_snapshot_filename(1));
+        let bytes = fs::read(&snap_path).unwrap();
+        let mut snapshot = decode_history_snapshot(&bytes).unwrap();
+        snapshot.versions[version_index].len += delta;
+        let forged = encode_history_snapshot_struct(&snapshot).unwrap();
+        fs::write(&snap_path, &forged).unwrap();
+        let manifest_bytes = fs::read(dir.join(HISTORY_MANIFEST_FILE)).unwrap();
+        let manifest = decode_history_manifest(&manifest_bytes).unwrap();
+        let rebound = HistoryManifest::for_generation(
+            manifest.generation(),
+            Some(ManifestSealed::for_snapshot(forged.len() as u64, &forged)),
+        );
+        fs::write(
+            dir.join(HISTORY_MANIFEST_FILE),
+            encode_history_manifest(&rebound),
+        )
+        .unwrap();
+        open_history_authority(dir)
+    }
+
+    #[test]
+    fn open_rejects_retained_length_mismatch_in_sealed_snapshot() {
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority
+            .append(history, None, b"sealed-length!", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        let _v1 = authority_forked(&mut authority, history, v0.id());
+        authority.seal().unwrap();
+        drop(authority);
+        let error = reopen_with_forged_sealed_len(temp.path(), 1, 1).unwrap_err();
+        assert!(matches!(
+            error,
+            DurableError::Rejected(crate::persistent_history::HistoryError::Invalid(
+                "history snapshot version length disagrees with its materialized root"
+            ))
+        ));
+    }
+
+    #[test]
+    fn open_rejects_expired_materialized_mismatch_in_sealed_snapshot() {
+        // Same gate for an expired-but-materialized version: GC could not
+        // later launder this by dropping the root.
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority
+            .append(history, None, b"sealed-length!", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        let _v1 = authority_forked(&mut authority, history, v0.id());
+        authority.expire(v0.id()).unwrap();
+        authority.seal().unwrap();
+        drop(authority);
+        let error = reopen_with_forged_sealed_len(temp.path(), 0, 1).unwrap_err();
+        assert!(matches!(
+            error,
+            DurableError::Rejected(crate::persistent_history::HistoryError::Invalid(
+                "history snapshot version length disagrees with its materialized root"
+            ))
+        ));
+    }
+
+    #[test]
+    fn gc_cleanup_preserves_unrelated_files_byte_exact() {
+        // B.2: only canonical Tulya temp names are recognized — files that
+        // merely share a prefix must survive GC byte-exact, while genuine
+        // stale generation temps are removed.
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority
+            .append(history, None, b"cleanup-scope", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        authority.seal().unwrap();
+        let unrelated: Vec<(&str, &[u8])> = vec![
+            ("history-notes.tmp", b"application notes"),
+            ("history-backup.tmp", b"application backup"),
+            ("history-abc.wal.tmp", b"not a generation temp"),
+            ("history-snap-copy.ths.tmp", b"not a generation temp"),
+            ("history-42.txt.tmp", b"not a generation temp"),
+            ("user-data.bin", b"opaque user bytes"),
+        ];
+        for (name, bytes) in &unrelated {
+            std::fs::write(temp.path().join(name), bytes).unwrap();
+        }
+        // Canonical stale temps: never part of any authority, safe to drop.
+        std::fs::write(temp.path().join("history-0.wal.tmp"), b"stale").unwrap();
+        std::fs::write(temp.path().join("history-snap-0.ths.tmp"), b"stale").unwrap();
+        std::fs::write(temp.path().join("history-manifest.json.tmp"), b"stale").unwrap();
+        let summary = authority.gc_quiescent().unwrap();
+        assert_eq!(summary.generation, 2);
+        assert!(summary.cleanup_complete);
+        // Canonical stale temps are gone.
+        for stale in [
+            "history-0.wal.tmp",
+            "history-snap-0.ths.tmp",
+            "history-manifest.json.tmp",
+        ] {
+            assert!(
+                !temp.path().join(stale).exists(),
+                "stale canonical temp {stale} must be removed"
+            );
+        }
+        // Every unrelated file survives byte-exact.
+        for (name, bytes) in &unrelated {
+            assert_eq!(
+                fs::read(temp.path().join(name)).unwrap(),
+                *bytes,
+                "unrelated file {name} must survive GC byte-exact"
+            );
+        }
+        drop(authority);
+        let reopened = open_history_authority(temp.path()).unwrap();
+        assert_eq!(reopened.store.version_count(), 1);
+        let got = reopened.store.lookup_version(v0.id()).unwrap();
+        let mut output = Vec::new();
+        reopened
+            .store
+            .read(
+                got,
+                0,
+                reopened.store.logical_len(got).unwrap().get(),
+                &mut output,
+            )
+            .unwrap();
+        assert_eq!(output, b"cleanup-scope");
+    }
+
+    #[test]
+    fn stale_temp_grammar_matches_only_canonical_names() {
+        for canonical in [
+            "history-0.wal.tmp",
+            "history-00000000000000000004.wal.tmp",
+            "history-snap-0.ths.tmp",
+            "history-snap-00000000000000000004.ths.tmp",
+            "history-manifest.json.tmp",
+        ] {
+            assert!(stale_tulya_temp_file(canonical), "{canonical} must match");
+            assert!(
+                !superseded_generation_file(canonical, 4),
+                "{canonical} is a temp, not a final generation file"
+            );
+        }
+        for unrelated in [
+            "history-notes.tmp",
+            "history-backup.tmp",
+            "history-abc.wal.tmp",
+            "history-snap-copy.ths.tmp",
+            "history-42.txt.tmp",
+            "user-data.bin",
+            "history-manifest.json",
+            "history-00000000000000000004.wal",
+            "history-snap-00000000000000000004.ths",
+        ] {
+            assert!(
+                !stale_tulya_temp_file(unrelated),
+                "{unrelated} must never match"
+            );
+        }
+        // Final-file grammar unchanged: only non-current generations.
+        assert!(superseded_generation_file(&history_wal_filename(3), 4));
+        assert!(!superseded_generation_file(&history_wal_filename(4), 4));
+        assert!(!superseded_generation_file("history-notes.tmp", 4));
+    }
+
     #[test]
     fn thousand_fork_seal_reopen_at_ci_scale() {
         // CI-scale fork fleet through the writable authority: 256 KiB parent,
@@ -1746,7 +2708,10 @@ mod tests {
         for _ in 0..1000 {
             let forked = authority_forked(&mut authority, history, v0.id());
             assert_eq!(forked.parent(), Some(v0.id()));
-            assert_eq!(forked.root(), v0.root());
+            assert_eq!(
+                authority.store().physical_root(forked.id()),
+                authority.store().physical_root(v0.id())
+            );
         }
         let counters_after = authority.store().work_counters();
         assert_eq!(
@@ -1770,7 +2735,10 @@ mod tests {
         for id in [1u64, 500, 1000] {
             let got = reopened.store.lookup_version(VersionId::new(id)).unwrap();
             assert_eq!(got.parent(), Some(v0.id()));
-            assert_eq!(got.root(), base.root());
+            assert_eq!(
+                reopened.store.physical_root(got.id()),
+                reopened.store.physical_root(base.id())
+            );
         }
         let mut head = Vec::new();
         reopened

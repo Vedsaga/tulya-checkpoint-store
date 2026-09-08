@@ -312,6 +312,20 @@ pub trait PersistentSequenceSplice {
     ) -> Result<SpliceResult, Self::Error>;
 }
 
+/// Compact replacement backend from [`BalancedSequence::compact_to_roots`]:
+/// the rebuilt arena, input roots remapped in order, and before/after arena
+/// sizes for maintenance statistics. Reclaimed deltas are the caller's
+/// checked arithmetic.
+#[derive(Debug)]
+pub(crate) struct CompactedSequence {
+    pub(crate) backend: BalancedSequence,
+    pub(crate) roots: Vec<PersistentRoot>,
+    pub(crate) nodes_before: u64,
+    pub(crate) nodes_after: u64,
+    pub(crate) payload_bytes_before: u64,
+    pub(crate) payload_bytes_after: u64,
+}
+
 /// In-memory balanced persistent-sequence backend behind the production seam.
 ///
 /// Wraps the staged AVL core without reimplementing tree logic. Every root
@@ -340,6 +354,68 @@ impl BalancedSequence {
     /// Reports whether the arena holds no payload or nodes.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+
+    /// Counts live arena nodes, reachable or not. Maintenance regimens use
+    /// this alongside [`payload_len`](Self::payload_len) for reclamation
+    /// statistics; foreground locality reasoning keeps using work counters.
+    pub(crate) fn node_count(&self) -> u64 {
+        u64::try_from(self.inner.node_count()).unwrap_or(u64::MAX)
+    }
+
+    /// Reports live payload-arena bytes, reachable or not.
+    pub(crate) fn payload_len(&self) -> u64 {
+        u64::try_from(self.inner.payload_len()).unwrap_or(u64::MAX)
+    }
+
+    /// Rebuilds a compact replacement backend from explicit retained roots.
+    ///
+    /// Generic history-core GC entry: every seed resolves (and therefore
+    /// validates) before planning; unreachable nodes and payload bytes are
+    /// discarded; input roots remap in order. Cumulative foreground work
+    /// counters carry over to the replacement — GC traversal must never
+    /// masquerade as foreground splice/fork/read work, and replacing the
+    /// backend must not silently reset locality history either.
+    pub(crate) fn compact_to_roots(
+        &self,
+        retained_roots: &[PersistentRoot],
+    ) -> Result<CompactedSequence, SequenceError> {
+        let mut canonical = Vec::new();
+        canonical
+            .try_reserve_exact(retained_roots.len())
+            .map_err(|_| {
+                SequenceError::Capacity("sequence compaction root table allocation failed")
+            })?;
+        for root in retained_roots.iter().copied() {
+            canonical.push(self.resolve(root)?);
+        }
+        let nodes_before = self.node_count();
+        let payload_bytes_before = self.payload_len();
+        let (inner, remapped) = self.inner.compact_to_roots(&canonical)?;
+        let backend = Self {
+            inner,
+            work: Cell::new(self.work.get()),
+        };
+        let nodes_after = backend.node_count();
+        let payload_bytes_after = backend.payload_len();
+        let mut roots = Vec::new();
+        roots.try_reserve_exact(remapped.len()).map_err(|_| {
+            SequenceError::Capacity("sequence compaction root table allocation failed")
+        })?;
+        for root in remapped {
+            roots.push(PersistentRoot::balanced_v2(
+                root.node_id(),
+                LogicalLength::new(root.logical_len()),
+            ));
+        }
+        Ok(CompactedSequence {
+            backend,
+            roots,
+            nodes_before,
+            nodes_after,
+            payload_bytes_before,
+            payload_bytes_after,
+        })
     }
 
     /// Encodes the complete arena plus an explicit retained-root table as one
