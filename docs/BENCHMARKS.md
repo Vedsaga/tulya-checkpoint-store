@@ -5,6 +5,51 @@ natural branch-history workload, it occupied less reopened storage than the
 tested checkpoint backends while reconstructing every historical checkpoint
 exactly.
 
+## Presentation contract
+
+Use this format for the README and future public benchmark summaries so readers
+can compare speed, storage, and tradeoffs in one place:
+
+1. Name the implementation, run/evidence ID, corpus size, operation shape, and
+   exactness result before showing measurements. Link the immutable source
+   commit, corpus digest, environment, and raw evidence. Distinguish prototype,
+   regression, and independent evaluation results; never mix runs in a table.
+2. Use one primary table: measurements in rows, Tulya followed by a fixed set
+   of named comparator implementations in columns. Use the same comparators
+   across metrics. Keep the full matrix available in the linked evidence.
+3. Order rows as durable save, historical read after reopen, marginal allocated
+   storage after reopen, peak RSS, and store-open elapsed time. State the
+   statistic and unit in each row label. Show p50/median in the overview and
+   link p95/p99 when recorded; do not derive missing percentiles from medians.
+4. Use ms for timing and decimal MB for bytes in the overview. Keep precision
+   consistent within each row and enough digits to avoid rounding small values
+   to zero. Calculate ratios from raw values, not displayed rounded values.
+5. Say "lower is better" and bold the lowest comparable value in each row,
+   including competitor wins. Mark missing measurements with an em dash and
+   explain it. Mark non-equivalent measurements as not comparable; do not rank
+   them or calculate a speedup from them.
+6. Follow the table with a short result and tradeoff statement. Specify the
+   comparator for each ratio or range. Define "N× faster" and "N× less storage"
+   as comparator measurement divided by Tulya measurement. Report regressions
+   explicitly, using Tulya divided by comparator when describing higher cost.
+7. Define durability, reopened versus controlled-cold reads, empty-store
+   subtraction, memory scope, and store-open timing. Report whole-store and
+   maintenance accounting in the full evidence; marginal storage is not total
+   deployment cost. Keep workload and implementation limitations adjacent.
+
+Use one clean SVG per claim when a visual summary helps: save speed, historical
+read speed, storage, memory, or startup. Each SVG must mirror the table's run,
+comparators, units, and measurement definition. Keep wins and losses separate
+within the relevant claim; do not combine unrelated metrics into one dashboard.
+The graphic must retain exact values, ratios, workload/run identity, and the
+scope limitation in its accessible title/description and visible footnote.
+
+The README currently uses only
+[`clean_public_api_reproduction.json`](../benchmarks/evidence/clean_public_api_reproduction.json)
+(run `TULYA-BF-OH-CLEAN-C59BD4B`, 2026-08-24). The frozen original run discussed
+below is separate; its timing and memory ratios must not be substituted into
+the README's reproduction table.
+
 ## Exact workload contract
 
 The headline result uses only a frozen evaluation subset of
