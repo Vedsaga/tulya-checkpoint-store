@@ -37,7 +37,8 @@ use crate::error_classification::{
     DurabilityOperation,
 };
 use crate::hot_wal_commit::{FileHotWalCommitIo, HotWalCommitter};
-use crate::persistent_history::{HistoryId, PersistentHistoryStore, VersionId};
+use tulya_core::persistent_history::authority::WritableHistoryAuthority;
+use tulya_core::persistent_history::{HistoryId, VersionId};
 
 mod storage_format;
 use storage_format::*;
@@ -47,6 +48,14 @@ use fault_injection::*;
 
 mod fsck;
 pub use fsck::{fsck, FsckReport};
+
+/// Adapter identity maps rebuilt from durable history bindings on every
+/// open: checkpoint thread to generic history, and checkpoint `(thread, id)`
+/// to generic version. Derived, never persisted separately.
+type RebuiltHistoryMaps = (
+    HashMap<String, HistoryId>,
+    HashMap<(String, String), VersionId>,
+);
 
 /// Errors returned by the production checkpoint-store lifecycle.
 #[derive(Debug, Error)]
@@ -85,6 +94,52 @@ pub enum CheckpointStoreError {
 
 fn format_error(message: impl Into<String>) -> CheckpointStoreError {
     CheckpointStoreError::Format(message.into())
+}
+
+/// Encodes a checkpoint `(thread, id)` pair as an opaque core version
+/// binding: `[thread_len: u32 BE][thread bytes][checkpoint bytes]`.
+/// Length framing keeps identifiers containing separator bytes unambiguous;
+/// the core treats these bytes as opaque and echoes them back on reopen for
+/// adapter map reconstruction.
+fn encode_candidate_version_binding(thread_id: &str, checkpoint_id: &str) -> Vec<u8> {
+    let thread = thread_id.as_bytes();
+    let checkpoint = checkpoint_id.as_bytes();
+    let mut binding = Vec::with_capacity(4 + thread.len() + checkpoint.len());
+    binding.extend_from_slice(&(thread.len() as u32).to_be_bytes());
+    binding.extend_from_slice(thread);
+    binding.extend_from_slice(checkpoint);
+    binding
+}
+
+/// Decodes an opaque core version binding back into its checkpoint
+/// `(thread, id)` pair, failing closed on any structural disagreement.
+fn decode_candidate_version_binding(
+    binding: &[u8],
+) -> Result<(String, String), CheckpointStoreError> {
+    if binding.len() < 4 {
+        return Err(format_error(
+            "reopened version binding is shorter than its length prefix",
+        ));
+    }
+    let thread_len = u32::from_be_bytes([binding[0], binding[1], binding[2], binding[3]]) as usize;
+    let Some(thread) = binding.get(4..4 + thread_len) else {
+        return Err(format_error(
+            "reopened version binding thread length exceeds its bytes",
+        ));
+    };
+    let Some(checkpoint) = binding.get(4 + thread_len..) else {
+        return Err(format_error("reopened version binding is truncated"));
+    };
+    if thread.is_empty() || checkpoint.is_empty() {
+        return Err(format_error(
+            "reopened version binding holds an empty identifier",
+        ));
+    }
+    let thread = std::str::from_utf8(thread)
+        .map_err(|_| format_error("reopened version binding thread is not valid UTF-8"))?;
+    let checkpoint = std::str::from_utf8(checkpoint)
+        .map_err(|_| format_error("reopened version binding checkpoint is not valid UTF-8"))?;
+    Ok((thread.to_owned(), checkpoint.to_owned()))
 }
 
 /// Opaque persistent identity for one logical checkpoint store.
@@ -762,16 +817,20 @@ pub struct CheckpointStore {
     hot: HotWal,
     lazy_base: Option<RefCell<LazyCheckpointStore>>,
     range_sizes: RefCell<Vec<Option<u64>>>,
-    /// Staged release-candidate history core. The legacy `state` remains
-    /// authoritative until the candidate path carries durability (P1.3+).
-    /// Staged P1.2: durability wiring makes these fields live; remove the
-    /// allowances then.
+    /// Staged release-candidate history authority: store-wide writer lease,
+    /// owned writable hot log, and generation tracking owned by the generic
+    /// core. The legacy `state` remains authoritative until the candidate
+    /// path carries durability. Staged: remove the allowances when the
+    /// legacy write path migrates onto the candidate authority.
     #[allow(dead_code)]
-    history: PersistentHistoryStore,
+    history_authority: WritableHistoryAuthority,
     /// Adapter mapping: checkpoint thread to generic history identity.
+    /// Derived from durable bindings on every open, never persisted
+    /// separately, so a crash cannot desynchronize it from the log.
     #[allow(dead_code)]
     history_ids: HashMap<String, HistoryId>,
     /// Adapter mapping: checkpoint (thread, id) to generic version identity.
+    /// Derived from durable bindings on every open, like `history_ids`.
     #[allow(dead_code)]
     history_versions: HashMap<(String, String), VersionId>,
 }

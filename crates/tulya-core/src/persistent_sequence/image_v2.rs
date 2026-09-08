@@ -21,7 +21,7 @@ const V2_IMAGE_MAX_RECORD_SIZE: u32 = 4096;
 const V2_IMAGE_DOMAIN: &[u8] = b"tulya-sequence-v2/image\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum V2ImageError {
+pub enum V2ImageError {
     Format(V2FormatError),
     Invalid(&'static str),
     Overflow(&'static str),

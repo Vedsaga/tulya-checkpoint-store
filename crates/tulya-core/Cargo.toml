@@ -1,0 +1,21 @@
+[package]
+name = "tulya-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Domain-neutral persistent history engine: balanced sequences, durable generations, sealed snapshots"
+license = "MIT"
+repository = "https://github.com/Vedsaga/tulya-checkpoint-store"
+keywords = ["persistence", "versioning", "storage"]
+categories = ["data-structures", "database-implementations"]
+
+[lib]
+name = "tulya_core"
+
+[dependencies]
+fs4 = "0.8.4"
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

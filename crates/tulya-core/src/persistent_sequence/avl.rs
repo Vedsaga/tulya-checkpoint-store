@@ -6,14 +6,14 @@
 //! snapshot while later appends allocate only a new leaf and the changed AVL
 //! path.
 
-use super::format_v2::{V2FormatError, V2NodeRecord, V2RootRecord};
+use super::format_v2::{V2FormatError, V2NodeRecord, V2RootRecord, MAX_LEAF_PAYLOAD_BYTES};
 use super::image_v2::{
     decode_v2_image, encode_v2_image, v2_node_fields, V2ImageError, V2NodeFields, V2SequenceImage,
 };
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum V2AvlError {
+pub enum V2AvlError {
     Format(V2FormatError),
     Image(V2ImageError),
     Invalid(&'static str),
@@ -65,6 +65,32 @@ impl V2AppendResult {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct V2SpliceResult {
+    root: V2RootRecord,
+    allocated_nodes: usize,
+    inspected_nodes: usize,
+    payload_bytes_allocated: usize,
+}
+
+impl V2SpliceResult {
+    pub(super) const fn root(self) -> V2RootRecord {
+        self.root
+    }
+
+    pub(super) const fn allocated_nodes(self) -> usize {
+        self.allocated_nodes
+    }
+
+    pub(super) const fn inspected_nodes(self) -> usize {
+        self.inspected_nodes
+    }
+
+    pub(super) const fn payload_bytes_allocated(self) -> usize {
+        self.payload_bytes_allocated
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ArenaNode {
     Leaf {
@@ -96,30 +122,108 @@ pub(super) struct V2AvlSequence {
 impl V2AvlSequence {
     /// Appends `bytes` to `parent`, preserving `parent` and all older roots.
     ///
-    /// An error rolls back every allocation made by this call. Successful
-    /// appends allocate one leaf plus only nodes on the changed AVL path.
+    /// Single-implementation convenience over [`splice`](Self::splice):
+    /// append canonicalizes immediately to a splice at the parent end, so
+    /// there is exactly one durable content-mutation encoding.
     pub(super) fn append(
         &mut self,
         parent: Option<V2RootRecord>,
         bytes: &[u8],
     ) -> Result<V2AppendResult, V2AvlError> {
-        if bytes.is_empty() {
+        // The offset reads record metadata directly; splice re-resolves the
+        // parent against the arena and fails closed on any disagreement.
+        let offset = parent.map_or(0, V2RootRecord::logical_len);
+        let result = self.splice(parent, offset, 0, bytes)?;
+        Ok(V2AppendResult {
+            root: result.root(),
+            allocated_nodes: result.allocated_nodes(),
+            inspected_nodes: result.inspected_nodes(),
+        })
+    }
+
+    /// Persistent local splice: replaces `source[offset..offset+delete_len]`
+    /// with `insert`, preserving `parent` and every older root.
+    ///
+    /// Reference semantics (Lean `PersistentAVLEdit.edit`): split at the
+    /// offset, split the right side at the delete length, drop the deleted
+    /// middle, build the inserted payload as a balanced subtree, and concat
+    /// left + insertion + right. Only the descent paths are copied; a leaf
+    /// split strictly inside one bounded leaf copies at most that leaf's
+    /// fragments.
+    ///
+    /// An error rolls back every allocation made by this call: both arenas
+    /// truncate to their entry lengths and every old root remains exact.
+    /// `None` parent creates a root and requires `offset == 0`,
+    /// `delete_len == 0`, and non-empty `insert`; a zero-effect or
+    /// zero-result splice on an existing parent is rejected.
+    pub(super) fn splice(
+        &mut self,
+        parent: Option<V2RootRecord>,
+        offset: u64,
+        delete_len: u64,
+        insert: &[u8],
+    ) -> Result<V2SpliceResult, V2AvlError> {
+        let source_len = match parent {
+            None => 0,
+            Some(root) => {
+                self.node_for_root(root)?;
+                root.logical_len()
+            }
+        };
+        if offset > source_len {
             return Err(V2AvlError::Invalid(
-                "v2 sequence append payload must be non-empty",
+                "v2 sequence splice offset exceeds parent length",
             ));
         }
-        if let Some(root) = parent {
-            self.node_for_root(root)?;
+        if delete_len > source_len - offset {
+            return Err(V2AvlError::Invalid(
+                "v2 sequence splice delete range exceeds parent length",
+            ));
+        }
+        let insert_len = u64::try_from(insert.len())
+            .map_err(|_| V2AvlError::Overflow("v2 sequence insert length exceeds u64"))?;
+        let result_len =
+            (source_len - delete_len)
+                .checked_add(insert_len)
+                .ok_or(V2AvlError::Overflow(
+                    "v2 sequence splice result length exceeds u64",
+                ))?;
+        match parent {
+            None => {
+                if offset != 0 || delete_len != 0 {
+                    return Err(V2AvlError::Invalid(
+                        "v2 sequence root creation requires zero offset and delete length",
+                    ));
+                }
+                if insert.is_empty() {
+                    return Err(V2AvlError::Invalid(
+                        "v2 sequence root creation requires non-empty insert",
+                    ));
+                }
+            }
+            Some(_) => {
+                if delete_len == 0 && insert.is_empty() {
+                    return Err(V2AvlError::Invalid(
+                        "v2 sequence splice without effect is rejected",
+                    ));
+                }
+            }
+        }
+        if result_len == 0 {
+            return Err(V2AvlError::Invalid(
+                "v2 sequence splice result must be non-empty",
+            ));
         }
 
         let payload_start = self.payload.len();
         let node_start = self.nodes.len();
         let mut inspected = 0usize;
-        match self.append_inner(parent, bytes, &mut inspected) {
-            Ok(root) => Ok(V2AppendResult {
+        match self.splice_inner(parent, offset, delete_len, insert, &mut inspected) {
+            Ok(root) => Ok(V2SpliceResult {
                 root,
                 allocated_nodes: self.nodes.len() - node_start,
                 inspected_nodes: inspected,
+                payload_bytes_allocated: self.payload.len() - payload_start,
             }),
             Err(error) => {
                 self.payload.truncate(payload_start);
@@ -127,6 +231,182 @@ impl V2AvlSequence {
                 Err(error)
             }
         }
+    }
+
+    fn splice_inner(
+        &mut self,
+        parent: Option<V2RootRecord>,
+        offset: u64,
+        delete_len: u64,
+        insert: &[u8],
+        inspected: &mut usize,
+    ) -> Result<V2RootRecord, V2AvlError> {
+        let middle = if insert.is_empty() {
+            None
+        } else {
+            Some(self.build_insert_subtree(insert, inspected)?)
+        };
+        let Some(root) = parent else {
+            // Root creation validated non-empty above; the option unwrap
+            // stays a closed error rather than a panic.
+            return middle.ok_or(V2AvlError::Invalid(
+                "v2 sequence root creation produced no content",
+            ));
+        };
+        let (left, mid_right) = self.split(root, offset, inspected)?;
+        let right = match mid_right {
+            None => None,
+            Some(mid) => {
+                if delete_len == 0 {
+                    Some(mid)
+                } else {
+                    let (_, right) = self.split(mid, delete_len, inspected)?;
+                    right
+                }
+            }
+        };
+        let combined = self.concat_optional(left, middle, inspected)?;
+        let combined = self.concat_optional(combined, right, inspected)?;
+        combined.ok_or(V2AvlError::Invalid(
+            "v2 sequence splice produced an empty root",
+        ))
+    }
+
+    /// Persistent split at `offset`: left holds `[0..offset)`, right holds
+    /// `[offset..len)`. Either side is `None` exactly at the boundaries.
+    /// Only the descent path is copied and rejoined through the balancing
+    /// concat, so both halves stay valid AVL trees sharing every untouched
+    /// node with the source.
+    fn split(
+        &mut self,
+        root: V2RootRecord,
+        offset: u64,
+        inspected: &mut usize,
+    ) -> Result<(Option<V2RootRecord>, Option<V2RootRecord>), V2AvlError> {
+        let len = root.logical_len();
+        if offset > len {
+            return Err(V2AvlError::Invalid(
+                "v2 sequence split offset exceeds root length",
+            ));
+        }
+        if offset == 0 {
+            return Ok((None, Some(root)));
+        }
+        if offset == len {
+            return Ok((Some(root), None));
+        }
+        *inspected = inspected.saturating_add(1);
+        let node = self.node_for_root(root)?.clone();
+        match node {
+            ArenaNode::Leaf {
+                payload_offset,
+                payload_len,
+                ..
+            } => {
+                let left_end = payload_offset
+                    .checked_add(offset)
+                    .ok_or(V2AvlError::Overflow("v2 leaf split range exceeds u64"))?;
+                let leaf_end = payload_offset
+                    .checked_add(payload_len)
+                    .ok_or(V2AvlError::Overflow("v2 leaf split range exceeds u64"))?;
+                // Bounded boundary fragments: the source leaf itself respects
+                // the staging bound, so both copies stay within it.
+                let left_bytes = self.payload_slice(payload_offset, left_end)?.to_vec();
+                let right_bytes = self.payload_slice(left_end, leaf_end)?.to_vec();
+                let left = self.allocate_leaf(&left_bytes)?;
+                let right = self.allocate_leaf(&right_bytes)?;
+                Ok((Some(left), Some(right)))
+            }
+            ArenaNode::Branch { left, right, .. } => {
+                let left_len = left.logical_len();
+                match offset.cmp(&left_len) {
+                    std::cmp::Ordering::Less => {
+                        let (far_left, near) = self.split(left, offset, inspected)?;
+                        let joined_right = match near {
+                            None => right,
+                            Some(near) => self.concat(near, right, inspected)?,
+                        };
+                        Ok((far_left, Some(joined_right)))
+                    }
+                    std::cmp::Ordering::Equal => Ok((Some(left), Some(right))),
+                    std::cmp::Ordering::Greater => {
+                        let (near, far_right) = self.split(right, offset - left_len, inspected)?;
+                        let joined_left = match near {
+                            None => left,
+                            Some(near) => self.concat(left, near, inspected)?,
+                        };
+                        Ok((Some(joined_left), far_right))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Concatenation over possibly empty sides, so split/splice represent
+    /// temporary empty pieces without an externally visible empty root.
+    fn concat_optional(
+        &mut self,
+        left: Option<V2RootRecord>,
+        right: Option<V2RootRecord>,
+        inspected: &mut usize,
+    ) -> Result<Option<V2RootRecord>, V2AvlError> {
+        match (left, right) {
+            (None, None) => Ok(None),
+            (None, Some(root)) | (Some(root), None) => Ok(Some(root)),
+            (Some(left), Some(right)) => Ok(Some(self.concat(left, right, inspected)?)),
+        }
+    }
+
+    /// Builds a balanced subtree for inserted bytes in linear chunk work:
+    /// bounded leaves first, then bottom-up pairing rounds that halve the
+    /// level each round instead of repeatedly path-copying a growing tree.
+    fn build_insert_subtree(
+        &mut self,
+        insert: &[u8],
+        inspected: &mut usize,
+    ) -> Result<V2RootRecord, V2AvlError> {
+        let chunks = insert.len().div_ceil(MAX_LEAF_PAYLOAD_BYTES);
+        let mut level = Vec::new();
+        level
+            .try_reserve_exact(chunks)
+            .map_err(|_| V2AvlError::Invalid("v2 sequence insert level allocation failed"))?;
+        for chunk in insert.chunks(MAX_LEAF_PAYLOAD_BYTES) {
+            level.push(self.allocate_leaf(chunk)?);
+        }
+        while level.len() > 1 {
+            let mut next = Vec::new();
+            next.try_reserve_exact(level.len().div_ceil(2))
+                .map_err(|_| V2AvlError::Invalid("v2 sequence insert level allocation failed"))?;
+            let mut index = 0;
+            while index < level.len() {
+                if index + 1 < level.len() {
+                    next.push(self.concat(level[index], level[index + 1], inspected)?);
+                    index += 2;
+                } else {
+                    next.push(level[index]);
+                    index += 1;
+                }
+            }
+            level = next;
+        }
+        level.pop().ok_or(V2AvlError::Invalid(
+            "v2 sequence insert produced no content",
+        ))
+    }
+
+    /// Allocates one bounded leaf. The record constructor enforces
+    /// non-emptiness and the staging payload bound.
+    fn allocate_leaf(&mut self, bytes: &[u8]) -> Result<V2RootRecord, V2AvlError> {
+        let payload_offset = u64::try_from(self.payload.len())
+            .map_err(|_| V2AvlError::Overflow("v2 payload arena length exceeds u64"))?;
+        let record = V2NodeRecord::leaf(payload_offset, bytes)?;
+        let payload_len = record.logical_len();
+        self.payload.extend_from_slice(bytes);
+        self.allocate_node(ArenaNode::Leaf {
+            payload_offset,
+            payload_len,
+            record,
+        })
     }
 
     /// Returns an exact logical byte range from one retained root.
@@ -229,6 +509,10 @@ impl V2AvlSequence {
 
     pub(super) fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.payload.is_empty() && self.nodes.is_empty()
     }
 
     /// Encodes the complete append-only arena plus an explicit retained-root table.
@@ -339,34 +623,6 @@ impl V2AvlSequence {
             sequence.node_for_root(*root)?;
         }
         Ok((sequence, image.roots))
-    }
-
-    fn append_inner(
-        &mut self,
-        parent: Option<V2RootRecord>,
-        bytes: &[u8],
-        inspected: &mut usize,
-    ) -> Result<V2RootRecord, V2AvlError> {
-        let payload_offset = u64::try_from(self.payload.len())
-            .map_err(|_| V2AvlError::Overflow("v2 payload arena length exceeds u64"))?;
-        let record = V2NodeRecord::leaf(payload_offset, bytes)?;
-        let payload_len = record.logical_len();
-        self.payload.extend_from_slice(bytes);
-        let leaf = self.allocate_node(ArenaNode::Leaf {
-            payload_offset,
-            payload_len,
-            record,
-        })?;
-        match parent {
-            Some(root) => {
-                // Parent validation resolves one arena node; count it so the
-                // append path reports its own traversal work.
-                *inspected = inspected.saturating_add(1);
-                self.node_for_root(root)?;
-                self.concat(root, leaf, inspected)
-            }
-            None => Ok(leaf),
-        }
     }
 
     /// Persistent AVL concatenation. Only the changed spine is copied.
@@ -709,10 +965,12 @@ mod tests {
         let nodes_before = sequence.nodes.len();
         let payload_before = sequence.payload.len();
 
+        // An empty append canonicalizes to a zero-effect splice, which the
+        // splice engine rejects: one canonical mutation, one encoding.
         assert_eq!(
             sequence.append(Some(root), b""),
             Err(V2AvlError::Invalid(
-                "v2 sequence append payload must be non-empty"
+                "v2 sequence splice without effect is rejected"
             ))
         );
         assert_eq!(sequence.nodes.len(), nodes_before);
@@ -784,6 +1042,230 @@ mod tests {
             Err(V2AvlError::Invalid(
                 "v2 image branch child must reference an earlier arena node"
             ))
+        ));
+    }
+
+    fn splice_bytes(
+        sequence: &mut V2AvlSequence,
+        parent: Option<V2RootRecord>,
+        offset: u64,
+        delete_len: u64,
+        insert: &[u8],
+    ) -> Vec<u8> {
+        let root = sequence
+            .splice(parent, offset, delete_len, insert)
+            .expect("test splice should succeed")
+            .root();
+        sequence
+            .verify_root(root)
+            .expect("splice root should verify");
+        let len = root.logical_len();
+        sequence
+            .read_range(root, 0, len)
+            .expect("splice root should read exactly")
+    }
+
+    fn splice_root(
+        sequence: &mut V2AvlSequence,
+        parent: Option<V2RootRecord>,
+        offset: u64,
+        delete_len: u64,
+        insert: &[u8],
+    ) -> V2RootRecord {
+        let result = sequence
+            .splice(parent, offset, delete_len, insert)
+            .expect("test splice should succeed");
+        sequence
+            .verify_root(result.root())
+            .expect("splice root should verify");
+        result.root()
+    }
+
+    #[test]
+    fn splice_insert_start_middle_end_is_exact() {
+        let mut sequence = V2AvlSequence::default();
+        let base = splice_root(&mut sequence, None, 0, 0, b"abcdef");
+        assert_eq!(
+            splice_bytes(&mut sequence, Some(base), 0, 0, b"START-"),
+            b"START-abcdef"
+        );
+        assert_eq!(
+            splice_bytes(&mut sequence, Some(base), 3, 0, b"-MID-"),
+            b"abc-MID-def"
+        );
+        assert_eq!(
+            splice_bytes(&mut sequence, Some(base), 6, 0, b"-END"),
+            b"abcdef-END"
+        );
+        // The source root is untouched by every edit.
+        assert_eq!(sequence.read_range(base, 0, 6).unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn splice_delete_start_middle_end_across_leaves_is_exact() {
+        let mut sequence = V2AvlSequence::default();
+        // Three appends force multiple leaves so deletions span them.
+        let mut base = None;
+        for chunk in [b"aa".as_slice(), b"bbbb".as_slice(), b"cc".as_slice()] {
+            base = Some(sequence.append(base, chunk).unwrap().root());
+        }
+        let base = base.unwrap();
+        assert_eq!(sequence.read_range(base, 0, 8).unwrap(), b"aabbbbcc");
+        assert_eq!(
+            splice_bytes(&mut sequence, Some(base), 0, 2, b""),
+            b"bbbbcc"
+        );
+        assert_eq!(splice_bytes(&mut sequence, Some(base), 2, 4, b""), b"aacc");
+        assert_eq!(
+            splice_bytes(&mut sequence, Some(base), 6, 2, b""),
+            b"aabbbb"
+        );
+        assert_eq!(splice_bytes(&mut sequence, Some(base), 1, 6, b""), b"ac");
+        assert_eq!(sequence.read_range(base, 0, 8).unwrap(), b"aabbbbcc");
+    }
+
+    #[test]
+    fn splice_replace_equal_shorter_longer_cross_leaf_is_exact() {
+        let mut sequence = V2AvlSequence::default();
+        let mut base = None;
+        for chunk in [b"0123456789".as_slice(), b"ABCDEFGHIJ".as_slice()] {
+            base = Some(sequence.append(base, chunk).unwrap().root());
+        }
+        let base = base.unwrap();
+        // Equal length, interior, spanning the leaf boundary.
+        assert_eq!(
+            splice_bytes(&mut sequence, Some(base), 8, 4, b"xxxx"),
+            b"01234567xxxxCDEFGHIJ"
+        );
+        // Shorter.
+        assert_eq!(
+            splice_bytes(&mut sequence, Some(base), 5, 10, b"Q"),
+            b"01234QFGHIJ"
+        );
+        // Longer, reaching both ends.
+        assert_eq!(
+            splice_bytes(&mut sequence, Some(base), 2, 16, b"0123456789ABCDEFGHIJ"),
+            b"010123456789ABCDEFGHIJIJ"
+        );
+        assert_eq!(
+            sequence.read_range(base, 0, 20).unwrap(),
+            b"0123456789ABCDEFGHIJ"
+        );
+    }
+
+    #[test]
+    fn splice_preserves_history_across_branches() {
+        let mut sequence = V2AvlSequence::default();
+        let v0 = splice_root(&mut sequence, None, 0, 0, b"base-payload");
+        let v1 = splice_root(&mut sequence, Some(v0), 5, 0, b"[edit1]");
+        assert_eq!(
+            sequence.read_range(v1, 0, v1.logical_len()).unwrap(),
+            b"base-[edit1]payload"
+        );
+        // A sibling edit off the same historical parent leaves both intact.
+        let v2 = splice_root(&mut sequence, Some(v0), 0, 4, b"EDIT");
+        assert_eq!(
+            sequence.read_range(v2, 0, v2.logical_len()).unwrap(),
+            b"EDIT-payload"
+        );
+        for (root, expected) in [
+            (v0, b"base-payload".as_slice()),
+            (v1, b"base-[edit1]payload".as_slice()),
+            (v2, b"EDIT-payload".as_slice()),
+        ] {
+            sequence.verify_root(root).unwrap();
+            assert_eq!(
+                sequence.read_range(root, 0, root.logical_len()).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn splice_rejects_invalid_coordinates_without_allocation() {
+        let mut sequence = V2AvlSequence::default();
+        let base = splice_root(&mut sequence, None, 0, 0, b"abcdef");
+        let nodes_before = sequence.node_count();
+        let cases = [
+            // offset past the end
+            (Some(base), 7, 0, b"x".as_slice()),
+            (Some(base), u64::MAX, 0, b"x"),
+            // delete past the end
+            (Some(base), 5, 2, b""),
+            (Some(base), 0, 7, b""),
+            // zero-effect splice
+            (Some(base), 3, 0, b""),
+            // zero-result splice
+            (Some(base), 0, 6, b""),
+            // root creation violations
+            (None, 1, 0, b"x"),
+            (None, 0, 1, b"x"),
+            (None, 0, 0, b""),
+            // cross-history shape is a history-layer rule; the AVL layer
+            // rejects the unknown-root coordinate here
+        ];
+        for (parent, offset, delete_len, insert) in cases {
+            assert!(
+                sequence.splice(parent, offset, delete_len, insert).is_err(),
+                "offset={offset} delete={delete_len} must fail"
+            );
+        }
+        // Rejections allocate nothing and disturb no root.
+        assert_eq!(sequence.node_count(), nodes_before);
+        assert_eq!(sequence.read_range(base, 0, 6).unwrap(), b"abcdef");
+        // A root from another arena fails closed at resolution even when the
+        // node identifier collides: commitments disagree.
+        let mut foreign = V2AvlSequence::default();
+        let foreign_root = splice_root(&mut foreign, None, 0, 0, b"foreign");
+        assert!(sequence.splice(Some(foreign_root), 0, 0, b"x").is_err());
+    }
+
+    #[test]
+    fn root_creation_chunks_large_payload_into_bounded_leaves() {
+        let mut sequence = V2AvlSequence::default();
+        let payload = vec![0xABu8; 100 * 1024];
+        let result = sequence
+            .splice(None, 0, 0, &payload)
+            .expect("large root creation should succeed");
+        // 100 KiB needs 7 bounded leaves plus branch structure: never one
+        // giant leaf, and the arena holds exactly the payload once.
+        assert!(result.allocated_nodes() >= 7);
+        assert_eq!(result.payload_bytes_allocated(), 100 * 1024);
+        let root = result.root();
+        assert_eq!(root.logical_len(), 100 * 1024);
+        assert_eq!(sequence.read_range(root, 0, 100 * 1024).unwrap(), payload);
+        sequence.verify_root(root).unwrap();
+        // The chunked image round-trips through the bound-enforcing import.
+        let image = sequence.export_image(&[root]).unwrap();
+        let (rebuilt, roots) = V2AvlSequence::import_image(&image).unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(
+            rebuilt.read_range(roots[0], 0, 100 * 1024).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn node_codec_rejects_oversized_staging_leaf() {
+        use crate::persistent_sequence::format_v2::{
+            decode_v2_node, encode_v2_node, V2NodeRecord, MAX_LEAF_PAYLOAD_BYTES,
+        };
+
+        let record = encode_v2_node(V2NodeRecord::leaf(0, b"ok").unwrap());
+        let mut oversized = record;
+        let wide = (MAX_LEAF_PAYLOAD_BYTES + 1) as u64;
+        oversized[8..16].copy_from_slice(&wide.to_le_bytes());
+        oversized[24..32].copy_from_slice(&wide.to_le_bytes());
+        assert_eq!(
+            decode_v2_node(&oversized),
+            Err(V2FormatError::Invalid(
+                "v2 leaf payload exceeds the staging bound"
+            ))
+        );
+        // The constructor gate agrees: no valid leaf can exceed the bound.
+        assert!(matches!(
+            V2NodeRecord::leaf(0, &vec![0u8; MAX_LEAF_PAYLOAD_BYTES + 1]),
+            Err(V2FormatError::Invalid(_))
         ));
     }
 }

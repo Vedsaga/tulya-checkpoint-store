@@ -46,34 +46,10 @@ pub enum CheckpointStoreFailureKind {
     LegacyUnclassified,
 }
 
-/// Durability operation whose failure can leave commit outcome indeterminate.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DurabilityOperation {
-    /// Flush after a complete WAL record has been written.
-    WalFlush,
-    /// Data-only durability barrier for a complete WAL record.
-    WalSyncData,
-    /// Full file durability barrier used by immutable/publication artifacts.
-    FileSyncAll,
-    /// Atomic publication rename after the staged file is durable.
-    Rename,
-    /// Parent-directory durability barrier after publication rename.
-    DirectorySync,
-}
-
-impl fmt::Display for DurabilityOperation {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Self::WalFlush => "wal-flush",
-            Self::WalSyncData => "wal-sync-data",
-            Self::FileSyncAll => "file-sync-all",
-            Self::Rename => "rename",
-            Self::DirectorySync => "directory-sync",
-        };
-        formatter.write_str(name)
-    }
-}
+/// Single definition lives in `tulya_core::operation`; this re-export keeps
+/// every existing `error_classification::DurabilityOperation` path working
+/// while the core owns the taxonomy.
+pub use tulya_core::DurabilityOperation;
 
 /// Typed context retained when durable commit may have happened before an I/O
 /// error was observed.

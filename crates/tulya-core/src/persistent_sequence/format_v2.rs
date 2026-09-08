@@ -19,6 +19,15 @@ const V2_NONE_NODE: u64 = u64::MAX;
 const V2_LEAF_DOMAIN: &[u8] = b"tulya-sequence-v2/leaf\0";
 const V2_BRANCH_DOMAIN: &[u8] = b"tulya-sequence-v2/branch\0";
 
+/// Staging bound on one leaf payload in bytes.
+///
+/// Newly built leaves (insert chunks, split boundary fragments, root
+/// creation) never exceed this, and decoding/import validation rejects
+/// anything larger, so a splice inside any leaf copies at most this many
+/// boundary bytes instead of an unbounded staging leaf. NOT release-frozen:
+/// tuned before the release format freeze using locality measurements.
+pub(super) const MAX_LEAF_PAYLOAD_BYTES: usize = 16 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct V2Commitment([u8; 32]);
 
@@ -33,7 +42,7 @@ impl V2Commitment {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum V2FormatError {
+pub enum V2FormatError {
     RecordLength {
         record: &'static str,
         expected: usize,
@@ -87,6 +96,11 @@ impl V2NodeRecord {
         if payload.is_empty() {
             return Err(V2FormatError::Invalid(
                 "v2 sequence leaf payload must be non-empty",
+            ));
+        }
+        if payload.len() > MAX_LEAF_PAYLOAD_BYTES {
+            return Err(V2FormatError::Invalid(
+                "v2 sequence leaf payload exceeds the staging bound",
             ));
         }
         let logical_len = u64::try_from(payload.len())
@@ -268,6 +282,11 @@ pub(super) fn decode_v2_node(bytes: &[u8]) -> Result<V2NodeRecord, V2FormatError
             if field_b != logical_len {
                 return Err(V2FormatError::Invalid(
                     "v2 leaf payload length disagrees with logical length",
+                ));
+            }
+            if logical_len > MAX_LEAF_PAYLOAD_BYTES as u64 {
+                return Err(V2FormatError::Invalid(
+                    "v2 leaf payload exceeds the staging bound",
                 ));
             }
             if field_c != 0 {

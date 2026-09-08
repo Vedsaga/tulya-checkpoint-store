@@ -23,12 +23,6 @@ mod error_classification;
 #[allow(dead_code)]
 mod format_authority;
 mod hot_wal_commit;
-mod persistent_sequence;
-
-// The domain-neutral history core is staged: its CheckpointStore client lands
-// in the next slice, which removes this allowance.
-#[allow(dead_code)]
-mod persistent_history;
 
 pub mod admin;
 pub mod format;
