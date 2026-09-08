@@ -1,20 +1,24 @@
-//! Splice-epoch durable log for the domain-neutral history core.
+//! Fork-epoch durable log for the domain-neutral history core.
 //!
 //! The log is the durability authority for generic history: a sequence of
 //! framed records replayed from genesis on open. It stores no adapter
 //! vocabulary — only numeric history/version identities, parent links,
 //! splice coordinates, inserted bytes, request identities, and operation
-//! digests.
+//! digests. Fork records store no root or content: replay resolves the
+//! republished root from the encoded parent version.
 //!
-//! Staging epoch note: the `THL2` magic and the splice record below replace
-//! the pre-E2 append-only `THL1` grammar. Old staging logs fail closed at
+//! Staging epoch note: the `THL3` magic and the splice/fork records below
+//! replace the E2 `THL2` splice-only grammar. Old staging logs fail closed at
 //! the frame magic and are never reinterpreted; there is deliberately no
-//! migration parser (zero external users).
+//! migration parser (zero external users). An E2 binary does not understand
+//! fork semantics, and a fork may exist solely in a sealed snapshot
+//! catalogue — so the epoch gate, not unknown-tag rejection, is what keeps
+//! pre-E3 code from reading E3 authority.
 //!
 //! Frame layout (all integers little-endian):
 //!
 //! ```text
-//! magic[4] = THL2
+//! magic[4] = THL3
 //! body_len[u64]
 //! body[..]
 //! footer_magic[4] = THLF
@@ -25,10 +29,14 @@
 //! Record bodies:
 //!
 //! ```text
-//! kind[u8]: 1 = create history, 4 = splice, 3 = retire
+//! kind[u8]: 1 = create history, 4 = splice, 5 = fork, 3 = retire
 //! create:  history_id[u64], binding-present[u8] + len[u64] + bytes
 //! splice:  history_id[u64], version_id[u64], parent[u64, MAX = none],
 //!          offset[u64], delete_len[u64], insert_len[u64], insert[..],
+//!          request_len[u64], request[..],
+//!          binding-present[u8] + len[u64] + bytes,
+//!          operation_digest[32]
+//! fork:    history_id[u64], version_id[u64], parent[u64],
 //!          request_len[u64], request[..],
 //!          binding-present[u8] + len[u64] + bytes,
 //!          operation_digest[32]
@@ -53,7 +61,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-const HISTORY_LOG_MAGIC: [u8; 4] = *b"THL2";
+const HISTORY_LOG_MAGIC: [u8; 4] = *b"THL3";
 const HISTORY_LOG_FOOTER_MAGIC: [u8; 4] = *b"THLF";
 const HISTORY_LOG_HEADER_SIZE: usize = 12;
 const HISTORY_LOG_FOOTER_SIZE: usize = 44;
@@ -65,6 +73,9 @@ const RECORD_RETIRE: u8 = 3;
 /// append-oriented commit record and is deliberately never reused, so no
 /// staging byte sequence can be reinterpreted across the grammar epoch.
 const RECORD_SPLICE: u8 = 4;
+/// Canonical fork/publication record tag: catalogue metadata only, no root
+/// or content stored. Tag 2 stays retired and is never reused.
+const RECORD_FORK: u8 = 5;
 const NO_PARENT: u64 = u64::MAX;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +91,14 @@ pub enum HistoryLogRecord {
         offset: u64,
         delete_len: u64,
         insert: Vec<u8>,
+        request_id: Option<Vec<u8>>,
+        binding: Option<Vec<u8>>,
+        digest: [u8; 32],
+    },
+    Fork {
+        history: HistoryId,
+        version: VersionId,
+        parent: VersionId,
         request_id: Option<Vec<u8>>,
         binding: Option<Vec<u8>>,
         digest: [u8; 32],
@@ -204,6 +223,44 @@ pub fn encode_history_log_record(record: &HistoryLogRecord) -> Result<Vec<u8>, H
             }
             output.extend_from_slice(digest);
         }
+        HistoryLogRecord::Fork {
+            history,
+            version,
+            parent,
+            request_id,
+            binding,
+            digest,
+        } => {
+            output.push(RECORD_FORK);
+            output.extend_from_slice(&history.id().to_le_bytes());
+            output.extend_from_slice(&version.id().to_le_bytes());
+            output.extend_from_slice(&parent.id().to_le_bytes());
+            match request_id {
+                Some(id) => {
+                    if id.len() > MAX_HISTORY_REQUEST_ID_BYTES {
+                        return Err(HistoryError::Invalid(
+                            "history log request identity exceeds the byte limit",
+                        ));
+                    }
+                    put_u64(&mut output, id.len() as u64);
+                    output.extend_from_slice(id);
+                }
+                None => put_u64(&mut output, 0),
+            }
+            match binding {
+                Some(bytes) => {
+                    if bytes.len() > MAX_HISTORY_BINDING_BYTES {
+                        return Err(HistoryError::Invalid(
+                            "history log binding exceeds the byte limit",
+                        ));
+                    }
+                    put_u64(&mut output, bytes.len() as u64 + 1);
+                    output.extend_from_slice(bytes);
+                }
+                None => put_u64(&mut output, 0),
+            }
+            output.extend_from_slice(digest);
+        }
         HistoryLogRecord::Retire { request_id, digest } => {
             output.push(RECORD_RETIRE);
             if request_id.len() > MAX_HISTORY_REQUEST_ID_BYTES {
@@ -241,6 +298,22 @@ fn encoded_record_len(record: &HistoryLogRecord) -> Result<usize, HistoryError> 
             .and_then(|value| value.checked_add(8))
             .and_then(|value| value.checked_add(8))
             .and_then(|value| value.checked_add(insert.len()))
+            .and_then(|value| value.checked_add(8))
+            .and_then(|value| value.checked_add(request_id.as_ref().map_or(0, Vec::len)))
+            .and_then(|value| value.checked_add(8))
+            .and_then(|value| value.checked_add(binding.as_ref().map_or(0, Vec::len)))
+            .and_then(|value| value.checked_add(32))
+            .ok_or(HistoryError::Overflow(
+                "history log record length exceeds usize",
+            ))?,
+        HistoryLogRecord::Fork {
+            request_id,
+            binding,
+            ..
+        } => 1usize
+            .checked_add(8)
+            .and_then(|value| value.checked_add(8))
+            .and_then(|value| value.checked_add(8))
             .and_then(|value| value.checked_add(8))
             .and_then(|value| value.checked_add(request_id.as_ref().map_or(0, Vec::len)))
             .and_then(|value| value.checked_add(8))
@@ -312,6 +385,33 @@ pub fn decode_history_log_record(bytes: &[u8]) -> Result<HistoryLogRecord, Histo
                 offset,
                 delete_len,
                 insert: insert.to_vec(),
+                request_id,
+                binding,
+                digest,
+            }
+        }
+        RECORD_FORK => {
+            let history = HistoryId(cursor.take_u64()?);
+            let version = VersionId(cursor.take_u64()?);
+            let parent = VersionId(cursor.take_u64()?);
+            let request_len = cursor.take_u64()?;
+            let request_id = if request_len == 0 {
+                None
+            } else {
+                if request_len > MAX_HISTORY_REQUEST_ID_BYTES as u64 {
+                    return Err(HistoryError::Invalid(
+                        "history log request identity exceeds the byte limit",
+                    ));
+                }
+                let bytes = cursor.take_bytes(request_len)?;
+                Some(bytes.to_vec())
+            };
+            let binding = decode_optional_binding(&mut cursor)?;
+            let digest = cursor.take_array::<32>()?;
+            HistoryLogRecord::Fork {
+                history,
+                version,
+                parent,
                 request_id,
                 binding,
                 digest,
@@ -599,6 +699,28 @@ fn apply_recovered_record(
                 ));
             }
         }
+        HistoryLogRecord::Fork {
+            history,
+            version,
+            parent,
+            request_id,
+            binding,
+            digest,
+        } => {
+            let assigned = store.replay_fork(
+                *history,
+                *version,
+                *parent,
+                request_id.as_deref(),
+                binding.as_deref(),
+                *digest,
+            )?;
+            if assigned != *version {
+                return Err(HistoryError::Invalid(
+                    "history log version identity disagrees with replay order",
+                ));
+            }
+        }
         HistoryLogRecord::Retire { request_id, digest } => {
             store.replay_retire(request_id, *digest)?;
         }
@@ -764,6 +886,22 @@ mod tests {
                 binding: None,
             },
             splice_record(),
+            HistoryLogRecord::Fork {
+                history: HistoryId(2),
+                version: VersionId(6),
+                parent: VersionId(4),
+                request_id: Some(b"req-fork".to_vec()),
+                binding: Some(b"bind-fork".to_vec()),
+                digest: [0x44; 32],
+            },
+            HistoryLogRecord::Fork {
+                history: HistoryId(0),
+                version: VersionId(0),
+                parent: VersionId(0),
+                request_id: None,
+                binding: None,
+                digest: [0x00; 32],
+            },
             HistoryLogRecord::Splice {
                 history: HistoryId(0),
                 version: VersionId(0),

@@ -11,7 +11,10 @@
 //! ```text
 //! magic[4] = THS1
 //! total_len[u64]          (exact byte length of the whole artifact)
-//! schema[u32] = 2         (staging epoch: 1 = pre-E2 append grammar, rejected)
+//! schema[u32] = 3         (staging epoch: 1 = pre-E2 append grammar, rejected;
+//!                          2 = E2 splice-only grammar, rejected: an E3 sealed
+//!                          snapshot may catalogue a forked child sharing its
+//!                          parent root, which E2 binaries cannot interpret)
 //! generation[u64]
 //! represented_wal_end[u64](exact hot-log prefix byte length represented)
 //! history_count[u64]
@@ -43,11 +46,13 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
 const HISTORY_SNAPSHOT_MAGIC: [u8; 4] = *b"THS1";
-/// Staging snapshot schema epoch: 2 covers the splice operation grammar.
-/// Schema-1 snapshots carry append-grammar request digests and fail closed
-/// at decode; there is deliberately no migration (zero external users).
+/// Staging snapshot schema epoch: 3 covers the splice + fork operation
+/// grammar. Schema-1 snapshots carry append-grammar request digests and
+/// schema-2 snapshots carry splice-only catalogues; both fail closed at
+/// decode because an E3 snapshot may catalogue a forked child sharing its
+/// parent root. There is deliberately no migration (zero external users).
 /// NOT a release format version; E9 freezes release Format v1.
-const HISTORY_SNAPSHOT_SCHEMA: u32 = 2;
+const HISTORY_SNAPSHOT_SCHEMA: u32 = 3;
 const HISTORY_SNAPSHOT_HEADER_SIZE: usize = 88;
 const HISTORY_SNAPSHOT_DIGEST_DOMAIN: &[u8] = b"tulya-history/v1/snapshot\0";
 const NO_PARENT: u64 = u64::MAX;

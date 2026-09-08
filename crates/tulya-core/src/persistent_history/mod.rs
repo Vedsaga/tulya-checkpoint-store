@@ -47,6 +47,15 @@ use durable_log::{DurableError, DurableHistoryLog, HistoryLogRecord};
 /// ever validating as splice operations.
 const HISTORY_SPLICE_DIGEST_DOMAIN: &[u8] = b"tulya-history/staging/splice\0";
 
+/// Domain separator for the canonical fork/publication operation digest.
+///
+/// A distinct operation domain from splice: fork binds the historical parent
+/// whose immutable root is republished, never content coordinates. A request
+/// bound to a splice digest therefore conflicts deterministically with the
+/// same request offered as a fork, and vice versa. Staging domain, not a
+/// release Format-v1 commitment.
+const HISTORY_FORK_DIGEST_DOMAIN: &[u8] = b"tulya-history/staging/fork\0";
+
 /// Maximum request-identity byte length accepted by the history core.
 const MAX_HISTORY_REQUEST_ID_BYTES: usize = 4096;
 
@@ -209,6 +218,63 @@ pub fn history_splice_digest(
     output
 }
 
+/// Computes the canonical digest for one exact fork/publication.
+///
+/// The digest binds history, the historical parent identity, and the opaque
+/// adapter binding — the complete logical coordinates of the operation. It
+/// deliberately excludes the assigned version identity (a consequence, not an
+/// input) and the republished root (canonically determined by the committed
+/// parent). Fork is catalogue metadata only: there are no content
+/// coordinates to bind.
+pub fn history_fork_digest(
+    history: HistoryId,
+    parent: VersionId,
+    binding: Option<&[u8]>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(HISTORY_FORK_DIGEST_DOMAIN);
+    hasher.update(history.id().to_le_bytes());
+    hasher.update(parent.id().to_le_bytes());
+    match binding {
+        Some(bytes) => {
+            hasher.update([1u8]);
+            hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+            hasher.update(bytes);
+        }
+        None => {
+            hasher.update([0u8]);
+        }
+    }
+    let digest = hasher.finalize();
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&digest);
+    output
+}
+
+/// A checked fresh-version identity prepared before backend mutation or
+/// authority I/O. Shared by splice and fork preparation: every operation that
+/// creates a new Version validates/reserves its logical VersionId in
+/// preparation (E2 exhaustion-correction invariant, reused by E3 fork).
+struct PreparedVersionIdentity {
+    version: VersionId,
+    next_version_id_after: u64,
+}
+
+/// Checks out the next fresh version identity without mutating anything: an
+/// exhausted counter fails here, before WAL construction, backend work, or
+/// table mutation.
+fn prepare_version_identity(next_version_id: u64) -> Result<PreparedVersionIdentity, HistoryError> {
+    let next_version_id_after = next_version_id
+        .checked_add(1)
+        .ok_or(HistoryError::Overflow(
+            "persistent version count exceeds u64",
+        ))?;
+    Ok(PreparedVersionIdentity {
+        version: VersionId(next_version_id),
+        next_version_id_after,
+    })
+}
+
 /// One active request-ledger entry: the bound operation digest plus the
 /// committed version that replay must return without a second mutation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,6 +341,33 @@ struct PreparedSplice<'a> {
     offset: u64,
     delete_len: u64,
     insert: &'a [u8],
+    request_id: Option<&'a [u8]>,
+    binding: Option<&'a [u8]>,
+    digest: [u8; 32],
+}
+
+/// Result of validating a logical fork without mutating state.
+enum ForkPreview<'a> {
+    Replayed(Version),
+    Retired,
+    Fresh(PreparedFork<'a>),
+}
+
+/// A validated logical fork awaiting persistence and application. Borrows
+/// caller bytes so preparation itself never allocates payload copies.
+///
+/// The fresh version identity is allocated (checked) at preview time, before
+/// any authority I/O or catalogue mutation, reusing the E2 splice discipline
+/// exactly: an exhausted counter fails here, never after WAL work. No backend
+/// operation is needed to obtain the root beyond committed catalogue lookup —
+/// fork reuses the parent's immutable root without touching the sequence
+/// layer at all.
+struct PreparedFork<'a> {
+    version: VersionId,
+    next_version_id_after: u64,
+    history: HistoryId,
+    parent: VersionId,
+    root: PersistentRoot,
     request_id: Option<&'a [u8]>,
     binding: Option<&'a [u8]>,
     digest: [u8; 32],
@@ -460,6 +553,46 @@ impl PersistentHistoryStore {
         self.splice(history, parent, offset, 0, bytes, request_id, binding)
     }
 
+    /// Publishes a new logical version pointing at the exact existing root
+    /// of one historical parent: the zero-content fork/branch operation.
+    ///
+    /// A successful fresh fork produces a first-class version whose root is
+    /// the parent's immutable root — no sequence splice runs, no AVL nodes or
+    /// payload bytes are allocated, no content is copied, and no existing
+    /// root changes. Only catalogue/version metadata grows. The forked
+    /// version is itself a normal parent for later splices.
+    ///
+    /// This is a distinct semantic operation from splice, never a
+    /// zero-effect splice encoding: E2 rejects zero-effect splices so fork
+    /// keeps an unambiguous semantic identity (and its own digest domain).
+    ///
+    /// The parent must exist and belong to the same history; any retained
+    /// historical version may be forked, not merely the latest. There is no
+    /// parentless fork: root versions are created by non-empty splice.
+    ///
+    /// With `request_id`, the durable idempotency matrix applies exactly as
+    /// for splice, keyed by the distinct fork digest: an unknown identity
+    /// forks; a bound identity with the same canonical fork digest replays
+    /// its committed version with no second entry; a different digest —
+    /// including any splice digest, which lives in another domain —
+    /// conflicts; a retired identity never resurrects.
+    ///
+    /// `binding` carries opaque adapter material recorded alongside the
+    /// version and covered by the operation digest, exactly as for splice.
+    pub fn fork(
+        &mut self,
+        history: HistoryId,
+        parent: VersionId,
+        request_id: Option<&[u8]>,
+        binding: Option<&[u8]>,
+    ) -> Result<CommitOutcome, HistoryError> {
+        match self.preview_fork(history, parent, request_id, binding)? {
+            ForkPreview::Replayed(version) => Ok(CommitOutcome::Replayed(version)),
+            ForkPreview::Retired => Ok(CommitOutcome::Retired),
+            ForkPreview::Fresh(prepared) => self.apply_prepared_fork(&prepared),
+        }
+    }
+
     /// Validates a logical splice without mutating anything: history and
     /// parent resolution, splice-coordinate validation against the parent
     /// length, canonical-digest computation, and the full request-ledger
@@ -560,15 +693,10 @@ impl PersistentHistoryStore {
             // preview and can never strand arena work or an unrecoverable
             // max-Version WAL record. Replay/retired outcomes above need no
             // identity and return before this point.
-            let next_version_id_after =
-                self.next_version_id
-                    .checked_add(1)
-                    .ok_or(HistoryError::Overflow(
-                        "persistent version count exceeds u64",
-                    ))?;
+            let identity = prepare_version_identity(self.next_version_id)?;
             PreparedSplice {
-                version: VersionId(self.next_version_id),
-                next_version_id_after,
+                version: identity.version,
+                next_version_id_after: identity.next_version_id_after,
                 history,
                 parent,
                 parent_root,
@@ -626,6 +754,132 @@ impl PersistentHistoryStore {
             id: prepared.version,
             parent: prepared.parent,
             root: splice.root,
+        };
+        self.versions.push(version);
+        if let Some(request) = prepared.request_id {
+            let _ = self.active_requests.insert(
+                request.to_vec(),
+                ActiveRequest {
+                    digest: prepared.digest,
+                    version: version.id(),
+                },
+            );
+        }
+        if let Some(binding) = prepared.binding {
+            let _ = self.version_bindings.insert(version.id(), binding.to_vec());
+        }
+        Ok(CommitOutcome::Committed(version))
+    }
+
+    /// Validates a logical fork without mutating anything: history and
+    /// parent resolution with same-history enforcement, canonical-digest
+    /// computation, the full request-ledger matrix, and checked fresh-version
+    /// identity allocation. Durable fork runs this first, persists the
+    /// prepared bytes, and only then applies — so a rejected fork can never
+    /// reach the log, where an encoded-but-unappliable record would brick
+    /// recovery.
+    ///
+    /// No backend operation runs here: the republished root comes from
+    /// committed catalogue lookup alone, so the sequence work counters cannot
+    /// move during preparation.
+    fn preview_fork<'a>(
+        &self,
+        history: HistoryId,
+        parent: VersionId,
+        request_id: Option<&'a [u8]>,
+        binding: Option<&'a [u8]>,
+    ) -> Result<ForkPreview<'a>, HistoryError> {
+        self.require_unpoisoned()?;
+        if !self.histories.contains(&history) {
+            return Err(HistoryError::Invalid(
+                "persistent fork targets an unknown history",
+            ));
+        }
+        if let Some(bytes) = binding {
+            validate_binding(bytes)?;
+        }
+        let parent_record = self.version_record(parent)?;
+        if parent_record.history() != history {
+            return Err(HistoryError::Invalid(
+                "persistent fork parent belongs to a different history",
+            ));
+        }
+        let root = parent_record.root();
+        let digest = history_fork_digest(history, parent, binding);
+        if let Some(request) = request_id {
+            validate_request_identity(request)?;
+            if let Some(active) = self.active_requests.get(request) {
+                if active.digest() == digest {
+                    let version = self.version_record(active.version())?;
+                    return Ok(ForkPreview::Replayed(version));
+                }
+                return Err(HistoryError::RequestConflict);
+            }
+            if let Some(retired) = self.retired_requests.get(request) {
+                if *retired == digest {
+                    return Ok(ForkPreview::Retired);
+                }
+                return Err(HistoryError::RequestConflict);
+            }
+        }
+        Ok(ForkPreview::Fresh({
+            // Allocate the fresh identity here — after validation, before any
+            // authority I/O or catalogue mutation — reusing the E2 splice
+            // discipline exactly. Replay/retired outcomes above need no
+            // identity and return before this point.
+            let identity = prepare_version_identity(self.next_version_id)?;
+            PreparedFork {
+                version: identity.version,
+                next_version_id_after: identity.next_version_id_after,
+                history,
+                parent,
+                root,
+                request_id,
+                binding,
+                digest,
+            }
+        }))
+    }
+
+    /// Applies a prepared fork: the single catalogue-mutation point shared by
+    /// the in-memory and durable paths.
+    ///
+    /// Every fallible table/ledger/binding reservation completes before the
+    /// catalogue edit runs. The live counter must still equal the prepared
+    /// identity — a mismatch fails here, before any mutation on the pure
+    /// in-memory path (and poisons post-barrier on the durable path via the
+    /// caller's mapping). Only after the reservations succeed is the prepared
+    /// successor counter adopted: there is no checked VersionId arithmetic
+    /// after catalogue mutation, and deliberately no backend call anywhere —
+    /// the exact captured parent root is stored directly.
+    fn apply_prepared_fork(
+        &mut self,
+        prepared: &PreparedFork<'_>,
+    ) -> Result<CommitOutcome, HistoryError> {
+        if self.next_version_id != prepared.version.id() {
+            return Err(HistoryError::Invalid(
+                "prepared fork identity disagrees with the allocation counter",
+            ));
+        }
+        self.versions
+            .try_reserve(1)
+            .map_err(|_| HistoryError::Capacity("persistent version table allocation failed"))?;
+        if prepared.request_id.is_some() {
+            self.active_requests.try_reserve(1).map_err(|_| {
+                HistoryError::Capacity("persistent active request allocation failed")
+            })?;
+        }
+        if prepared.binding.is_some() {
+            self.version_bindings.try_reserve(1).map_err(|_| {
+                HistoryError::Capacity("persistent version binding allocation failed")
+            })?;
+        }
+        self.next_version_id = prepared.next_version_id_after;
+        let version = Version {
+            history: prepared.history,
+            id: prepared.version,
+            parent: Some(prepared.parent),
+            root: prepared.root,
         };
         self.versions.push(version);
         if let Some(request) = prepared.request_id {
@@ -840,6 +1094,97 @@ impl PersistentHistoryStore {
             id,
             parent,
             root: splice.root,
+        });
+        if let Some(request) = request_id {
+            validate_request_identity(request)?;
+            if self.active_requests.contains_key(request)
+                || self.retired_requests.contains_key(request)
+            {
+                return Err(HistoryError::Invalid(
+                    "history log request identity is already recorded",
+                ));
+            }
+            self.active_requests.try_reserve(1).map_err(|_| {
+                HistoryError::Capacity("persistent active request allocation failed")
+            })?;
+            let _ = self.active_requests.insert(
+                request.to_vec(),
+                ActiveRequest {
+                    digest,
+                    version: id,
+                },
+            );
+        }
+        if let Some(binding) = binding {
+            validate_binding(binding)?;
+            self.version_bindings.try_reserve(1).map_err(|_| {
+                HistoryError::Capacity("persistent version binding allocation failed")
+            })?;
+            let _ = self.version_bindings.insert(id, binding.to_vec());
+        }
+        Ok(id)
+    }
+
+    /// Replays one logged fork during recovery: exact history, exact
+    /// parent, same-history parenthood, recomputed canonical fork digest,
+    /// exact version identity with checked successor validation before
+    /// mutation, and request/binding rebuild — copying the parent's
+    /// persistent root into the new version with zero backend mutation. A
+    /// complete but malformed fork frame fails closed; a torn suffix never
+    /// reaches this point.
+    pub fn replay_fork(
+        &mut self,
+        history: HistoryId,
+        version: VersionId,
+        parent: VersionId,
+        request_id: Option<&[u8]>,
+        binding: Option<&[u8]>,
+        digest: [u8; 32],
+    ) -> Result<VersionId, HistoryError> {
+        if !self.histories.contains(&history) {
+            return Err(HistoryError::Invalid(
+                "history log fork targets an unknown history",
+            ));
+        }
+        let parent_record = self
+            .version_record(parent)
+            .map_err(|_| HistoryError::Invalid("history log fork parent version is unknown"))?;
+        if parent_record.history() != history {
+            return Err(HistoryError::Invalid(
+                "history log fork parent belongs to a different history",
+            ));
+        }
+        let root = parent_record.root();
+        if history_fork_digest(history, parent, binding) != digest {
+            return Err(HistoryError::Invalid(
+                "history log fork digest disagrees with its operation",
+            ));
+        }
+        if let Some(bytes) = binding {
+            validate_binding(bytes)?;
+        }
+        let id = VersionId(self.next_version_id);
+        if id != version {
+            return Err(HistoryError::Invalid(
+                "history log version identity disagrees with replay order",
+            ));
+        }
+        // The successor must exist before anything mutates: a forged
+        // max-Version fork record fails here, never after catalogue work.
+        self.next_version_id =
+            self.next_version_id
+                .checked_add(1)
+                .ok_or(HistoryError::Overflow(
+                    "persistent version count exceeds u64",
+                ))?;
+        self.versions
+            .try_reserve(1)
+            .map_err(|_| HistoryError::Capacity("persistent version table allocation failed"))?;
+        self.versions.push(Version {
+            history,
+            id,
+            parent: Some(parent),
+            root,
         });
         if let Some(request) = request_id {
             validate_request_identity(request)?;
@@ -1161,6 +1506,45 @@ impl PersistentHistoryStore {
             }
         };
         self.splice_durable(log, history, parent, offset, 0, bytes, request_id, binding)
+    }
+
+    /// Durably forks through the request ledger: replay and retired outcomes
+    /// return without touching the log; fresh operations follow
+    /// write-then-barrier-then-apply with poison on any post-barrier failure.
+    /// The encoded record carries the prepared version identity and no root
+    /// or content: replay resolves the root from the encoded parent.
+    pub(crate) fn fork_durable(
+        &mut self,
+        log: &mut DurableHistoryLog,
+        history: HistoryId,
+        parent: VersionId,
+        request_id: Option<&[u8]>,
+        binding: Option<&[u8]>,
+    ) -> Result<CommitOutcome, DurableError> {
+        self.require_unpoisoned_durable()?;
+        let prepared = match self
+            .preview_fork(history, parent, request_id, binding)
+            .map_err(DurableError::Rejected)?
+        {
+            ForkPreview::Replayed(version) => return Ok(CommitOutcome::Replayed(version)),
+            ForkPreview::Retired => return Ok(CommitOutcome::Retired),
+            ForkPreview::Fresh(prepared) => prepared,
+        };
+        let record = HistoryLogRecord::Fork {
+            history: prepared.history,
+            version: prepared.version,
+            parent: prepared.parent,
+            request_id: prepared.request_id.map(<[u8]>::to_vec),
+            binding: prepared.binding.map(<[u8]>::to_vec),
+            digest: prepared.digest,
+        };
+        let frame = durable_log::encode_history_log_frame(
+            &durable_log::encode_history_log_record(&record).map_err(DurableError::Rejected)?,
+        )
+        .map_err(DurableError::Rejected)?;
+        self.write_and_sync(log, &frame)?;
+        self.apply_prepared_fork(&prepared)
+            .map_err(|error| self.poison_after_barrier(error))
     }
 
     /// Durably retires a request identity with the same write-then-apply
@@ -2804,6 +3188,10 @@ mod tests {
             Err(DurableError::RecoveryRequired)
         ));
         assert!(matches!(
+            store.fork_durable(&mut log, HistoryId(0), VersionId::new(0), None, None),
+            Err(DurableError::RecoveryRequired)
+        ));
+        assert!(matches!(
             store.retire_durable(&mut log, b"req-1"),
             Err(DurableError::RecoveryRequired)
         ));
@@ -3102,5 +3490,885 @@ mod tests {
         assert_eq!(store.next_history_id, u64::MAX);
         assert!(!store.is_poisoned());
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    // ---- E3 fork/publication tests ----
+
+    fn fork_new(
+        store: &mut PersistentHistoryStore,
+        history: HistoryId,
+        parent: VersionId,
+        request_id: Option<&[u8]>,
+        binding: Option<&[u8]>,
+    ) -> Version {
+        let outcome = store.fork(history, parent, request_id, binding).unwrap();
+        assert!(matches!(outcome, CommitOutcome::Committed(_)));
+        outcome.version().unwrap()
+    }
+
+    #[test]
+    fn fork_publishes_exact_parent_root_with_zero_content_growth() {
+        // A 20 KiB parent forces the bounded-leaf multi-leaf path, so root
+        // reuse below is structural sharing, not a small-buffer accident.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let parent_payload = vec![0xA5u8; 20 * 1024];
+        let v0 = append_new(&mut store, history, None, &parent_payload);
+        let counters_before = store.work_counters();
+        let v1 = fork_new(&mut store, history, v0.id(), None, None);
+        let counters_after = store.work_counters();
+        assert_ne!(v1.id(), v0.id());
+        assert_eq!(v1.id().id(), 1);
+        assert_eq!(v1.history(), history);
+        assert_eq!(v1.parent(), Some(v0.id()));
+        assert_eq!(v1.root(), v0.root());
+        // Zero content-node/payload growth: fork is catalogue metadata only.
+        // (Fork may write WAL/catalogue metadata; that is not content.)
+        assert_eq!(
+            counters_after.nodes_allocated,
+            counters_before.nodes_allocated
+        );
+        assert_eq!(
+            counters_after.nodes_inspected,
+            counters_before.nodes_inspected
+        );
+        assert_eq!(counters_after.nodes_read, counters_before.nodes_read);
+        assert_eq!(
+            counters_after.payload_bytes_read,
+            counters_before.payload_bytes_read
+        );
+        assert_eq!(
+            counters_after.payload_bytes_written,
+            counters_before.payload_bytes_written
+        );
+        assert!(!store.is_poisoned());
+        assert_eq!(read_full(&store, v1, 20 * 1024), parent_payload);
+        assert_eq!(read_full(&store, v0, 20 * 1024), parent_payload);
+        store.verify(v0).unwrap();
+        store.verify(v1).unwrap();
+    }
+
+    #[test]
+    fn fork_of_historical_version_ignores_later_descendants() {
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"base-payload");
+        let v1 = splice_new(&mut store, history, Some(v0.id()), 0, 4, b"EDIT");
+        let v2 = splice_new(&mut store, history, Some(v1.id()), 5, 0, b"[tail]");
+        let v3 = fork_new(&mut store, history, v0.id(), None, None);
+        assert_eq!(v3.parent(), Some(v0.id()));
+        assert_eq!(v3.root(), v0.root());
+        assert_eq!(read_full(&store, v3, 12), b"base-payload");
+        assert_eq!(read_full(&store, v0, 12), b"base-payload");
+        // Later descendants are untouched and distinct.
+        assert_eq!(read_full(&store, v2, 18), b"EDIT-[tail]payload");
+        assert_ne!(v3.root(), v2.root());
+    }
+
+    #[test]
+    fn fork_siblings_share_parent_root_with_distinct_identities() {
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"sibling-source");
+        let counters_before = store.work_counters();
+        let first = fork_new(&mut store, history, v0.id(), None, None);
+        let second = fork_new(&mut store, history, v0.id(), None, None);
+        let counters_after = store.work_counters();
+        assert_ne!(first.id(), second.id());
+        assert_eq!(first.parent(), Some(v0.id()));
+        assert_eq!(second.parent(), Some(v0.id()));
+        assert_eq!(first.root(), v0.root());
+        assert_eq!(second.root(), v0.root());
+        assert_eq!(
+            counters_after.nodes_allocated,
+            counters_before.nodes_allocated
+        );
+        assert_eq!(
+            counters_after.nodes_inspected,
+            counters_before.nodes_inspected
+        );
+        assert_eq!(
+            counters_after.payload_bytes_written,
+            counters_before.payload_bytes_written
+        );
+        assert_eq!(read_full(&store, first, 14), b"sibling-source");
+        assert_eq!(read_full(&store, second, 14), b"sibling-source");
+    }
+
+    #[test]
+    fn forked_version_is_first_class_splice_parent() {
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"base-payload");
+        let v1 = fork_new(&mut store, history, v0.id(), None, None);
+        let v2 = splice_new(&mut store, history, Some(v1.id()), 5, 0, b"[edit]");
+        assert_eq!(v2.parent(), Some(v1.id()));
+        assert_eq!(read_full(&store, v2, 18), b"base-[edit]payload");
+        // The fork source and the fork itself stay byte-exact.
+        assert_eq!(read_full(&store, v0, 12), b"base-payload");
+        assert_eq!(read_full(&store, v1, 12), b"base-payload");
+        store.verify(v2).unwrap();
+    }
+
+    #[test]
+    fn fork_parent_rules_fail_closed() {
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let other = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"data");
+        let foreign = append_new(&mut store, other, None, b"other");
+        // Unknown history.
+        assert!(matches!(
+            store.fork(HistoryId::new(99), v0.id(), None, None),
+            Err(HistoryError::Invalid(_))
+        ));
+        // Unknown parent.
+        assert!(matches!(
+            store.fork(history, VersionId::new(99), None, None),
+            Err(HistoryError::Invalid(_))
+        ));
+        // Cross-history parent grafting.
+        assert!(matches!(
+            store.fork(history, foreign.id(), None, None),
+            Err(HistoryError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.fork(other, v0.id(), None, None),
+            Err(HistoryError::Invalid(_))
+        ));
+        assert_eq!(store.versions.len(), 2);
+        assert_eq!(store.next_version_id, 2);
+        assert!(!store.is_poisoned());
+        // A parentless fork is unrepresentable: `parent` is a `VersionId`,
+        // not an `Option`, so root creation stays splice-only by type.
+    }
+
+    #[test]
+    fn fork_digest_lives_in_its_own_domain() {
+        let history = HistoryId::new(3);
+        let parent = VersionId::new(7);
+        let fork_digest = history_fork_digest(history, parent, Some(b"bind"));
+        // Deterministic over identical coordinates.
+        assert_eq!(
+            history_fork_digest(history, parent, Some(b"bind")),
+            fork_digest
+        );
+        // Binding presence and bytes participate.
+        assert_ne!(history_fork_digest(history, parent, None), fork_digest);
+        assert_ne!(
+            history_fork_digest(history, parent, Some(b"other")),
+            fork_digest
+        );
+        // Parent identity participates.
+        assert_ne!(
+            history_fork_digest(history, VersionId::new(8), Some(b"bind")),
+            fork_digest
+        );
+        // Operation separation: no splice digest over the same
+        // history/parent can equal a fork digest, whatever the coordinates.
+        for offset in [0u64, 7] {
+            for delete_len in [0u64, 3] {
+                let splice_digest = history_splice_digest(
+                    history,
+                    Some(parent),
+                    offset,
+                    delete_len,
+                    b"",
+                    Some(b"bind"),
+                );
+                assert_ne!(splice_digest, fork_digest);
+            }
+        }
+        // The assigned identity and the republished root are consequences,
+        // not inputs: identical inputs always hash identically.
+        assert_eq!(
+            history_fork_digest(history, parent, None),
+            history_fork_digest(history, parent, None)
+        );
+    }
+
+    #[test]
+    fn thousand_fork_zero_content_regression() {
+        // A 10 MiB parent on the bounded-leaf path, then 1,000 fresh forks
+        // from the same historical parent: catalogue/metadata growth only.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let parent_payload = vec![0x3Cu8; 10 * 1024 * 1024];
+        let v0 = append_new(&mut store, history, None, &parent_payload);
+        let counters_before = store.work_counters();
+        let mut previous = v0.id().id();
+        for _ in 0..1000 {
+            let forked = fork_new(&mut store, history, v0.id(), None, None);
+            assert_eq!(forked.parent(), Some(v0.id()));
+            assert_eq!(forked.root(), v0.root());
+            assert_eq!(forked.id().id(), previous + 1);
+            previous = forked.id().id();
+        }
+        let counters_after = store.work_counters();
+        assert_eq!(store.versions.len(), 1001);
+        assert_eq!(store.next_version_id, 1001);
+        assert_eq!(
+            counters_after.nodes_allocated,
+            counters_before.nodes_allocated
+        );
+        assert_eq!(
+            counters_after.nodes_inspected,
+            counters_before.nodes_inspected
+        );
+        assert_eq!(counters_after.nodes_read, counters_before.nodes_read);
+        assert_eq!(
+            counters_after.payload_bytes_read,
+            counters_before.payload_bytes_read
+        );
+        assert_eq!(
+            counters_after.payload_bytes_written,
+            counters_before.payload_bytes_written
+        );
+        // Spot-check first, middle, and last fork reads (after the counters).
+        for id in [1u64, 500, 1000] {
+            let version = store.lookup_version(VersionId::new(id)).unwrap();
+            assert_eq!(version.parent(), Some(v0.id()));
+            assert_eq!(version.root(), v0.root());
+            let mut output = Vec::new();
+            store.read(version, 0, 16, &mut output).unwrap();
+            assert_eq!(output, &parent_payload[..16]);
+        }
+        let mut tail = Vec::new();
+        store
+            .read(
+                store.lookup_version(VersionId::new(1000)).unwrap(),
+                10 * 1024 * 1024 - 16,
+                16,
+                &mut tail,
+            )
+            .unwrap();
+        assert_eq!(tail, &parent_payload[parent_payload.len() - 16..]);
+    }
+
+    #[test]
+    fn fork_request_ledger_matrix_with_cross_operation_conflicts() {
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"ledger-base");
+        let v1 = splice_new(&mut store, history, Some(v0.id()), 5, 0, b"[e]");
+        // Same request + same fork replays the exact version, no new entry.
+        let forked = fork_new(&mut store, history, v0.id(), Some(b"fork-req"), None);
+        assert_eq!(
+            store.fork(history, v0.id(), Some(b"fork-req"), None),
+            Ok(CommitOutcome::Replayed(forked))
+        );
+        assert_eq!(store.versions.len(), 3);
+        // Same request + different parent conflicts.
+        assert_eq!(
+            store.fork(history, v1.id(), Some(b"fork-req"), None),
+            Err(HistoryError::RequestConflict)
+        );
+        // Same request + different binding conflicts.
+        assert_eq!(
+            store.fork(history, v0.id(), Some(b"fork-req"), Some(b"bind")),
+            Err(HistoryError::RequestConflict)
+        );
+        // A request used for splice conflicts as a fork, and inversely a
+        // fork request conflicts as a splice: distinct digest domains make
+        // this deterministic.
+        let spliced = match store
+            .splice(
+                history,
+                Some(v0.id()),
+                5,
+                0,
+                b"[e2]",
+                Some(b"shared-req"),
+                None,
+            )
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("fresh splice must create")
+            }
+        };
+        assert_eq!(
+            store.fork(history, v0.id(), Some(b"shared-req"), None),
+            Err(HistoryError::RequestConflict)
+        );
+        assert_eq!(
+            store.splice(
+                history,
+                Some(forked.id()),
+                5,
+                0,
+                b"[e3]",
+                Some(b"fork-req"),
+                None
+            ),
+            Err(HistoryError::RequestConflict)
+        );
+        let _ = spliced;
+        // Retirement: the same fork retry retires, a different fork conflicts.
+        store.retire_request(b"fork-req").unwrap();
+        assert_eq!(
+            store.fork(history, v0.id(), Some(b"fork-req"), None),
+            Ok(CommitOutcome::Retired)
+        );
+        assert_eq!(
+            store.fork(history, v1.id(), Some(b"fork-req"), None),
+            Err(HistoryError::RequestConflict)
+        );
+        // Replay and retired outcomes need no fresh identity: at an
+        // exhausted counter the retired fork still retires instead of
+        // overflowing, and a bound-but-live fork still replays.
+        store.next_version_id = u64::MAX;
+        assert_eq!(
+            store.fork(history, v0.id(), Some(b"fork-req"), None),
+            Ok(CommitOutcome::Retired)
+        );
+        let mut live = PersistentHistoryStore::new();
+        let live_history = live.create_history().unwrap();
+        let live_v0 = append_new(&mut live, live_history, None, b"live-base");
+        let live_fork = fork_new(
+            &mut live,
+            live_history,
+            live_v0.id(),
+            Some(b"live-req"),
+            None,
+        );
+        live.next_version_id = u64::MAX;
+        assert_eq!(
+            live.fork(live_history, live_v0.id(), Some(b"live-req"), None),
+            Ok(CommitOutcome::Replayed(live_fork))
+        );
+    }
+
+    #[test]
+    fn fork_version_counter_overflow_leaves_no_catalogue_mutation() {
+        // Identity allocation is preview-checked: at exhaustion the fork
+        // fails before any catalogue mutation, so every table stays exactly
+        // as found and the writer stays usable.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"fork-base");
+        let counters_before = store.work_counters();
+        store.next_version_id = u64::MAX;
+        assert!(matches!(
+            store.fork(history, v0.id(), None, None),
+            Err(HistoryError::Overflow(_))
+        ));
+        assert_eq!(store.next_version_id, u64::MAX);
+        assert_eq!(store.versions.len(), 1);
+        assert!(store.active_requests.is_empty());
+        assert!(store.retired_requests.is_empty());
+        assert!(store.version_bindings.is_empty());
+        let counters_after = store.work_counters();
+        assert_eq!(
+            counters_after.nodes_allocated,
+            counters_before.nodes_allocated
+        );
+        assert_eq!(
+            counters_after.nodes_inspected,
+            counters_before.nodes_inspected
+        );
+        assert_eq!(counters_after.nodes_read, counters_before.nodes_read);
+        assert_eq!(
+            counters_after.payload_bytes_read,
+            counters_before.payload_bytes_read
+        );
+        assert_eq!(
+            counters_after.payload_bytes_written,
+            counters_before.payload_bytes_written
+        );
+        assert_eq!(read_full(&store, v0, 9), b"fork-base");
+        store.verify(v0).unwrap();
+        assert!(!store.is_poisoned());
+        // A request-bound exhaustion fails the same way: no ledger entry.
+        assert!(matches!(
+            store.fork(history, v0.id(), Some(b"req-1"), None),
+            Err(HistoryError::Overflow(_))
+        ));
+        assert!(!store.active_requests.contains_key(b"req-1".as_slice()));
+    }
+
+    #[test]
+    fn durable_fork_exhaustion_writes_zero_authority_bytes() {
+        // The durable path must reject an exhausted counter before WAL
+        // record construction, append, sync, catalogue mutation, and
+        // poisoning: the hot log is byte-identical afterwards and no
+        // max-Version record can become authoritative.
+        let temp = tempfile::tempdir().unwrap();
+        let path = test_log_path(temp.path());
+        let mut store = PersistentHistoryStore::new();
+        let mut log = DurableHistoryLog::open(&path).unwrap();
+        let history = store.create_history_durable(&mut log).unwrap();
+        let v0 = match store
+            .append_durable(&mut log, history, None, b"fork-base", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("durable root must create")
+            }
+        };
+        let counters_before = store.work_counters();
+        let log_len_before = std::fs::metadata(&path).unwrap().len();
+        assert!(log_len_before > 0);
+        store.next_version_id = u64::MAX;
+        let error = store
+            .fork_durable(&mut log, history, v0.id(), None, None)
+            .unwrap_err();
+        assert!(
+            matches!(error, DurableError::Rejected(HistoryError::Overflow(_))),
+            "exhaustion must reject definitely, got {error}"
+        );
+        assert!(!store.is_poisoned());
+        assert_eq!(store.next_version_id, u64::MAX);
+        assert_eq!(store.versions.len(), 1);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            log_len_before,
+            "rejected fork must not append authority bytes"
+        );
+        let counters_after = store.work_counters();
+        assert_eq!(
+            counters_after.nodes_allocated,
+            counters_before.nodes_allocated
+        );
+        assert_eq!(
+            counters_after.nodes_inspected,
+            counters_before.nodes_inspected
+        );
+        assert_eq!(
+            counters_after.payload_bytes_written,
+            counters_before.payload_bytes_written
+        );
+        assert_eq!(read_full(&store, v0, 9), b"fork-base");
+        // The writer stays usable for reads and the log replays exactly the
+        // pre-exhaustion state: no unrecoverable record was emitted.
+        drop(store);
+        drop(log);
+        let bytes = std::fs::read(&path).unwrap();
+        let reopened = recover_history_store(&bytes).unwrap();
+        assert_eq!(reopened.versions.len(), 1);
+        assert_eq!(reopened.next_version_id, 1);
+    }
+
+    #[test]
+    fn replay_at_fork_exhaustion_fails_before_catalogue_mutation() {
+        // A forged max-Version fork record against an exhausted counter fails
+        // at identity allocation, before any catalogue work: recovery may
+        // fail on impossible bytes, but the live writer must never generate
+        // them (proven by the durable test above).
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"fork-base");
+        store.next_version_id = u64::MAX;
+        let counters_before = store.work_counters();
+        let digest = history_fork_digest(history, v0.id(), None);
+        assert!(matches!(
+            store.replay_fork(
+                history,
+                VersionId::new(u64::MAX),
+                v0.id(),
+                None,
+                None,
+                digest
+            ),
+            Err(HistoryError::Overflow(_))
+        ));
+        assert_eq!(store.versions.len(), 1);
+        let counters_after = store.work_counters();
+        assert_eq!(
+            counters_after.nodes_allocated,
+            counters_before.nodes_allocated
+        );
+        assert_eq!(
+            counters_after.nodes_inspected,
+            counters_before.nodes_inspected
+        );
+        assert_eq!(
+            counters_after.payload_bytes_written,
+            counters_before.payload_bytes_written
+        );
+    }
+
+    #[test]
+    fn durable_fork_reopen_is_exact() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = test_log_path(temp.path());
+        let mut store = PersistentHistoryStore::new();
+        let mut log = DurableHistoryLog::open(&path).unwrap();
+        let history = store.create_history_durable(&mut log).unwrap();
+        let v0 = match store
+            .append_durable(&mut log, history, None, b"fork-base", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("durable root must create")
+            }
+        };
+        let v1 = match store
+            .fork_durable(
+                &mut log,
+                history,
+                v0.id(),
+                Some(b"fork-req"),
+                Some(b"bind-1"),
+            )
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("durable fork must create")
+            }
+        };
+        assert_eq!(v1.parent(), Some(v0.id()));
+        assert_eq!(v1.root(), v0.root());
+        // Same fork request replays with no new log bytes.
+        let len_before = log.read_all().unwrap().len();
+        assert_eq!(
+            store
+                .fork_durable(
+                    &mut log,
+                    history,
+                    v0.id(),
+                    Some(b"fork-req"),
+                    Some(b"bind-1")
+                )
+                .unwrap(),
+            CommitOutcome::Replayed(v1)
+        );
+        assert_eq!(log.read_all().unwrap().len(), len_before);
+        // Cross-operation conflict writes nothing either.
+        assert!(matches!(
+            store.splice_durable(
+                &mut log,
+                history,
+                Some(v0.id()),
+                4,
+                0,
+                b"[e]",
+                Some(b"fork-req"),
+                None,
+            ),
+            Err(DurableError::Rejected(HistoryError::RequestConflict))
+        ));
+        assert_eq!(log.read_all().unwrap().len(), len_before);
+        drop(store);
+        drop(log);
+        let bytes = std::fs::read(&path).unwrap();
+        let reopened = recover_history_store(&bytes).unwrap();
+        assert_eq!(reopened.versions.len(), 2);
+        assert_eq!(reopened.next_version_id, 2);
+        let got = reopened.lookup_version(v1.id()).unwrap();
+        assert_eq!(got, v1);
+        assert_eq!(got.parent(), Some(v0.id()));
+        assert_eq!(got.root(), reopened.lookup_version(v0.id()).unwrap().root());
+        let mut output = Vec::new();
+        reopened.read(got, 0, 9, &mut output).unwrap();
+        assert_eq!(output, b"fork-base");
+        reopened.verify(got).unwrap();
+        assert_eq!(
+            reopened.version_binding(v1.id()),
+            Some(b"bind-1".as_slice())
+        );
+        assert!(reopened
+            .active_requests
+            .contains_key(b"fork-req".as_slice()));
+    }
+
+    #[test]
+    fn fork_replay_corruption_vectors_fail_closed() {
+        // One honest frame builder: create + root splice + fork, with the
+        // fork record mutated per vector before framing.
+        fn honest_log(mutate: impl FnOnce(&mut HistoryLogRecord)) -> Vec<u8> {
+            let mut store = PersistentHistoryStore::new();
+            let history = store.create_history().unwrap();
+            let v0 = append_new(&mut store, history, None, b"fork-base");
+            let digest = history_fork_digest(history, v0.id(), Some(b"bind-1"));
+            let mut fork = HistoryLogRecord::Fork {
+                history,
+                version: VersionId::new(1),
+                parent: v0.id(),
+                request_id: Some(b"fork-req".to_vec()),
+                binding: Some(b"bind-1".to_vec()),
+                digest,
+            };
+            mutate(&mut fork);
+            let mut bytes = durable_log::encode_history_log_frame(
+                &durable_log::encode_history_log_record(&HistoryLogRecord::CreateHistory {
+                    history,
+                    binding: None,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let root_digest = history_splice_digest(history, None, 0, 0, b"fork-base", None);
+            bytes.extend_from_slice(
+                &durable_log::encode_history_log_frame(
+                    &durable_log::encode_history_log_record(&HistoryLogRecord::Splice {
+                        history,
+                        version: VersionId::new(0),
+                        parent: None,
+                        offset: 0,
+                        delete_len: 0,
+                        insert: b"fork-base".to_vec(),
+                        request_id: None,
+                        binding: None,
+                        digest: root_digest,
+                    })
+                    .unwrap(),
+                )
+                .unwrap(),
+            );
+            // A forged fork record may itself be unencodable (oversized
+            // binding): that encode rejection is already fail-closed.
+            if let Ok(encoded) = durable_log::encode_history_log_record(&fork) {
+                bytes.extend_from_slice(&durable_log::encode_history_log_frame(&encoded).unwrap());
+            }
+            bytes
+        }
+        // Control: the honest log replays to an exact shared-root fork.
+        let recovered = recover_history_store(&honest_log(|_| {})).unwrap();
+        assert_eq!(recovered.versions.len(), 2);
+        let forked = recovered.lookup_version(VersionId::new(1)).unwrap();
+        assert_eq!(forked.parent(), Some(VersionId::new(0)));
+        assert_eq!(
+            forked.root(),
+            recovered.lookup_version(VersionId::new(0)).unwrap().root()
+        );
+        // Unknown history.
+        assert!(recover_history_store(&honest_log(|record| {
+            if let HistoryLogRecord::Fork { history, .. } = record {
+                *history = HistoryId::new(99);
+            }
+        }))
+        .is_err());
+        // Unknown parent.
+        assert!(recover_history_store(&honest_log(|record| {
+            if let HistoryLogRecord::Fork { parent, .. } = record {
+                *parent = VersionId::new(99);
+            }
+        }))
+        .is_err());
+        // Cross-history parent.
+        assert!(recover_history_store(&honest_log(|record| {
+            if let HistoryLogRecord::Fork {
+                history,
+                parent,
+                digest,
+                binding,
+                ..
+            } = record
+            {
+                *history = HistoryId::new(1);
+                *parent = VersionId::new(0);
+                *digest = history_fork_digest(*history, *parent, binding.as_deref());
+            }
+        }))
+        .is_err());
+        // Wrong version identity (replay-order disagreement).
+        assert!(recover_history_store(&honest_log(|record| {
+            if let HistoryLogRecord::Fork { version, .. } = record {
+                *version = VersionId::new(7);
+            }
+        }))
+        .is_err());
+        // Wrong digest.
+        assert!(recover_history_store(&honest_log(|record| {
+            if let HistoryLogRecord::Fork { digest, .. } = record {
+                digest[0] ^= 0xFF;
+            }
+        }))
+        .is_err());
+        // Malformed binding: present-but-empty fails closed.
+        assert!(recover_history_store(&honest_log(|record| {
+            if let HistoryLogRecord::Fork {
+                binding,
+                digest,
+                history,
+                parent,
+                ..
+            } = record
+            {
+                *binding = Some(Vec::new());
+                *digest = history_fork_digest(*history, *parent, Some(&[]));
+            }
+        }))
+        .is_err());
+        // Oversized binding never even encodes.
+        assert!(
+            durable_log::encode_history_log_record(&HistoryLogRecord::Fork {
+                history: HistoryId::new(0),
+                version: VersionId::new(0),
+                parent: VersionId::new(0),
+                request_id: None,
+                binding: Some(vec![0xAA; MAX_HISTORY_BINDING_BYTES + 1]),
+                digest: [0u8; 32],
+            })
+            .is_err()
+        );
+        // Duplicate request identity during replay: the second fork record
+        // reusing one request fails closed.
+        let mut duplicated = honest_log(|_| {});
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"fork-base");
+        let digest = history_fork_digest(history, v0.id(), Some(b"bind-1"));
+        duplicated.extend_from_slice(
+            &durable_log::encode_history_log_frame(
+                &durable_log::encode_history_log_record(&HistoryLogRecord::Fork {
+                    history,
+                    version: VersionId::new(2),
+                    parent: v0.id(),
+                    request_id: Some(b"fork-req".to_vec()),
+                    binding: Some(b"bind-1".to_vec()),
+                    digest,
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        assert!(recover_history_store(&duplicated).is_err());
+        // Exhausted version identity: max-Version fork against an empty
+        // counter disagrees with replay order; against MAX it overflows.
+        assert!(recover_history_store(&honest_log(|record| {
+            if let HistoryLogRecord::Fork { version, .. } = record {
+                *version = VersionId::new(u64::MAX);
+            }
+        }))
+        .is_err());
+        // Trailing record bytes fail closed.
+        let encoded = durable_log::encode_history_log_record(&HistoryLogRecord::Fork {
+            history: HistoryId::new(0),
+            version: VersionId::new(0),
+            parent: VersionId::new(0),
+            request_id: None,
+            binding: None,
+            digest: [0u8; 32],
+        })
+        .unwrap();
+        let mut trailed = encoded.clone();
+        trailed.push(0xFF);
+        assert!(durable_log::decode_history_log_record(&trailed).is_err());
+        // Truncated record body fails closed.
+        assert!(durable_log::decode_history_log_record(&encoded[..encoded.len() - 1]).is_err());
+        // Unsupported record kind fails closed.
+        let mut bad_kind = encoded.clone();
+        bad_kind[0] = 0x7F;
+        assert!(durable_log::decode_history_log_record(&bad_kind).is_err());
+    }
+
+    #[test]
+    fn staging_epoch_gates_reject_thl2_and_schema2() {
+        // A THL2 log is byte-identical to THL3 except the frame magic (record
+        // layouts for pre-fork kinds are unchanged), so patching the magic on
+        // valid bytes is a faithful old-epoch control: the E3 reader must
+        // fail at the epoch gate, before any record parsing.
+        let temp = tempfile::tempdir().unwrap();
+        let path = test_log_path(temp.path());
+        let mut store = PersistentHistoryStore::new();
+        let mut log = DurableHistoryLog::open(&path).unwrap();
+        let history = store.create_history_durable(&mut log).unwrap();
+        store
+            .append_durable(&mut log, history, None, b"epoch-base", None, None)
+            .unwrap();
+        drop(store);
+        drop(log);
+        let thl3_bytes = std::fs::read(&path).unwrap();
+        assert!(recover_history_store(&thl3_bytes).is_ok());
+        let mut thl2_bytes = thl3_bytes.clone();
+        // Every frame opens with its 4-byte magic; patch all of them.
+        let mut offset = 0usize;
+        let mut patched = 0u32;
+        while offset + 4 <= thl2_bytes.len() {
+            assert_eq!(&thl2_bytes[offset..offset + 4], b"THL3");
+            thl2_bytes[offset..offset + 4].copy_from_slice(b"THL2");
+            patched += 1;
+            let body_len =
+                u64::from_le_bytes(thl2_bytes[offset + 4..offset + 12].try_into().unwrap())
+                    as usize;
+            offset += 12 + body_len + 44;
+        }
+        assert!(patched >= 2);
+        assert!(matches!(
+            recover_history_store(&thl2_bytes),
+            Err(HistoryError::Invalid(_))
+        ));
+        // Schema-2 snapshot: patch the schema u32 (magic 0..4, total_len
+        // 4..12, schema 12..16) on valid bytes. Decode checks the schema
+        // before the trailing digest, so no digest recompute is needed: the
+        // gate must fire first.
+        let mut snap_store = PersistentHistoryStore::new();
+        let snap_history = snap_store.create_history().unwrap();
+        append_new(&mut snap_store, snap_history, None, b"epoch-base");
+        let schema3_bytes =
+            snapshot::encode_history_snapshot(&snap_store, 0, thl3_bytes.len() as u64).unwrap();
+        assert!(snapshot::decode_history_snapshot(&schema3_bytes).is_ok());
+        let mut schema2_bytes = schema3_bytes.clone();
+        assert_eq!(&schema2_bytes[0..4], b"THS1");
+        schema2_bytes[12..16].copy_from_slice(&2u32.to_le_bytes());
+        assert!(matches!(
+            snapshot::decode_history_snapshot(&schema2_bytes),
+            Err(HistoryError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn fork_snapshot_grows_metadata_not_content() {
+        // 1 MiB parent: snapshot before and after 100 forks. Content
+        // counters stay flat while the snapshot artifact grows by catalogue
+        // metadata only — the image payload section must not duplicate.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let parent_payload = vec![0x71u8; 1024 * 1024];
+        let v0 = append_new(&mut store, history, None, &parent_payload);
+        let before_bytes = snapshot::encode_history_snapshot(&store, 0, 0).unwrap();
+        let before_snapshot = snapshot::decode_history_snapshot(&before_bytes).unwrap();
+        let counters_before = store.work_counters();
+        for _ in 0..100 {
+            fork_new(&mut store, history, v0.id(), None, None);
+        }
+        let counters_after = store.work_counters();
+        assert_eq!(
+            counters_after.nodes_allocated,
+            counters_before.nodes_allocated
+        );
+        assert_eq!(
+            counters_after.payload_bytes_written,
+            counters_before.payload_bytes_written
+        );
+        let after_bytes = snapshot::encode_history_snapshot(&store, 1, 0).unwrap();
+        let after_snapshot = snapshot::decode_history_snapshot(&after_bytes).unwrap();
+        assert_eq!(after_snapshot.versions.len(), 101);
+        // Metadata growth is expected and small: 100 extra catalogue entries
+        // cost far less than one content copy.
+        assert!(after_bytes.len() > before_bytes.len());
+        let image_growth = after_snapshot.image.len() - before_snapshot.image.len();
+        assert!(
+            image_growth < parent_payload.len() / 100,
+            "image growth {image_growth} must be root-table metadata, not content duplication"
+        );
+        // Import preserves every forked root/parent exactly.
+        let imported = PersistentHistoryStore::import_snapshot(after_snapshot).unwrap();
+        assert_eq!(imported.versions.len(), 101);
+        for id in [1u64, 50, 100] {
+            let version = imported.lookup_version(VersionId::new(id)).unwrap();
+            assert_eq!(version.parent(), Some(v0.id()));
+            assert_eq!(
+                version.root(),
+                imported.lookup_version(v0.id()).unwrap().root()
+            );
+            imported.verify(version).unwrap();
+        }
+        let mut output = Vec::new();
+        imported
+            .read(
+                imported.lookup_version(VersionId::new(100)).unwrap(),
+                0,
+                16,
+                &mut output,
+            )
+            .unwrap();
+        assert_eq!(output, &parent_payload[..16]);
     }
 }

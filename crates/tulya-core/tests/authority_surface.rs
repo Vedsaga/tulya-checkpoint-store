@@ -62,13 +62,23 @@ fn public_surface_covers_the_full_durable_lifecycle() {
         Err(DurableError::AlreadyOpen)
     ));
     let v2 = committed(&mut first, history, Some(v1.id()), b"ccc");
+    // Fork/publication through the authority: a new version sharing the
+    // parent root with zero content growth.
+    let forked = match first.fork(history, v0.id(), None, None).unwrap() {
+        CommitOutcome::Committed(version) => version,
+        CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+            panic!("surface fork must create")
+        }
+    };
+    assert_eq!(forked.parent(), Some(v0.id()));
+    assert_eq!(forked.root(), v0.root());
     drop(first);
 
     let second = WritableHistoryAuthority::open(temp.path()).unwrap();
     assert_eq!(second.generation(), 1);
     assert_eq!(second.stats().snapshot_versions, 2);
     assert!(second.stats().suffix_bytes > 0);
-    for version in [v0, v1, v2] {
+    for version in [v0, v1, v2, forked] {
         let got = second.store().lookup_version(version.id()).unwrap();
         assert_eq!(got, version);
     }
@@ -84,5 +94,5 @@ fn public_surface_covers_the_full_durable_lifecycle() {
     // Lock-free read-only loading observes the same authority.
     let read_only = open_history_authority(temp.path()).unwrap();
     assert_eq!(read_only.generation, 1);
-    assert_eq!(read_only.store.version_count(), 3);
+    assert_eq!(read_only.store.version_count(), 4);
 }

@@ -197,6 +197,20 @@ impl WritableHistoryAuthority {
             .append_durable(&mut self.hot, history, parent, bytes, request_id, binding)
     }
 
+    /// Durably forks through the owned writable log: publishes a new
+    /// version pointing at the exact existing parent root with zero content
+    /// growth. See [`PersistentHistoryStore::fork`].
+    pub fn fork(
+        &mut self,
+        history: HistoryId,
+        parent: VersionId,
+        request_id: Option<&[u8]>,
+        binding: Option<&[u8]>,
+    ) -> Result<CommitOutcome, DurableError> {
+        self.store
+            .fork_durable(&mut self.hot, history, parent, request_id, binding)
+    }
+
     /// Durably retires a request identity through the owned writable log.
     pub fn retire(&mut self, request_id: &[u8]) -> Result<(), DurableError> {
         self.store.retire_durable(&mut self.hot, request_id)
@@ -1291,5 +1305,165 @@ mod tests {
             .read(base, 0, base.root().logical_len().get(), &mut expected)
             .unwrap();
         assert_eq!(expected, b"abcdefghij");
+    }
+
+    fn authority_forked(
+        authority: &mut WritableHistoryAuthority,
+        history: HistoryId,
+        parent: VersionId,
+    ) -> crate::persistent_history::Version {
+        match authority.fork(history, parent, None, None).unwrap() {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("authority fork must create")
+            }
+        }
+    }
+
+    #[test]
+    fn seal_then_fork_suffix_reopens_exact() {
+        // Durable fork after a seal lands in the new hot generation and
+        // reopens exact: snapshot base plus a content-free fork suffix whose
+        // child shares the sealed parent root.
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority
+            .append(history, None, b"fork-suffix-base", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        let summary = authority.seal().unwrap();
+        assert_eq!(summary.generation, 1);
+        let v1 = authority_forked(&mut authority, history, v0.id());
+        assert_eq!(v1.parent(), Some(v0.id()));
+        assert_eq!(v1.root(), v0.root());
+        drop(authority);
+        let reopened = open_history_authority(temp.path()).unwrap();
+        assert_eq!(reopened.generation, 1);
+        assert_eq!(reopened.stats.snapshot_versions, 1);
+        assert!(reopened.stats.suffix_bytes > 0);
+        assert_eq!(reopened.store.versions.len(), 2);
+        let got = reopened.store.lookup_version(v1.id()).unwrap();
+        assert_eq!(got.parent(), Some(v0.id()));
+        assert_eq!(
+            got.root(),
+            reopened.store.lookup_version(v0.id()).unwrap().root()
+        );
+        let mut output = Vec::new();
+        reopened
+            .store
+            .read(got, 0, got.root().logical_len().get(), &mut output)
+            .unwrap();
+        assert_eq!(output, b"fork-suffix-base");
+    }
+
+    #[test]
+    fn fork_then_seal_snapshot_only_reopens_exact() {
+        // Fork before seal: the sealed snapshot catalogue alone carries the
+        // shared root (no hot suffix), and reopen preserves every forked
+        // identity, parent, root, and byte exactly.
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority
+            .append(history, None, b"sealed-fork-base", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        let v1 = authority_forked(&mut authority, history, v0.id());
+        let v2 = authority_forked(&mut authority, history, v0.id());
+        assert_ne!(v1.id(), v2.id());
+        let summary = authority.seal().unwrap();
+        assert_eq!(summary.generation, 1);
+        drop(authority);
+        let reopened = open_history_authority(temp.path()).unwrap();
+        assert_eq!(reopened.generation, 1);
+        assert_eq!(reopened.stats.snapshot_versions, 3);
+        assert_eq!(reopened.stats.suffix_bytes, 0);
+        for forked in [v1, v2] {
+            let got = reopened.store.lookup_version(forked.id()).unwrap();
+            assert_eq!(got, forked);
+            assert_eq!(got.parent(), Some(v0.id()));
+            assert_eq!(
+                got.root(),
+                reopened.store.lookup_version(v0.id()).unwrap().root()
+            );
+            let mut output = Vec::new();
+            reopened
+                .store
+                .read(got, 0, got.root().logical_len().get(), &mut output)
+                .unwrap();
+            assert_eq!(output, b"sealed-fork-base");
+            reopened.store.verify(got).unwrap();
+        }
+    }
+
+    #[test]
+    fn thousand_fork_seal_reopen_at_ci_scale() {
+        // CI-scale fork fleet through the writable authority: 256 KiB parent,
+        // 1,000 durable forks, seal, reopen — every forked root exact.
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let parent_payload = vec![0x5Au8; 256 * 1024];
+        let v0 = match authority
+            .append(history, None, &parent_payload, None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        let counters_before = authority.store().work_counters();
+        for _ in 0..1000 {
+            let forked = authority_forked(&mut authority, history, v0.id());
+            assert_eq!(forked.parent(), Some(v0.id()));
+            assert_eq!(forked.root(), v0.root());
+        }
+        let counters_after = authority.store().work_counters();
+        assert_eq!(
+            counters_after.nodes_allocated,
+            counters_before.nodes_allocated
+        );
+        assert_eq!(
+            counters_after.payload_bytes_written,
+            counters_before.payload_bytes_written
+        );
+        assert_eq!(authority.store().versions.len(), 1001);
+        let summary = authority.seal().unwrap();
+        assert_eq!(summary.generation, 1);
+        drop(authority);
+        let reopened = open_history_authority(temp.path()).unwrap();
+        assert_eq!(reopened.generation, 1);
+        assert_eq!(reopened.stats.snapshot_versions, 1001);
+        assert_eq!(reopened.stats.suffix_bytes, 0);
+        assert_eq!(reopened.store.versions.len(), 1001);
+        let base = reopened.store.lookup_version(v0.id()).unwrap();
+        for id in [1u64, 500, 1000] {
+            let got = reopened.store.lookup_version(VersionId::new(id)).unwrap();
+            assert_eq!(got.parent(), Some(v0.id()));
+            assert_eq!(got.root(), base.root());
+        }
+        let mut head = Vec::new();
+        reopened
+            .store
+            .read(
+                reopened.store.lookup_version(VersionId::new(1000)).unwrap(),
+                0,
+                16,
+                &mut head,
+            )
+            .unwrap();
+        assert_eq!(head, &parent_payload[..16]);
     }
 }
