@@ -1,23 +1,24 @@
 //! Generic sealed history snapshots for bounded restart.
 //!
-//! A snapshot captures the complete reconstructible state — generation,
-//! allocation counters, histories, versions, ledgers, bindings, and the
-//! canonical balanced image — so reopen loads one verified artifact plus a
-//! bounded hot suffix instead of replaying lifetime history.
-//!
-//! The arena image reuses the staged canonical `T2I2` codec; only the small
-//! envelope around it is new. Envelope layout (integers little-endian):
+//! A snapshot captures the reconstructible metadata — generation, the
+//! physical-content epoch and authoritative frontiers, histories, versions
+//! with root descriptors, ledgers, and bindings — so reopen loads one small
+//! verified artifact plus a bounded hot suffix instead of replaying lifetime
+//! history. Content itself stays in the physical generation files: schema6
+//! embeds NO arena image. Envelope layout (integers little-endian):
 //!
 //! ```text
 //! magic[4] = THS1
 //! total_len[u64]          (exact byte length of the whole artifact)
-//! schema[u32] = 5         (staging epoch: 1 = pre-E2 append grammar, rejected;
+//! schema[u32] = 6         (staging epoch: 1 = pre-E2 append grammar, rejected;
 //!                          2 = E2 splice-only grammar, rejected; 3 = E3
 //!                          fork grammar without lifecycle/receipt bounds,
 //!                          rejected; 4 = E4 lifecycle grammar with every
-//!                          version materialized, rejected: an E5 snapshot may
-//!                          leave reclaimed expired versions rootless, which
-//!                          E4 binaries cannot interpret)
+//!                          version materialized, rejected; 5 = E5
+//!                          image-embedding grammar with optional expired
+//!                          roots, rejected: a schema6 snapshot carries root
+//!                          descriptors plus physical frontiers and no image,
+//!                          which E5 binaries cannot interpret)
 //! generation[u64]
 //! represented_wal_end[u64](exact hot-log prefix byte length represented)
 //! history_count[u64]
@@ -25,7 +26,9 @@
 //! active_count[u64]
 //! retired_count[u64]
 //! receipt_order_count[u64]
-//! image_len[u64]
+//! physical_generation[u64](authoritative content epoch)
+//! payload_end[u64]        (authoritative committed payload frontier)
+//! node_count[u64]         (authoritative committed node frontier)
 //! next_history_id[u64]
 //! next_version_id[u64]
 //! histories:  per entry: binding-present[u8] + len[u64] + bytes
@@ -34,18 +37,15 @@
 //!                            lifecycle[u8] (0 = retained, 1 = expired) +
 //!                            root_present[u8] (0 = reclaimed/absent,
 //!                                               1 = materialized) +
-//!                            len[u64] (exact logical byte length)
+//!                            len[u64] (exact logical byte length) +
+//!                            root[56] if materialized (canonical T2R2
+//!                              root record; its length must equal len)
 //! active:     per entry, strictly ascending request id:
 //!             req_len[u64] + req + digest[32] + version[u64]
 //! retired:    per entry, strictly ascending request id:
 //!             req_len[u64] + req + digest[32]
 //! receipt_order: oldest-to-newest retained receipt ids, in insertion order:
 //!             per entry: req_len[u64] + req
-//! image[..]               (canonical T2I2 bytes; its root table covers
-//!                          exactly the materialized roots in version order,
-//!                          empty iff no version materializes a root — valid
-//!                          even with a non-empty catalogue when every version
-//!                          is expired and reclaimed)
 //! sha256[32] over everything before it
 //! ```
 //!
@@ -56,19 +56,20 @@ use super::{
     HistoryError, HistoryId, PersistentHistoryStore, VersionId, VersionLifecycle,
     MAX_HISTORY_BINDING_BYTES, MAX_HISTORY_REQUEST_ID_BYTES, STAGING_REQUEST_RECEIPT_CAPACITY,
 };
+use crate::persistent_sequence::{decode_canonical_root_bytes, V2_ROOT_RECORD_SIZE};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
-const HISTORY_SNAPSHOT_MAGIC: [u8; 4] = *b"THS1";
-/// Staging snapshot schema epoch: 5 covers splice + fork plus version
-/// lifecycle, the bounded receipt horizon, and optional expired roots after
-/// reclamation. Schemas 1-4 fail closed at decode; in particular schema-4
-/// pairs every version with a materialized image root, which a reclaimed E5
-/// snapshot no longer provides. There is deliberately no migration (zero
-/// external users).
+pub(crate) const HISTORY_SNAPSHOT_MAGIC: [u8; 4] = *b"THS1";
+/// Staging snapshot schema epoch: 6 covers splice + fork plus version
+/// lifecycle, the bounded receipt horizon, optional expired roots after
+/// reclamation, and — replacing the E5 embedded arena image — root
+/// descriptors plus the authoritative physical-content epoch and frontiers.
+/// Schemas 1-5 fail closed at decode. There is deliberately no migration
+/// (zero external users).
 /// NOT a release format version; E9 freezes release Format v1.
-const HISTORY_SNAPSHOT_SCHEMA: u32 = 5;
-const HISTORY_SNAPSHOT_HEADER_SIZE: usize = 96;
+pub(crate) const HISTORY_SNAPSHOT_SCHEMA: u32 = 6;
+pub(crate) const HISTORY_SNAPSHOT_HEADER_SIZE: usize = 112;
 const HISTORY_SNAPSHOT_DIGEST_DOMAIN: &[u8] = b"tulya-history/v1/snapshot\0";
 const NO_PARENT: u64 = u64::MAX;
 
@@ -80,14 +81,18 @@ pub struct SnapshotVersion {
     /// One-way lifecycle mark. The immutable logical `Version` is unchanged;
     /// this byte is the separate lifecycle metadata E4 adds.
     pub lifecycle: VersionLifecycle,
-    /// Whether this version materializes a physical root in the image root
-    /// table. Retained versions must always materialize; expired versions
-    /// may be rootless after reclamation.
+    /// Whether this version materializes a physical root descriptor below.
+    /// Retained versions must always materialize; expired versions may be
+    /// rootless after reclamation.
     pub root_present: bool,
     /// Exact logical byte length, authoritative without backend access — the
     /// catalogue truth that lets validation and replay work even for
     /// rootless entries.
     pub len: u64,
+    /// Canonical 56-byte `T2R2` root record when materialized: the content
+    /// descriptor resolving through the snapshot's physical generation. Its
+    /// carried length must equal `len` (checked at import).
+    pub root: Option<[u8; V2_ROOT_RECORD_SIZE]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +112,13 @@ pub struct SnapshotRetired {
 pub struct HistorySnapshot {
     pub generation: u64,
     pub represented_wal_end: u64,
+    /// Authoritative physical-content epoch: content files for exactly this
+    /// generation back every materialized root descriptor.
+    pub physical_generation: u64,
+    /// Authoritative committed payload frontier at seal time.
+    pub payload_end: u64,
+    /// Authoritative committed node frontier at seal time.
+    pub node_count: u64,
     pub next_history_id: u64,
     pub next_version_id: u64,
     pub history_bindings: Vec<Option<Vec<u8>>>,
@@ -116,7 +128,6 @@ pub struct HistorySnapshot {
     /// Oldest-to-newest retained receipt identities, in insertion order
     /// (not sorted): replay, retire, and expiration never reorder.
     pub receipt_order: Vec<Vec<u8>>,
-    pub image: Vec<u8>,
 }
 
 /// Encodes the complete reconstructible state at one generation.
@@ -149,8 +160,8 @@ pub fn encode_history_snapshot(
             ));
         }
     }
-    let mut roots = Vec::new();
-    roots
+    let mut descriptors: Vec<Option<[u8; V2_ROOT_RECORD_SIZE]>> = Vec::new();
+    descriptors
         .try_reserve_exact(store.versions.len())
         .map_err(|_| HistoryError::Capacity("history snapshot root table allocation failed"))?;
     for record in &store.versions {
@@ -165,7 +176,10 @@ pub fn encode_history_snapshot(
                         "history snapshot source version length disagrees with its materialized root",
                     ));
                 }
-                roots.push(root);
+                // One node-record read per materialized version on a
+                // physical backend: metadata-scale (per version, never per
+                // content byte), so seal stays content-size-independent.
+                descriptors.push(Some(store.backend.canonical_root_bytes(root)?));
             }
             None => {
                 if !store.expired_versions.contains(&record.id()) {
@@ -173,24 +187,19 @@ pub fn encode_history_snapshot(
                         "history snapshot source retained version has no materialized root",
                     ));
                 }
+                descriptors.push(None);
             }
         }
     }
-    let image = if roots.is_empty() {
-        if store.backend.is_empty() {
-            Vec::new()
-        } else if store.versions.iter().all(|record| record.root().is_none()) {
-            // Nothing retained reaches content: unreachable arena bytes are
-            // simply not exported, with no requirement on the live backend.
-            Vec::new()
-        } else {
-            return Err(HistoryError::Invalid(
-                "history snapshot source arena is not empty for zero materialized roots",
-            ));
-        }
-    } else {
-        store.backend.export_image(&roots)?
+    // Authoritative frontiers travel with the snapshot: durable backends
+    // report committed file frontiers; ephemeral memory backends report live
+    // arena sizes (self-consistent for struct-level tooling; only physical
+    // snapshots bind files at import).
+    let (payload_end, node_count) = match store.backend.physical_frontiers() {
+        Some(frontiers) => frontiers,
+        None => (store.backend.payload_len(), store.backend.node_count()),
     };
+    let physical_generation = store.backend.physical_generation().unwrap_or(0);
 
     let mut active: Vec<(&Vec<u8>, [u8; 32], VersionId)> = Vec::new();
     active
@@ -221,7 +230,7 @@ pub fn encode_history_snapshot(
     versions
         .try_reserve_exact(store.versions.len())
         .map_err(|_| HistoryError::Capacity("history snapshot table allocation failed"))?;
-    for record in &store.versions {
+    for (record, descriptor) in store.versions.iter().zip(descriptors.iter()) {
         versions.push(SnapshotVersion {
             history: record.history(),
             parent: record.parent(),
@@ -233,6 +242,7 @@ pub fn encode_history_snapshot(
             },
             root_present: record.root().is_some(),
             len: record.len(),
+            root: *descriptor,
         });
     }
     // The live horizon invariant the decoder rechecks: every retained
@@ -245,6 +255,9 @@ pub fn encode_history_snapshot(
     let snapshot = HistorySnapshot {
         generation,
         represented_wal_end,
+        physical_generation,
+        payload_end,
+        node_count,
         next_history_id: store.next_history_id,
         next_version_id: store.next_version_id,
         history_bindings,
@@ -265,17 +278,17 @@ pub fn encode_history_snapshot(
             })
             .collect(),
         receipt_order: store.receipt_order.iter().cloned().collect(),
-        image,
     };
     encode_history_snapshot_struct(&snapshot)
 }
 
 /// Encodes an already-built snapshot struct to artifact bytes.
 ///
-/// Structural only: density, coordinate agreement, ledger order, lengths,
-/// and the trailing digest are enforced exactly like the store path, but
-/// semantic rules (same-history parents, binding uniqueness, retained
-/// materialization, receipt-horizon agreement) are deliberately NOT
+/// Structural only: density, coordinate agreement, root-descriptor presence
+/// agreement, ledger order, lengths, and the trailing digest are enforced
+/// exactly like the store path, but semantic rules (same-history parents,
+/// binding uniqueness, retained materialization, receipt-horizon agreement,
+/// root-descriptor canonicality and length agreement) are deliberately NOT
 /// re-checked here — they are decode/import's job. That split is what lets
 /// tests and conformance tooling construct otherwise well-formed corruption
 /// vectors with recomputed integrity.
@@ -300,6 +313,11 @@ pub fn encode_history_snapshot_struct(snapshot: &HistorySnapshot) -> Result<Vec<
                 "history snapshot version references a missing history",
             ));
         }
+        if record.root_present != record.root.is_some() {
+            return Err(HistoryError::Invalid(
+                "history snapshot version root presence disagrees with its descriptor",
+            ));
+        }
         put_u64(&mut body, record.history.id())?;
         put_u64(&mut body, record.parent.map_or(NO_PARENT, VersionId::id))?;
         put_optional_bytes(&mut body, record.binding.as_deref())?;
@@ -311,6 +329,11 @@ pub fn encode_history_snapshot_struct(snapshot: &HistorySnapshot) -> Result<Vec<
         });
         body.push(u8::from(record.root_present));
         put_u64(&mut body, record.len)?;
+        if let Some(descriptor) = &record.root {
+            body.try_reserve_exact(V2_ROOT_RECORD_SIZE)
+                .map_err(|_| HistoryError::Capacity("history snapshot allocation failed"))?;
+            body.extend_from_slice(descriptor);
+        }
     }
     let mut previous_active: Option<&[u8]> = None;
     for record in &snapshot.active {
@@ -362,12 +385,6 @@ pub fn encode_history_snapshot_struct(snapshot: &HistorySnapshot) -> Result<Vec<
         }
         put_bytes(&mut body, request_id)?;
     }
-    if snapshot.versions.is_empty() && !snapshot.image.is_empty() {
-        return Err(HistoryError::Invalid(
-            "history snapshot image without versions is malformed",
-        ));
-    }
-    body.extend_from_slice(&snapshot.image);
 
     let mut output = Vec::new();
     output
@@ -415,11 +432,9 @@ pub fn encode_history_snapshot_struct(snapshot: &HistorySnapshot) -> Result<Vec<
             HistoryError::Overflow("history snapshot receipt order length exceeds u64")
         })?,
     )?;
-    put_u64(
-        &mut output,
-        u64::try_from(snapshot.image.len())
-            .map_err(|_| HistoryError::Overflow("history snapshot image length exceeds u64"))?,
-    )?;
+    put_u64(&mut output, snapshot.physical_generation)?;
+    put_u64(&mut output, snapshot.payload_end)?;
+    put_u64(&mut output, snapshot.node_count)?;
     put_u64(&mut output, snapshot.next_history_id)?;
     put_u64(&mut output, snapshot.next_version_id)?;
     output.extend_from_slice(&body);
@@ -448,8 +463,9 @@ fn snapshot_digest(prefix: &[u8]) -> [u8; 32] {
 /// trailing digest, dense identity tables matching their allocation
 /// counters, topological parents, strictly ascending ledger order with no
 /// duplicates or active/retired overlap, bounded identifier lengths, nonzero
-/// version lengths, retained materialization, and exact byte consumption.
-/// Import validates image/root/lifecycle/lineage/receipt consistency;
+/// version lengths, retained materialization, canonical root descriptors,
+/// and exact byte consumption. Import validates physical-root
+/// agreement/lifecycle/lineage/receipt consistency against content files;
 /// operation digests are preserved byte-exact and trace to commit/replay
 /// validation, with snapshot artifact integrity protecting their stored
 /// bytes.
@@ -480,7 +496,9 @@ pub fn decode_history_snapshot(bytes: &[u8]) -> Result<HistorySnapshot, HistoryE
     let retired_count = cursor.bounded_count("history snapshot retired count is excessive")?;
     let receipt_order_count =
         cursor.bounded_count("history snapshot receipt order is excessive")?;
-    let image_len = cursor.bounded_count("history snapshot image length is excessive")?;
+    let physical_generation = cursor.take_u64()?;
+    let payload_end = cursor.take_u64()?;
+    let node_count = cursor.take_u64()?;
     let next_history_id = cursor.take_u64()?;
     let next_version_id = cursor.take_u64()?;
     if next_history_id as usize != history_count {
@@ -578,6 +596,17 @@ pub fn decode_history_snapshot(bytes: &[u8]) -> Result<HistorySnapshot, HistoryE
                 "history snapshot retained version has no materialized root",
             ));
         }
+        let root = if root_present {
+            let descriptor = cursor.take_array::<V2_ROOT_RECORD_SIZE>()?;
+            // Canonical shape now: length agreement against `len` stays
+            // import's job (it owns the catalogue context).
+            decode_canonical_root_bytes(&descriptor).map_err(|_| {
+                HistoryError::Invalid("history snapshot root descriptor is non-canonical")
+            })?;
+            Some(descriptor)
+        } else {
+            None
+        };
         versions.push(SnapshotVersion {
             history: HistoryId::new(history),
             parent,
@@ -585,6 +614,7 @@ pub fn decode_history_snapshot(bytes: &[u8]) -> Result<HistorySnapshot, HistoryE
             lifecycle,
             root_present,
             len,
+            root,
         });
     }
     let mut active: Vec<SnapshotActive> = Vec::new();
@@ -650,12 +680,6 @@ pub fn decode_history_snapshot(bytes: &[u8]) -> Result<HistorySnapshot, HistoryE
     for _ in 0..receipt_order_count {
         receipt_order.push(cursor.take_request_id()?);
     }
-    let image = cursor.take(image_len)?.to_vec();
-    if versions.is_empty() && !image.is_empty() {
-        return Err(HistoryError::Invalid(
-            "history snapshot image without versions is malformed",
-        ));
-    }
     validate_snapshot_receipt_consistency(&versions, &active, &retired, &receipt_order)?;
     let digest_start = bytes.len().checked_sub(32).ok_or(HistoryError::Invalid(
         "history snapshot digest is truncated",
@@ -676,6 +700,9 @@ pub fn decode_history_snapshot(bytes: &[u8]) -> Result<HistorySnapshot, HistoryE
     Ok(HistorySnapshot {
         generation,
         represented_wal_end,
+        physical_generation,
+        payload_end,
+        node_count,
         next_history_id,
         next_version_id,
         history_bindings,
@@ -683,7 +710,6 @@ pub fn decode_history_snapshot(bytes: &[u8]) -> Result<HistorySnapshot, HistoryE
         active,
         retired,
         receipt_order,
-        image,
     })
 }
 
@@ -928,7 +954,7 @@ mod tests {
         let history = store.create_history().unwrap();
         store.append(history, None, b"data", None, None).unwrap();
         let bytes = encode_history_snapshot(&store, 3, 128).unwrap();
-        for end in [0, 1, 7, 88, 89, bytes.len() - 33, bytes.len() - 1] {
+        for end in [0, 1, 7, 119, 120, 121, bytes.len() - 33, bytes.len() - 1] {
             assert!(
                 decode_history_snapshot(&bytes[..end]).is_err(),
                 "truncation at {end} must fail"
@@ -985,102 +1011,151 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_import_rebuilds_exact_working_store() {
+    fn schema6_snapshot_carries_descriptors_and_frontiers_without_image() {
+        // Memory backends report live arena sizes as frontiers; every
+        // materialized version carries a canonical root descriptor whose
+        // length agrees with the catalogue.
         let source = fixture_store();
         let bytes = encode_history_snapshot(&source, 9, 4096).unwrap();
         let snapshot = decode_history_snapshot(&bytes).unwrap();
-        let mut imported = PersistentHistoryStore::import_snapshot(snapshot).unwrap();
-
-        assert_eq!(imported.next_history_id, 2);
-        assert_eq!(imported.next_version_id, 3);
-        assert_eq!(imported.histories.len(), 2);
-        assert_eq!(imported.versions.len(), 3);
-        assert_eq!(
-            imported.history_bindings.get(&HistoryId::new(0)),
-            Some(&b"history-a".to_vec())
-        );
-        assert_eq!(
-            imported.version_bindings.get(&VersionId::new(0)),
-            Some(&b"bind-a0".to_vec())
-        );
-        for index in 0..3u64 {
-            let version = imported.lookup_version(VersionId::new(index)).unwrap();
-            assert_eq!(version.id().id(), index);
-            imported.verify(version).unwrap();
+        assert_eq!(snapshot.versions.len(), 3);
+        assert_eq!(snapshot.payload_end, source.backend.payload_len());
+        assert_eq!(snapshot.node_count, source.backend.node_count());
+        for entry in &snapshot.versions {
+            assert!(entry.root_present);
+            let descriptor = entry.root.expect("retained version must describe its root");
+            let root = decode_canonical_root_bytes(&descriptor).unwrap();
+            assert_eq!(root.logical_len().get(), entry.len);
         }
-        let mut output = Vec::new();
-        imported
-            .read(
-                imported.lookup_version(VersionId::new(1)).unwrap(),
-                0,
-                6,
-                &mut output,
-            )
-            .unwrap();
-        assert_eq!(output, b"aaabbb");
-        assert_eq!(imported.active_requests.len(), 1);
-        assert_eq!(imported.retired_requests.len(), 1);
-        // The imported store continues operating with dense identities.
-        let history = HistoryId::new(0);
-        let parent = imported.lookup_version(VersionId::new(1)).unwrap();
-        let next = match imported
-            .append(history, Some(parent.id()), b"ccc", None, None)
-            .unwrap()
-        {
-            crate::persistent_history::CommitOutcome::Committed(version) => version,
-            crate::persistent_history::CommitOutcome::Replayed(_)
-            | crate::persistent_history::CommitOutcome::Retired => {
-                panic!("post-import commit must create")
-            }
-        };
-        assert_eq!(next.id().id(), 3);
+        // Struct round trip is exact, including descriptors and frontiers.
+        let reencoded = encode_history_snapshot_struct(&snapshot).unwrap();
+        assert_eq!(decode_history_snapshot(&reencoded).unwrap(), snapshot);
     }
 
     #[test]
-    fn snapshot_import_preserves_ledger_digests_exactly() {
-        // Import revalidates structural cross-references, not operation
-        // digests: digests bind commit deltas that version content cannot
-        // reproduce, so their authenticity traces to commit-time and
-        // log-replay validation while the artifact digest protects these
-        // bytes. Import must therefore preserve them byte-exact.
-        let source = fixture_store();
-        let bytes = encode_history_snapshot(&source, 1, 0).unwrap();
-        let snapshot = decode_history_snapshot(&bytes).unwrap();
-        let imported = PersistentHistoryStore::import_snapshot(snapshot).unwrap();
-        assert_eq!(imported.active_requests, source.active_requests);
-        assert_eq!(imported.retired_requests, source.retired_requests);
+    fn schema5_bytes_fail_closed_at_the_schema_gate() {
+        // The previous epoch embeds an arena image and no physical epoch:
+        // patching the schema byte back to 5 with a recomputed digest must
+        // still fail — the epoch gate, not integrity, rejects it.
+        let bytes = encode_history_snapshot(&fixture_store(), 1, 0).unwrap();
+        // Header: magic[4] + total_len[8] + schema[4].
+        assert_eq!(&bytes[..4], b"THS1");
+        let mut forged = bytes.clone();
+        forged[12..16].copy_from_slice(&5u32.to_le_bytes());
+        let digest_start = forged.len() - 32;
+        let mut hasher = Sha256::new();
+        hasher.update(HISTORY_SNAPSHOT_DIGEST_DOMAIN);
+        hasher.update(&forged[..digest_start]);
+        let digest = hasher.finalize();
+        forged[digest_start..].copy_from_slice(&digest);
+        assert!(matches!(
+            decode_history_snapshot(&forged),
+            Err(HistoryError::Invalid(
+                "history snapshot schema is unsupported"
+            ))
+        ));
     }
 
     #[test]
-    fn snapshot_tampered_image_bytes_fail_closed() {
-        let source = fixture_store();
-        let bytes = encode_history_snapshot(&source, 1, 0).unwrap();
-        let snapshot = decode_history_snapshot(&bytes).unwrap();
-        assert!(!snapshot.image.is_empty());
-        let mut bad_image = snapshot.image.clone();
-        let flip = bad_image.len() / 2;
-        bad_image[flip] ^= 0xFF;
-        let mut bad = bytes.clone();
-        let image_start = bytes.len() - 32 - bad_image.len();
-        bad[image_start..image_start + bad_image.len()].copy_from_slice(&bad_image);
-        // The artifact digest pins the sealed bytes, so any image tampering
-        // fails at decode before import ever runs.
-        assert!(decode_history_snapshot(&bad).is_err());
+    fn noncanonical_root_descriptor_fails_decode_with_valid_integrity() {
+        // Flip a byte inside the first version's root descriptor, then
+        // recompute the artifact digest: integrity passes, so only the
+        // descriptor gate can reject — proving the gate is load-bearing.
+        let bytes = encode_history_snapshot(&fixture_store(), 1, 0).unwrap();
+        let honest = decode_history_snapshot(&bytes).unwrap();
+        assert!(honest.versions[0].root.is_some());
+        // Locate the first version's descriptor by its known bytes rather
+        // than fragile hand arithmetic: presence u8 + len u64 sit in the 9
+        // bytes immediately before it.
+        let descriptor = honest.versions[0].root.expect("fixture root is described");
+        let descriptor_offset = bytes
+            .windows(V2_ROOT_RECORD_SIZE)
+            .position(|window| window == descriptor)
+            .expect("descriptor bytes must appear in the artifact");
+        let mut forged = bytes.clone();
+        forged[descriptor_offset] ^= 0xFF;
+        let digest_start = forged.len() - 32;
+        let mut hasher = Sha256::new();
+        hasher.update(HISTORY_SNAPSHOT_DIGEST_DOMAIN);
+        hasher.update(&forged[..digest_start]);
+        let digest = hasher.finalize();
+        forged[digest_start..].copy_from_slice(&digest);
+        assert!(matches!(
+            decode_history_snapshot(&forged),
+            Err(HistoryError::Invalid(_))
+        ));
     }
 
     #[test]
-    fn empty_snapshot_round_trips_to_empty_store() {
+    fn root_presence_descriptor_disagreement_fails_struct_encode() {
+        // Presence byte and descriptor must agree structurally, before any
+        // semantic check runs.
+        let honest =
+            decode_history_snapshot(&encode_history_snapshot(&fixture_store(), 1, 0).unwrap())
+                .unwrap();
+        let mut forged = honest.clone();
+        forged.versions[0].root = None;
+        assert!(matches!(
+            encode_history_snapshot_struct(&forged),
+            Err(HistoryError::Invalid(
+                "history snapshot version root presence disagrees with its descriptor"
+            ))
+        ));
+        let mut forged = honest;
+        forged.versions[0].root_present = false;
+        assert!(matches!(
+            encode_history_snapshot_struct(&forged),
+            Err(HistoryError::Invalid(
+                "history snapshot version root presence disagrees with its descriptor"
+            ))
+        ));
+    }
+
+    #[test]
+    fn rootless_retained_version_fails_decode_with_valid_integrity() {
+        // Clearing the presence byte (keeping the descriptor out and the
+        // digest recomputed) fails at decode: retained versions must
+        // materialize.
+        let bytes = encode_history_snapshot(&fixture_store(), 1, 0).unwrap();
+        let honest = decode_history_snapshot(&bytes).unwrap();
+        // The presence byte sits 9 bytes before the descriptor (presence u8
+        // + len u64): locate the descriptor by content, not arithmetic.
+        let descriptor = honest.versions[0].root.expect("fixture root is described");
+        let presence_offset = bytes
+            .windows(V2_ROOT_RECORD_SIZE)
+            .position(|window| window == descriptor)
+            .expect("descriptor bytes must appear in the artifact")
+            - 9;
+        assert_eq!(bytes[presence_offset], 1);
+        // Presence lives inside a length-delimited region, so clearing it
+        // without removing the descriptor breaks framing: rebuild at the
+        // struct level instead, with valid integrity.
+        let mut forged = honest;
+        forged.versions[0].root_present = false;
+        forged.versions[0].root = None;
+        let forged_bytes = encode_history_snapshot_struct(&forged).unwrap();
+        assert!(matches!(
+            decode_history_snapshot(&forged_bytes),
+            Err(HistoryError::Invalid(
+                "history snapshot retained version has no materialized root"
+            ))
+        ));
+    }
+
+    #[test]
+    fn empty_snapshot_round_trips_without_content() {
         let source = PersistentHistoryStore::new();
         let bytes = encode_history_snapshot(&source, 0, 0).unwrap();
         let snapshot = decode_history_snapshot(&bytes).unwrap();
         assert_eq!(snapshot.next_history_id, 0);
         assert_eq!(snapshot.next_version_id, 0);
         assert!(snapshot.versions.is_empty());
-        assert!(snapshot.image.is_empty());
-        let imported = PersistentHistoryStore::import_snapshot(snapshot).unwrap();
-        assert_eq!(imported.next_history_id, 0);
-        assert_eq!(imported.next_version_id, 0);
-        assert!(imported.versions.is_empty());
+        assert_eq!(snapshot.payload_end, 0);
+        assert_eq!(snapshot.node_count, 0);
+        assert_eq!(
+            decode_history_snapshot(&encode_history_snapshot_struct(&snapshot).unwrap()).unwrap(),
+            snapshot
+        );
     }
 
     #[test]
@@ -1104,8 +1179,6 @@ mod tests {
             decode_history_snapshot(&forged_bytes),
             Err(HistoryError::Invalid(_))
         ));
-        // Import rejects the struct even without the wire round trip.
-        assert!(PersistentHistoryStore::import_snapshot(forged).is_err());
     }
 
     #[test]
@@ -1119,7 +1192,7 @@ mod tests {
         let bytes = encode_history_snapshot(&store, 1, 0).unwrap();
         let honest = decode_history_snapshot(&bytes).unwrap();
         assert_eq!(honest.versions.len(), 1);
-        // Versions section starts after the 96-byte header plus the history
+        // Versions section starts after the 120-byte header plus the history
         // table (one entry, no binding: present-flag u64 = 8 bytes): the
         // entry is history u64 + parent u64 + binding u64 + lifecycle u8.
         let lifecycle_offset = HISTORY_SNAPSHOT_HEADER_SIZE + 8 + 8 + 8 + 8;
@@ -1139,35 +1212,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_materialized_root_fails_import_with_valid_integrity() {
-        // Corrupt the image payload section, then recompute the artifact
-        // digest: decode accepts the structurally fine envelope, but import
-        // revalidates every node and fails closed on the broken root.
-        let mut store = PersistentHistoryStore::new();
-        let history = store.create_history().unwrap();
-        store
-            .append(history, None, b"root-integrity", None, None)
-            .unwrap();
-        let bytes = encode_history_snapshot(&store, 1, 0).unwrap();
-        let honest = decode_history_snapshot(&bytes).unwrap();
-        assert!(!honest.image.is_empty());
-        let mut forged = bytes.clone();
-        let image_start = forged.len() - 32 - honest.image.len();
-        // Flip a byte inside the image payload section (past the 72-byte
-        // T2I2 header so the table geometry still parses).
-        forged[image_start + 80] ^= 0xFF;
-        let digest_start = forged.len() - 32;
-        let mut hasher = Sha256::new();
-        hasher.update(HISTORY_SNAPSHOT_DIGEST_DOMAIN);
-        hasher.update(&forged[..digest_start]);
-        let digest = hasher.finalize();
-        forged[digest_start..].copy_from_slice(&digest);
-        let decoded = decode_history_snapshot(&forged).unwrap();
-        assert_eq!(decoded.versions.len(), 1);
-        assert!(PersistentHistoryStore::import_snapshot(decoded).is_err());
-    }
-
-    #[test]
     fn malformed_version_binding_fails_closed_with_valid_integrity() {
         // Patch a version binding length to empty (present flag with zero
         // length) and recompute the artifact digest: only the binding gate
@@ -1178,7 +1222,7 @@ mod tests {
             .append(history, None, b"data", None, Some(b"bind-1"))
             .unwrap();
         let bytes = encode_history_snapshot(&store, 1, 0).unwrap();
-        // Versions section starts after the 96-byte header plus the history
+        // Versions section starts after the 120-byte header plus the history
         // table (one entry, no binding: 8 bytes): entry opens with history
         // u64 + parent u64, then the binding length u64.
         let binding_len_offset = HISTORY_SNAPSHOT_HEADER_SIZE + 8 + 8 + 8;
@@ -1216,6 +1260,5 @@ mod tests {
             decode_history_snapshot(&forged_bytes),
             Err(HistoryError::Invalid(_))
         ));
-        assert!(PersistentHistoryStore::import_snapshot(forged).is_err());
     }
 }

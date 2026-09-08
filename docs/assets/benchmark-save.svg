@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="360" viewBox="0 0 1040 360" role="img" aria-labelledby="title description">
+  <title id="title">Durable checkpoint save time</title>
+  <desc id="description">Median durable save time for Tulya, normalized SQLite delta, and content-addressed SQLite delta across 11,383 checkpoints. Tulya measured 0.365 milliseconds, compared with 0.816 and 0.879 milliseconds for the SQLite stores.</desc>
+  <defs><linearGradient id="canvas" x1="0" y1="0" x2="1" y2="1"><stop class="canvas-start" offset="0"/><stop class="canvas-end" offset="1"/></linearGradient><linearGradient id="saffron" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#ffd166"/><stop offset="0.48" stop-color="#ff9f1c"/><stop offset="1" stop-color="#f25c05"/></linearGradient><filter id="soft-shadow" x="-20%" y="-30%" width="150%" height="180%"><feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#9a4300" flood-opacity="0.24"/></filter></defs>
+  <style>
+    .background{fill:url(#canvas)}.canvas-start{stop-color:#ffffff}.canvas-end{stop-color:#fff8ed}
+    text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#1f2328}.title{font-size:22px;font-weight:600}.subtitle,.axis,.footnote{font-size:13px;fill:#59636e}.name{font-size:14px;font-weight:600}.value{font-size:14px;font-variant-numeric:tabular-nums}.ratio{font-size:13px;font-weight:600;fill:#59636e}.grid{stroke:#d0d7de;stroke-width:1}.bar-tulya{fill:url(#saffron);filter:url(#soft-shadow)}.bar-other{fill:#8c959f}
+    @media(prefers-color-scheme:dark){.canvas-start{stop-color:#0d1117}.canvas-end{stop-color:#21150d}text{fill:#f0f6fc}.subtitle,.axis,.footnote,.ratio{fill:#9da7b3}.grid{stroke:#30363d}.bar-other{fill:#6e7681}}
+  </style>
+  <rect class="background" width="1040" height="360" rx="12"/>
+  <text class="title" x="520" y="30" text-anchor="middle">Durable checkpoint save time</text><text class="subtitle" x="520" y="54" text-anchor="middle">Median per checkpoint · 11,383 unique nodes · same durability contract</text>
+  <line class="grid" x1="270" y1="82" x2="270" y2="270"/><line class="grid" x1="395" y1="82" x2="395" y2="270"/><line class="grid" x1="520" y1="82" x2="520" y2="270"/><line class="grid" x1="645" y1="82" x2="645" y2="270"/><line class="grid" x1="770" y1="82" x2="770" y2="270"/>
+  <text class="axis" x="270" y="74" text-anchor="middle">0 ms</text><text class="axis" x="395" y="74" text-anchor="middle">0.25</text><text class="axis" x="520" y="74" text-anchor="middle">0.50</text><text class="axis" x="645" y="74" text-anchor="middle">0.75</text><text class="axis" x="770" y="74" text-anchor="middle">1.00</text>
+  <text class="name" x="20" y="124">Tulya</text><rect class="bar-tulya" x="270" y="100" width="183" height="36" rx="5"/><text class="value" x="800" y="124">0.365 ms</text><text class="ratio" x="990" y="124" text-anchor="end">1.00×</text>
+  <text class="name" x="20" y="178">SQLite normalized delta</text><rect class="bar-other" x="270" y="154" width="408" height="36" rx="5"/><text class="value" x="800" y="178">0.816 ms</text><text class="ratio" x="990" y="178" text-anchor="end">2.23×</text>
+  <text class="name" x="20" y="232">SQLite content-addressed delta</text><rect class="bar-other" x="270" y="208" width="440" height="36" rx="5"/><text class="value" x="800" y="232">0.879 ms</text><text class="ratio" x="990" y="232" text-anchor="end">2.41×</text>
+  <text class="footnote" x="20" y="304">Clean public-API reproduction of frozen corpus a931c659…; durable append p50.</text><text class="footnote" x="20" y="328">Lower is better. Tulya was 2.23–2.41× faster than the tested SQLite delta stores.</text>
+</svg>

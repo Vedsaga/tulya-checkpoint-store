@@ -10,8 +10,8 @@ use std::fmt;
 
 const V2_NODE_MAGIC: [u8; 4] = *b"T2N2";
 const V2_ROOT_MAGIC: [u8; 4] = *b"T2R2";
-const V2_NODE_RECORD_SIZE: usize = 72;
-const V2_ROOT_RECORD_SIZE: usize = 56;
+pub(crate) const V2_NODE_RECORD_SIZE: usize = 72;
+pub(crate) const V2_ROOT_RECORD_SIZE: usize = 56;
 const V2_ROOT_REPRESENTATION_BALANCED: u8 = 1;
 const V2_NODE_KIND_LEAF: u8 = 1;
 const V2_NODE_KIND_BRANCH: u8 = 2;

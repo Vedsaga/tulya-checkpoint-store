@@ -119,7 +119,7 @@ impl V2SpliceResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ArenaNode {
+pub(super) enum ArenaNode {
     Leaf {
         payload_offset: u64,
         payload_len: u64,
@@ -132,8 +132,52 @@ enum ArenaNode {
     },
 }
 
+/// Private content-access boundary shared by the in-memory arena and the
+/// durable physical content store (E6).
+///
+/// The AVL split/concat/rebalance/splice/range-read/verification logic below
+/// is written once, against this boundary: there is no separate disk splice
+/// algorithm and memory splice algorithm. The in-memory
+/// [`V2AvlSequence`] implements it over its vectors (existing pure/unit
+/// tests), while the authoritative durable store implements it over
+/// fixed-width node records and bounded payload ranges in content files.
+///
+/// Length accessors report `usize` for direct allocation/index use; every
+/// conversion to persisted `u64` widths is checked at the call site. Reads
+/// return owned values so file-backed implementations never hand out
+/// borrowed arena memory. Builders append only: old nodes and payload are
+/// immutable, and new branches may reference old nodes plus earlier fresh
+/// nodes from the same delta. Rollback truncates to entry lengths.
+///
+/// Integrity validation of visited nodes (leaf recomputation against full
+/// leaf bytes, branch recomputation against child roots) lives in the shared
+/// traversal code, not in any one backend, so both paths enforce identical
+/// read integrity. Validation work deliberately does not move the
+/// [`SequenceWorkCounters`](super::SequenceWorkCounters) traversal counters:
+/// those keep their exact historical traversal-shape semantics, while actual
+/// file bytes surface in the physical I/O counters.
+pub(super) trait ArenaStore {
+    /// Current payload-arena length in bytes.
+    fn arena_payload_len(&self) -> usize;
+    /// Current node-arena length in records.
+    fn arena_node_count(&self) -> usize;
+    /// Loads one node by identifier, failing closed on unknown identifiers
+    /// or non-canonical record bytes.
+    fn arena_load_node(&self, node_id: u64) -> Result<ArenaNode, V2AvlError>;
+    /// Reads one exact payload range `[start..end)`, failing closed outside
+    /// the arena.
+    fn arena_read_payload(&self, start: u64, end: u64) -> Result<Vec<u8>, V2AvlError>;
+    /// Appends payload bytes, returning the base offset they occupy.
+    fn arena_append_payload(&mut self, bytes: &[u8]) -> Result<u64, V2AvlError>;
+    /// Pushes one node, returning its dense identifier.
+    fn arena_push_node(&mut self, node: ArenaNode) -> Result<u64, V2AvlError>;
+    /// Rolls back both arenas to entry lengths after a failed edit. Only
+    /// ever called with lengths at or above the delta base.
+    fn arena_truncate(&mut self, payload_len: usize, node_count: usize);
+}
+
 impl ArenaNode {
-    const fn record(&self) -> V2NodeRecord {
+    pub(super) const fn record(&self) -> V2NodeRecord {
         match self {
             Self::Leaf { record, .. } | Self::Branch { record, .. } => *record,
         }
@@ -144,6 +188,47 @@ impl ArenaNode {
 pub(super) struct V2AvlSequence {
     payload: Vec<u8>,
     nodes: Vec<ArenaNode>,
+}
+
+impl ArenaStore for V2AvlSequence {
+    fn arena_payload_len(&self) -> usize {
+        self.payload.len()
+    }
+
+    fn arena_node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn arena_load_node(&self, node_id: u64) -> Result<ArenaNode, V2AvlError> {
+        let index = usize::try_from(node_id)
+            .map_err(|_| V2AvlError::Overflow("v2 node identifier exceeds usize"))?;
+        self.nodes.get(index).cloned().ok_or(V2AvlError::Invalid(
+            "v2 root references a missing arena node",
+        ))
+    }
+
+    fn arena_read_payload(&self, start: u64, end: u64) -> Result<Vec<u8>, V2AvlError> {
+        Ok(self.payload_slice(start, end)?.to_vec())
+    }
+
+    fn arena_append_payload(&mut self, bytes: &[u8]) -> Result<u64, V2AvlError> {
+        let offset = u64::try_from(self.payload.len())
+            .map_err(|_| V2AvlError::Overflow("v2 payload arena length exceeds u64"))?;
+        self.payload.extend_from_slice(bytes);
+        Ok(offset)
+    }
+
+    fn arena_push_node(&mut self, node: ArenaNode) -> Result<u64, V2AvlError> {
+        let node_id = u64::try_from(self.nodes.len())
+            .map_err(|_| V2AvlError::Overflow("v2 node arena length exceeds u64"))?;
+        self.nodes.push(node);
+        Ok(node_id)
+    }
+
+    fn arena_truncate(&mut self, payload_len: usize, node_count: usize) {
+        self.payload.truncate(payload_len);
+        self.nodes.truncate(node_count);
+    }
 }
 
 impl V2AvlSequence {
@@ -159,8 +244,17 @@ impl V2AvlSequence {
     ) -> Result<V2AppendResult, V2AvlError> {
         // The offset reads record metadata directly; splice re-resolves the
         // parent against the arena and fails closed on any disagreement.
+        Self::append_on(self, parent, bytes)
+    }
+
+    /// Shared append core: identical logic for memory and physical arenas.
+    pub(super) fn append_on<A: ArenaStore>(
+        arena: &mut A,
+        parent: Option<V2RootRecord>,
+        bytes: &[u8],
+    ) -> Result<V2AppendResult, V2AvlError> {
         let offset = parent.map_or(0, V2RootRecord::logical_len);
-        let result = self.splice(parent, offset, 0, bytes)?;
+        let result = Self::splice_on(arena, parent, offset, 0, bytes)?;
         Ok(V2AppendResult {
             root: result.root(),
             allocated_nodes: result.allocated_nodes(),
@@ -190,10 +284,24 @@ impl V2AvlSequence {
         delete_len: u64,
         insert: &[u8],
     ) -> Result<V2SpliceResult, V2AvlError> {
+        Self::splice_on(self, parent, offset, delete_len, insert)
+    }
+
+    /// Shared persistent local splice over any arena: replaces
+    /// `source[offset..offset+delete_len]` with `insert`, preserving
+    /// `parent` and every older root. See [`splice`](Self::splice) for the
+    /// reference semantics and rollback contract.
+    pub(super) fn splice_on<A: ArenaStore>(
+        arena: &mut A,
+        parent: Option<V2RootRecord>,
+        offset: u64,
+        delete_len: u64,
+        insert: &[u8],
+    ) -> Result<V2SpliceResult, V2AvlError> {
         let source_len = match parent {
             None => 0,
             Some(root) => {
-                self.node_for_root(root)?;
+                Self::node_for_root_on(arena, root)?;
                 root.logical_len()
             }
         };
@@ -242,26 +350,32 @@ impl V2AvlSequence {
             ));
         }
 
-        let payload_start = self.payload.len();
-        let node_start = self.nodes.len();
+        let payload_start = arena.arena_payload_len();
+        let node_start = arena.arena_node_count();
         let mut inspected = 0usize;
-        match self.splice_inner(parent, offset, delete_len, insert, &mut inspected) {
+        // The parent node itself is an accessed path: boundary splits may
+        // return it untouched, so validate it explicitly here rather than
+        // relying on descent to visit it.
+        if let Some(root) = parent {
+            let node = Self::node_for_root_on(arena, root)?;
+            Self::validate_node_on(arena, &node)?;
+        }
+        match Self::splice_inner_on(arena, parent, offset, delete_len, insert, &mut inspected) {
             Ok(root) => Ok(V2SpliceResult {
                 root,
-                allocated_nodes: self.nodes.len() - node_start,
+                allocated_nodes: arena.arena_node_count() - node_start,
                 inspected_nodes: inspected,
-                payload_bytes_allocated: self.payload.len() - payload_start,
+                payload_bytes_allocated: arena.arena_payload_len() - payload_start,
             }),
             Err(error) => {
-                self.payload.truncate(payload_start);
-                self.nodes.truncate(node_start);
+                arena.arena_truncate(payload_start, node_start);
                 Err(error)
             }
         }
     }
 
-    fn splice_inner(
-        &mut self,
+    fn splice_inner_on<A: ArenaStore>(
+        arena: &mut A,
         parent: Option<V2RootRecord>,
         offset: u64,
         delete_len: u64,
@@ -271,7 +385,7 @@ impl V2AvlSequence {
         let middle = if insert.is_empty() {
             None
         } else {
-            Some(self.build_insert_subtree(insert, inspected)?)
+            Some(Self::build_insert_subtree_on(arena, insert, inspected)?)
         };
         let Some(root) = parent else {
             // Root creation validated non-empty above; the option unwrap
@@ -280,20 +394,20 @@ impl V2AvlSequence {
                 "v2 sequence root creation produced no content",
             ));
         };
-        let (left, mid_right) = self.split(root, offset, inspected)?;
+        let (left, mid_right) = Self::split_on(arena, root, offset, inspected)?;
         let right = match mid_right {
             None => None,
             Some(mid) => {
                 if delete_len == 0 {
                     Some(mid)
                 } else {
-                    let (_, right) = self.split(mid, delete_len, inspected)?;
+                    let (_, right) = Self::split_on(arena, mid, delete_len, inspected)?;
                     right
                 }
             }
         };
-        let combined = self.concat_optional(left, middle, inspected)?;
-        let combined = self.concat_optional(combined, right, inspected)?;
+        let combined = Self::concat_optional_on(arena, left, middle, inspected)?;
+        let combined = Self::concat_optional_on(arena, combined, right, inspected)?;
         combined.ok_or(V2AvlError::Invalid(
             "v2 sequence splice produced an empty root",
         ))
@@ -304,8 +418,8 @@ impl V2AvlSequence {
     /// Only the descent path is copied and rejoined through the balancing
     /// concat, so both halves stay valid AVL trees sharing every untouched
     /// node with the source.
-    fn split(
-        &mut self,
+    fn split_on<A: ArenaStore>(
+        arena: &mut A,
         root: V2RootRecord,
         offset: u64,
         inspected: &mut usize,
@@ -323,7 +437,11 @@ impl V2AvlSequence {
             return Ok((Some(root), None));
         }
         *inspected = inspected.saturating_add(1);
-        let node = self.node_for_root(root)?.clone();
+        let node = Self::node_for_root_on(arena, root)?;
+        // Every descended node is an accessed path: its stored record must
+        // agree with its payload (leaf) or children (branch), identically on
+        // memory and physical arenas.
+        Self::validate_node_on(arena, &node)?;
         match node {
             ArenaNode::Leaf {
                 payload_offset,
@@ -338,29 +456,30 @@ impl V2AvlSequence {
                     .ok_or(V2AvlError::Overflow("v2 leaf split range exceeds u64"))?;
                 // Bounded boundary fragments: the source leaf itself respects
                 // the staging bound, so both copies stay within it.
-                let left_bytes = self.payload_slice(payload_offset, left_end)?.to_vec();
-                let right_bytes = self.payload_slice(left_end, leaf_end)?.to_vec();
-                let left = self.allocate_leaf(&left_bytes)?;
-                let right = self.allocate_leaf(&right_bytes)?;
+                let left_bytes = arena.arena_read_payload(payload_offset, left_end)?;
+                let right_bytes = arena.arena_read_payload(left_end, leaf_end)?;
+                let left = Self::allocate_leaf_on(arena, &left_bytes)?;
+                let right = Self::allocate_leaf_on(arena, &right_bytes)?;
                 Ok((Some(left), Some(right)))
             }
             ArenaNode::Branch { left, right, .. } => {
                 let left_len = left.logical_len();
                 match offset.cmp(&left_len) {
                     std::cmp::Ordering::Less => {
-                        let (far_left, near) = self.split(left, offset, inspected)?;
+                        let (far_left, near) = Self::split_on(arena, left, offset, inspected)?;
                         let joined_right = match near {
                             None => right,
-                            Some(near) => self.concat(near, right, inspected)?,
+                            Some(near) => Self::concat_on(arena, near, right, inspected)?,
                         };
                         Ok((far_left, Some(joined_right)))
                     }
                     std::cmp::Ordering::Equal => Ok((Some(left), Some(right))),
                     std::cmp::Ordering::Greater => {
-                        let (near, far_right) = self.split(right, offset - left_len, inspected)?;
+                        let (near, far_right) =
+                            Self::split_on(arena, right, offset - left_len, inspected)?;
                         let joined_left = match near {
                             None => left,
-                            Some(near) => self.concat(left, near, inspected)?,
+                            Some(near) => Self::concat_on(arena, left, near, inspected)?,
                         };
                         Ok((Some(joined_left), far_right))
                     }
@@ -371,8 +490,8 @@ impl V2AvlSequence {
 
     /// Concatenation over possibly empty sides, so split/splice represent
     /// temporary empty pieces without an externally visible empty root.
-    fn concat_optional(
-        &mut self,
+    fn concat_optional_on<A: ArenaStore>(
+        arena: &mut A,
         left: Option<V2RootRecord>,
         right: Option<V2RootRecord>,
         inspected: &mut usize,
@@ -380,15 +499,15 @@ impl V2AvlSequence {
         match (left, right) {
             (None, None) => Ok(None),
             (None, Some(root)) | (Some(root), None) => Ok(Some(root)),
-            (Some(left), Some(right)) => Ok(Some(self.concat(left, right, inspected)?)),
+            (Some(left), Some(right)) => Ok(Some(Self::concat_on(arena, left, right, inspected)?)),
         }
     }
 
     /// Builds a balanced subtree for inserted bytes in linear chunk work:
     /// bounded leaves first, then bottom-up pairing rounds that halve the
     /// level each round instead of repeatedly path-copying a growing tree.
-    fn build_insert_subtree(
-        &mut self,
+    fn build_insert_subtree_on<A: ArenaStore>(
+        arena: &mut A,
         insert: &[u8],
         inspected: &mut usize,
     ) -> Result<V2RootRecord, V2AvlError> {
@@ -398,7 +517,7 @@ impl V2AvlSequence {
             .try_reserve_exact(chunks)
             .map_err(|_| V2AvlError::Invalid("v2 sequence insert level allocation failed"))?;
         for chunk in insert.chunks(MAX_LEAF_PAYLOAD_BYTES) {
-            level.push(self.allocate_leaf(chunk)?);
+            level.push(Self::allocate_leaf_on(arena, chunk)?);
         }
         while level.len() > 1 {
             let mut next = Vec::new();
@@ -407,7 +526,12 @@ impl V2AvlSequence {
             let mut index = 0;
             while index < level.len() {
                 if index + 1 < level.len() {
-                    next.push(self.concat(level[index], level[index + 1], inspected)?);
+                    next.push(Self::concat_on(
+                        arena,
+                        level[index],
+                        level[index + 1],
+                        inspected,
+                    )?);
                     index += 2;
                 } else {
                     next.push(level[index]);
@@ -423,17 +547,28 @@ impl V2AvlSequence {
 
     /// Allocates one bounded leaf. The record constructor enforces
     /// non-emptiness and the staging payload bound.
-    fn allocate_leaf(&mut self, bytes: &[u8]) -> Result<V2RootRecord, V2AvlError> {
-        let payload_offset = u64::try_from(self.payload.len())
+    fn allocate_leaf_on<A: ArenaStore>(
+        arena: &mut A,
+        bytes: &[u8],
+    ) -> Result<V2RootRecord, V2AvlError> {
+        let payload_offset = u64::try_from(arena.arena_payload_len())
             .map_err(|_| V2AvlError::Overflow("v2 payload arena length exceeds u64"))?;
         let record = V2NodeRecord::leaf(payload_offset, bytes)?;
         let payload_len = record.logical_len();
-        self.payload.extend_from_slice(bytes);
-        self.allocate_node(ArenaNode::Leaf {
-            payload_offset,
-            payload_len,
-            record,
-        })
+        let placed = arena.arena_append_payload(bytes)?;
+        if placed != payload_offset {
+            return Err(V2AvlError::Invalid(
+                "v2 leaf payload placement disagrees with its record",
+            ));
+        }
+        Self::allocate_node_on(
+            arena,
+            ArenaNode::Leaf {
+                payload_offset,
+                payload_len,
+                record,
+            },
+        )
     }
 
     /// Returns an exact logical byte range from one retained root.
@@ -443,7 +578,7 @@ impl V2AvlSequence {
         offset: u64,
         length: u64,
     ) -> Result<Vec<u8>, V2AvlError> {
-        Ok(self.read_range_counted(root, offset, length)?.0)
+        Ok(Self::read_range_counted_on(self, root, offset, length)?.0)
     }
 
     /// Returns an exact logical byte range plus the number of arena nodes
@@ -455,7 +590,23 @@ impl V2AvlSequence {
         offset: u64,
         length: u64,
     ) -> Result<(Vec<u8>, u64), V2AvlError> {
-        self.node_for_root(root)?;
+        Self::read_range_counted_on(self, root, offset, length)
+    }
+
+    /// Shared range-read core over any arena. Every visited node is an
+    /// accessed path: leaf payload is re-read whole and recomputed against
+    /// its record (a sub-range read still validates the complete bounded
+    /// boundary leaf), and branch records recompute against their child
+    /// roots. A corrupt node fails the read closed even when the requested
+    /// slice itself would decode; corruption outside visited paths stays
+    /// lazy for `verify`/`fsck` to catch.
+    pub(super) fn read_range_counted_on<A: ArenaStore>(
+        arena: &A,
+        root: V2RootRecord,
+        offset: u64,
+        length: u64,
+    ) -> Result<(Vec<u8>, u64), V2AvlError> {
+        Self::node_for_root_on(arena, root)?;
         let end = offset
             .checked_add(length)
             .ok_or(V2AvlError::Overflow("v2 range end exceeds u64"))?;
@@ -473,7 +624,9 @@ impl V2AvlSequence {
         let mut stack = vec![(root, offset, length)];
         while let Some((current, local_offset, local_length)) = stack.pop() {
             visited = visited.saturating_add(1);
-            match self.node_for_root(current)? {
+            let node = Self::node_for_root_on(arena, current)?;
+            Self::validate_node_on(arena, &node)?;
+            match node {
                 ArenaNode::Leaf {
                     payload_offset,
                     payload_len,
@@ -482,7 +635,7 @@ impl V2AvlSequence {
                     let local_end = local_offset
                         .checked_add(local_length)
                         .ok_or(V2AvlError::Overflow("v2 leaf range exceeds u64"))?;
-                    if local_end > *payload_len {
+                    if local_end > payload_len {
                         return Err(V2AvlError::Invalid("v2 leaf range exceeds leaf payload"));
                     }
                     let start = payload_offset
@@ -491,7 +644,7 @@ impl V2AvlSequence {
                     let end = start
                         .checked_add(local_length)
                         .ok_or(V2AvlError::Overflow("v2 payload end exceeds u64"))?;
-                    output.extend_from_slice(self.payload_slice(start, end)?);
+                    output.extend_from_slice(&arena.arena_read_payload(start, end)?);
                 }
                 ArenaNode::Branch { left, right, .. } => {
                     let left_len = left.logical_len();
@@ -500,13 +653,13 @@ impl V2AvlSequence {
                         let left_length = local_length.min(left_available);
                         let right_length = local_length - left_length;
                         if right_length > 0 {
-                            stack.push((*right, 0, right_length));
+                            stack.push((right, 0, right_length));
                         }
                         if left_length > 0 {
-                            stack.push((*left, local_offset, left_length));
+                            stack.push((left, local_offset, left_length));
                         }
                     } else {
-                        stack.push((*right, local_offset - left_len, local_length));
+                        stack.push((right, local_offset - left_len, local_length));
                     }
                 }
             }
@@ -522,15 +675,23 @@ impl V2AvlSequence {
 
     /// Recomputes every reachable node's metadata and commitment.
     pub(super) fn verify_root(&self, root: V2RootRecord) -> Result<(), V2AvlError> {
-        let _ = self.verify_root_counted(root)?;
+        let _ = Self::verify_root_counted_on(self, root)?;
         Ok(())
     }
 
     /// Verifies like [`V2AvlSequence::verify_root`] and reports how many arena
     /// nodes were revalidated.
     pub(super) fn verify_root_counted(&self, root: V2RootRecord) -> Result<u64, V2AvlError> {
+        Self::verify_root_counted_on(self, root)
+    }
+
+    /// Shared full-version verification core over any arena.
+    pub(super) fn verify_root_counted_on<A: ArenaStore>(
+        arena: &A,
+        root: V2RootRecord,
+    ) -> Result<u64, V2AvlError> {
         let mut visited = 0u64;
-        self.verify_node(root, &mut visited)?;
+        Self::verify_node_on(arena, root, &mut visited)?;
         Ok(visited)
     }
 
@@ -564,7 +725,7 @@ impl V2AvlSequence {
         for root in roots {
             // Validates representation, node identity, and exact length: a
             // forged or dangling root fails here, before any plan work.
-            self.node_for_root(*root)?;
+            Self::node_for_root_on(self, *root)?;
             seeds.push(root.node_id());
         }
         let mut records: Vec<V2NodeRecord> = Vec::new();
@@ -682,7 +843,7 @@ impl V2AvlSequence {
             ));
         }
         for root in roots {
-            self.node_for_root(*root)?;
+            Self::node_for_root_on(self, *root)?;
         }
         let image = V2SequenceImage {
             payload: self.payload.clone(),
@@ -776,100 +937,136 @@ impl V2AvlSequence {
             ));
         }
         for root in &image.roots {
-            sequence.node_for_root(*root)?;
+            Self::node_for_root_on(&sequence, *root)?;
         }
         Ok((sequence, image.roots))
     }
 
     /// Persistent AVL concatenation. Only the changed spine is copied.
-    fn concat(
-        &mut self,
+    fn concat_on<A: ArenaStore>(
+        arena: &mut A,
         left: V2RootRecord,
         right: V2RootRecord,
         inspected: &mut usize,
     ) -> Result<V2RootRecord, V2AvlError> {
         if left.height() > right.height().saturating_add(1) {
-            let (left_left, left_right) = self.branch_children(left, inspected)?;
-            let joined = self.concat(left_right, right, inspected)?;
-            return self.rebalance(left_left, joined, inspected);
+            let (left_left, left_right) = Self::branch_children_on(arena, left, inspected)?;
+            let joined = Self::concat_on(arena, left_right, right, inspected)?;
+            return Self::rebalance_on(arena, left_left, joined, inspected);
         }
         if right.height() > left.height().saturating_add(1) {
-            let (right_left, right_right) = self.branch_children(right, inspected)?;
-            let joined = self.concat(left, right_left, inspected)?;
-            return self.rebalance(joined, right_right, inspected);
+            let (right_left, right_right) = Self::branch_children_on(arena, right, inspected)?;
+            let joined = Self::concat_on(arena, left, right_left, inspected)?;
+            return Self::rebalance_on(arena, joined, right_right, inspected);
         }
-        self.allocate_branch(left, right, inspected)
+        Self::allocate_branch_on(arena, left, right, inspected)
     }
 
     /// Restores the AVL height invariant with a single or double rotation.
+    /// Test-visible entry kept for rotation coverage: shares the single
+    /// implementation below.
+    #[cfg(test)]
     fn rebalance(
         &mut self,
         left: V2RootRecord,
         right: V2RootRecord,
         inspected: &mut usize,
     ) -> Result<V2RootRecord, V2AvlError> {
+        Self::rebalance_on(self, left, right, inspected)
+    }
+
+    fn rebalance_on<A: ArenaStore>(
+        arena: &mut A,
+        left: V2RootRecord,
+        right: V2RootRecord,
+        inspected: &mut usize,
+    ) -> Result<V2RootRecord, V2AvlError> {
         if left.height().abs_diff(right.height()) <= 1 {
-            return self.allocate_branch(left, right, inspected);
+            return Self::allocate_branch_on(arena, left, right, inspected);
         }
 
         if left.height() > right.height() {
-            let (left_left, left_right) = self.branch_children(left, inspected)?;
+            let (left_left, left_right) = Self::branch_children_on(arena, left, inspected)?;
             if left_left.height() >= left_right.height() {
-                let new_right = self.allocate_branch(left_right, right, inspected)?;
-                return self.allocate_branch(left_left, new_right, inspected);
+                let new_right = Self::allocate_branch_on(arena, left_right, right, inspected)?;
+                return Self::allocate_branch_on(arena, left_left, new_right, inspected);
             }
-            let (middle_left, middle_right) = self.branch_children(left_right, inspected)?;
-            let new_left = self.allocate_branch(left_left, middle_left, inspected)?;
-            let new_right = self.allocate_branch(middle_right, right, inspected)?;
-            return self.allocate_branch(new_left, new_right, inspected);
+            let (middle_left, middle_right) =
+                Self::branch_children_on(arena, left_right, inspected)?;
+            let new_left = Self::allocate_branch_on(arena, left_left, middle_left, inspected)?;
+            let new_right = Self::allocate_branch_on(arena, middle_right, right, inspected)?;
+            return Self::allocate_branch_on(arena, new_left, new_right, inspected);
         }
 
-        let (right_left, right_right) = self.branch_children(right, inspected)?;
+        let (right_left, right_right) = Self::branch_children_on(arena, right, inspected)?;
         if right_right.height() >= right_left.height() {
-            let new_left = self.allocate_branch(left, right_left, inspected)?;
-            return self.allocate_branch(new_left, right_right, inspected);
+            let new_left = Self::allocate_branch_on(arena, left, right_left, inspected)?;
+            return Self::allocate_branch_on(arena, new_left, right_right, inspected);
         }
-        let (middle_left, middle_right) = self.branch_children(right_left, inspected)?;
-        let new_left = self.allocate_branch(left, middle_left, inspected)?;
-        let new_right = self.allocate_branch(middle_right, right_right, inspected)?;
-        self.allocate_branch(new_left, new_right, inspected)
+        let (middle_left, middle_right) = Self::branch_children_on(arena, right_left, inspected)?;
+        let new_left = Self::allocate_branch_on(arena, left, middle_left, inspected)?;
+        let new_right = Self::allocate_branch_on(arena, middle_right, right_right, inspected)?;
+        Self::allocate_branch_on(arena, new_left, new_right, inspected)
     }
 
+    /// Test-visible branch allocation entry kept for rotation coverage:
+    /// shares the single implementation below.
+    #[cfg(test)]
     fn allocate_branch(
         &mut self,
         left: V2RootRecord,
         right: V2RootRecord,
         inspected: &mut usize,
     ) -> Result<V2RootRecord, V2AvlError> {
-        // Both child validations below resolve one arena node each.
-        *inspected = inspected.saturating_add(2);
-        self.node_for_root(left)?;
-        self.node_for_root(right)?;
-        let record = V2NodeRecord::branch(left, right)?;
-        self.allocate_node(ArenaNode::Branch {
-            left,
-            right,
-            record,
-        })
+        Self::allocate_branch_on(self, left, right, inspected)
     }
 
-    fn allocate_node(&mut self, node: ArenaNode) -> Result<V2RootRecord, V2AvlError> {
-        let node_id = u64::try_from(self.nodes.len())
+    fn allocate_branch_on<A: ArenaStore>(
+        arena: &mut A,
+        left: V2RootRecord,
+        right: V2RootRecord,
+        inspected: &mut usize,
+    ) -> Result<V2RootRecord, V2AvlError> {
+        // Both child validations below resolve one arena node each.
+        *inspected = inspected.saturating_add(2);
+        Self::node_for_root_on(arena, left)?;
+        Self::node_for_root_on(arena, right)?;
+        let record = V2NodeRecord::branch(left, right)?;
+        Self::allocate_node_on(
+            arena,
+            ArenaNode::Branch {
+                left,
+                right,
+                record,
+            },
+        )
+    }
+
+    fn allocate_node_on<A: ArenaStore>(
+        arena: &mut A,
+        node: ArenaNode,
+    ) -> Result<V2RootRecord, V2AvlError> {
+        let node_id = u64::try_from(arena.arena_node_count())
             .map_err(|_| V2AvlError::Overflow("v2 node arena length exceeds u64"))?;
         let root = V2RootRecord::from_node(node_id, node.record())?;
-        self.nodes.push(node);
+        let placed = arena.arena_push_node(node)?;
+        if placed != node_id {
+            return Err(V2AvlError::Invalid(
+                "v2 node placement disagrees with its record",
+            ));
+        }
         Ok(root)
     }
 
-    fn branch_children(
-        &self,
+    fn branch_children_on<A: ArenaStore>(
+        arena: &A,
         root: V2RootRecord,
         inspected: &mut usize,
     ) -> Result<(V2RootRecord, V2RootRecord), V2AvlError> {
         // The single resolution below reads one arena node.
         *inspected = inspected.saturating_add(1);
-        match self.node_for_root(root)? {
-            ArenaNode::Branch { left, right, .. } => Ok((*left, *right)),
+        match Self::node_for_root_on(arena, root)? {
+            ArenaNode::Branch { left, right, .. } => Ok((left, right)),
             ArenaNode::Leaf { .. } => Err(V2AvlError::Invalid(
                 "v2 AVL traversal expected a branch node",
             )),
@@ -882,20 +1079,27 @@ impl V2AvlSequence {
     /// re-entering the backend resolves against the actual arena node instead
     /// of trusting caller-supplied metadata.
     pub(super) fn root_for_node_id(&self, node_id: u64) -> Result<V2RootRecord, V2AvlError> {
-        let index = usize::try_from(node_id)
-            .map_err(|_| V2AvlError::Overflow("v2 node identifier exceeds usize"))?;
-        let node = self.nodes.get(index).ok_or(V2AvlError::Invalid(
-            "v2 root references a missing arena node",
-        ))?;
+        Self::root_for_node_id_on(self, node_id)
+    }
+
+    /// Shared arena-position resolution over any arena.
+    pub(super) fn root_for_node_id_on<A: ArenaStore>(
+        arena: &A,
+        node_id: u64,
+    ) -> Result<V2RootRecord, V2AvlError> {
+        let node = arena.arena_load_node(node_id)?;
         Ok(V2RootRecord::from_node(node_id, node.record())?)
     }
 
-    fn node_for_root(&self, root: V2RootRecord) -> Result<&ArenaNode, V2AvlError> {
-        let index = usize::try_from(root.node_id())
-            .map_err(|_| V2AvlError::Overflow("v2 node identifier exceeds usize"))?;
-        let node = self.nodes.get(index).ok_or(V2AvlError::Invalid(
-            "v2 root references a missing arena node",
-        ))?;
+    /// Resolves a re-entering root against the arena and checks exact
+    /// metadata agreement, returning the stored node. Every traversal entry
+    /// funnels through here so forged lengths or unknown identifiers fail
+    /// closed before any content work.
+    pub(super) fn node_for_root_on<A: ArenaStore>(
+        arena: &A,
+        root: V2RootRecord,
+    ) -> Result<ArenaNode, V2AvlError> {
+        let node = arena.arena_load_node(root.node_id())?;
         let canonical = V2RootRecord::from_node(root.node_id(), node.record())?;
         if canonical != root {
             return Err(V2AvlError::Invalid(
@@ -903,6 +1107,46 @@ impl V2AvlSequence {
             ));
         }
         Ok(node)
+    }
+
+    /// Validates one resolved node's stored record against its content: a
+    /// leaf recomputes from its complete payload bytes, a branch recomputes
+    /// from its child roots. Pure metadata agreement (above) is not enough:
+    /// a stored record with intact identity but corrupt commitment must fail
+    /// every path that visits it.
+    fn validate_node_on<A: ArenaStore>(arena: &A, node: &ArenaNode) -> Result<(), V2AvlError> {
+        match node {
+            ArenaNode::Leaf {
+                payload_offset,
+                payload_len,
+                record,
+            } => {
+                let payload_end = payload_offset
+                    .checked_add(*payload_len)
+                    .ok_or(V2AvlError::Overflow("v2 leaf payload range exceeds u64"))?;
+                let bytes = arena.arena_read_payload(*payload_offset, payload_end)?;
+                let expected = V2NodeRecord::leaf(*payload_offset, &bytes)?;
+                if expected != *record {
+                    return Err(V2AvlError::Invalid(
+                        "v2 leaf metadata or commitment verification failed",
+                    ));
+                }
+                Ok(())
+            }
+            ArenaNode::Branch {
+                left,
+                right,
+                record,
+            } => {
+                let expected = V2NodeRecord::branch(*left, *right)?;
+                if expected != *record {
+                    return Err(V2AvlError::Invalid(
+                        "v2 branch metadata or commitment verification failed",
+                    ));
+                }
+                Ok(())
+            }
+        }
     }
 
     fn payload_slice(&self, start: u64, end: u64) -> Result<&[u8], V2AvlError> {
@@ -915,41 +1159,17 @@ impl V2AvlSequence {
             .ok_or(V2AvlError::Invalid("v2 payload range is outside the arena"))
     }
 
-    fn verify_node(&self, root: V2RootRecord, visited: &mut u64) -> Result<(), V2AvlError> {
+    fn verify_node_on<A: ArenaStore>(
+        arena: &A,
+        root: V2RootRecord,
+        visited: &mut u64,
+    ) -> Result<(), V2AvlError> {
         *visited = visited.saturating_add(1);
-        match self.node_for_root(root)? {
-            ArenaNode::Leaf {
-                payload_offset,
-                payload_len,
-                record,
-            } => {
-                let payload_end = payload_offset
-                    .checked_add(*payload_len)
-                    .ok_or(V2AvlError::Overflow("v2 leaf payload range exceeds u64"))?;
-                let expected = V2NodeRecord::leaf(
-                    *payload_offset,
-                    self.payload_slice(*payload_offset, payload_end)?,
-                )?;
-                if expected != *record {
-                    return Err(V2AvlError::Invalid(
-                        "v2 leaf metadata or commitment verification failed",
-                    ));
-                }
-            }
-            ArenaNode::Branch {
-                left,
-                right,
-                record,
-            } => {
-                self.verify_node(*left, visited)?;
-                self.verify_node(*right, visited)?;
-                let expected = V2NodeRecord::branch(*left, *right)?;
-                if expected != *record {
-                    return Err(V2AvlError::Invalid(
-                        "v2 branch metadata or commitment verification failed",
-                    ));
-                }
-            }
+        let node = Self::node_for_root_on(arena, root)?;
+        Self::validate_node_on(arena, &node)?;
+        if let ArenaNode::Branch { left, right, .. } = node {
+            Self::verify_node_on(arena, left, visited)?;
+            Self::verify_node_on(arena, right, visited)?;
         }
         Ok(())
     }

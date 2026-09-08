@@ -39,6 +39,7 @@ mod format_v2;
 #[allow(dead_code)]
 mod hot_frame_v2;
 mod image_v2;
+pub(crate) mod physical;
 #[allow(dead_code)]
 mod publication_v2;
 #[allow(dead_code)]
@@ -50,8 +51,13 @@ mod transaction_v2;
 
 use avl::{V2AvlError, V2AvlSequence};
 use format_v2::V2RootRecord;
+pub(crate) use format_v2::V2_ROOT_RECORD_SIZE;
+use physical::{
+    IoLedger, PhysicalContentStore, PhysicalDelta, PhysicalGcBuild, PhysicalIoCounters,
+};
 use std::cell::Cell;
 use std::fmt;
+use std::path::Path;
 
 /// Logical byte length of a persistent sequence.
 ///
@@ -326,23 +332,133 @@ pub(crate) struct CompactedSequence {
     pub(crate) payload_bytes_after: u64,
 }
 
+/// Compact replacement from [`BalancedSequence::compact_physical_to_roots`]:
+/// the new-generation backend, remapped roots in input order, and
+/// before/after sizes for maintenance statistics.
+#[derive(Debug)]
+pub(crate) struct PhysicalCompactedSequence {
+    pub(crate) backend: BalancedSequence,
+    pub(crate) roots: Vec<PersistentRoot>,
+    pub(crate) nodes_before: u64,
+    pub(crate) nodes_after: u64,
+    pub(crate) payload_bytes_before: u64,
+    pub(crate) payload_bytes_after: u64,
+}
+
+/// Exports one canonical `T2I2` image from a physical store by loading the
+/// complete committed tables. Explicit export/fsck/conformance tooling only:
+/// `O(state)` RAM and I/O, never the normal authority path.
+fn export_physical_image(
+    store: &PhysicalContentStore,
+    roots: &[V2RootRecord],
+) -> Result<Vec<u8>, SequenceError> {
+    use image_v2::{encode_v2_image, V2SequenceImage};
+    let records = store.load_all_records()?;
+    let payload = store.read_all_payload()?;
+    Ok(encode_v2_image(&V2SequenceImage {
+        payload,
+        nodes: records,
+        roots: roots.to_vec(),
+    })
+    .map_err(V2AvlError::from)?)
+}
+
+/// Decodes and validates one canonical 56-byte `T2R2` root record from a
+/// metadata snapshot, returning the seam root. Non-canonical bytes fail
+/// closed here, before any catalogue entry commits.
+pub(crate) fn decode_canonical_root_bytes(
+    bytes: &[u8; format_v2::V2_ROOT_RECORD_SIZE],
+) -> Result<PersistentRoot, SequenceError> {
+    let root = format_v2::decode_v2_root(bytes).map_err(V2AvlError::from)?;
+    Ok(PersistentRoot::balanced_v2(
+        root.node_id(),
+        LogicalLength::new(root.logical_len()),
+    ))
+}
+
 /// In-memory balanced persistent-sequence backend behind the production seam.
 ///
 /// Wraps the staged AVL core without reimplementing tree logic. Every root
 /// re-entering through [`PersistentRoot`] resolves its arena position to
 /// canonical metadata, so forged lengths or unknown identifiers fail closed
 /// inside the core's existing checks.
+///
+/// E6 adds the second backend variant: the authoritative physical content
+/// store. A backend is either ephemeral memory (pure/unit tests, legacy
+/// reconstruction) or durable physical files (the one canonical durable
+/// path). Both run the SAME split/concat/rebalance/splice/range-read
+/// algorithms through the private arena boundary; only the storage of nodes
+/// and payload differs.
 #[derive(Debug)]
 pub struct BalancedSequence {
-    inner: V2AvlSequence,
+    backend: SequenceBackend,
     work: Cell<SequenceWorkCounters>,
+    ledger: IoLedger,
+}
+
+#[derive(Debug)]
+enum SequenceBackend {
+    Memory(V2AvlSequence),
+    Physical(PhysicalContentStore),
 }
 
 impl BalancedSequence {
     pub fn new() -> Self {
         Self {
-            inner: V2AvlSequence::default(),
+            backend: SequenceBackend::Memory(V2AvlSequence::default()),
             work: Cell::new(SequenceWorkCounters::default()),
+            ledger: IoLedger::new(),
+        }
+    }
+
+    /// Binds an already-opened physical content store: the durable-backend
+    /// constructor used by snapshot import and GC adoption.
+    pub(crate) fn open_physical(store: PhysicalContentStore) -> Self {
+        let ledger = store.ledger();
+        Self {
+            backend: SequenceBackend::Physical(store),
+            work: Cell::new(SequenceWorkCounters::default()),
+            ledger,
+        }
+    }
+
+    /// Returns the shared physical I/O ledger for WAL/metadata accounting
+    /// at the history layer.
+    pub(crate) fn io_ledger(&self) -> IoLedger {
+        self.ledger.clone()
+    }
+
+    /// Snapshots the physical I/O counters (all scopes).
+    pub fn io_counters(&self) -> PhysicalIoCounters {
+        self.ledger.snapshot()
+    }
+
+    /// Resets every physical I/O bucket and clears the overflow flag.
+    pub fn reset_io_counters(&self) {
+        self.ledger.reset();
+    }
+
+    /// Runs `body` under one I/O accounting scope.
+    /// Reports whether this backend is the durable physical store.
+    pub(crate) fn backend_is_physical(&self) -> bool {
+        matches!(self.backend, SequenceBackend::Physical(_))
+    }
+
+    /// Reports the physical generation for durable backends, if any.
+    pub(crate) fn physical_generation(&self) -> Option<u64> {
+        match &self.backend {
+            SequenceBackend::Memory(_) => None,
+            SequenceBackend::Physical(store) => Some(store.generation()),
+        }
+    }
+
+    /// Reports committed content frontiers for durable backends, if any.
+    pub(crate) fn physical_frontiers(&self) -> Option<(u64, u64)> {
+        match &self.backend {
+            SequenceBackend::Memory(_) => None,
+            SequenceBackend::Physical(store) => {
+                Some((store.committed_payload_end(), store.committed_node_count()))
+            }
         }
     }
 
@@ -353,19 +469,32 @@ impl BalancedSequence {
 
     /// Reports whether the arena holds no payload or nodes.
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        match &self.backend {
+            SequenceBackend::Memory(inner) => inner.is_empty(),
+            SequenceBackend::Physical(store) => {
+                store.committed_payload_end() == 0 && store.committed_node_count() == 0
+            }
+        }
     }
 
     /// Counts live arena nodes, reachable or not. Maintenance regimens use
     /// this alongside [`payload_len`](Self::payload_len) for reclamation
     /// statistics; foreground locality reasoning keeps using work counters.
     pub(crate) fn node_count(&self) -> u64 {
-        u64::try_from(self.inner.node_count()).unwrap_or(u64::MAX)
+        match &self.backend {
+            SequenceBackend::Memory(inner) => u64::try_from(inner.node_count()).unwrap_or(u64::MAX),
+            SequenceBackend::Physical(store) => store.committed_node_count(),
+        }
     }
 
     /// Reports live payload-arena bytes, reachable or not.
     pub(crate) fn payload_len(&self) -> u64 {
-        u64::try_from(self.inner.payload_len()).unwrap_or(u64::MAX)
+        match &self.backend {
+            SequenceBackend::Memory(inner) => {
+                u64::try_from(inner.payload_len()).unwrap_or(u64::MAX)
+            }
+            SequenceBackend::Physical(store) => store.committed_payload_end(),
+        }
     }
 
     /// Rebuilds a compact replacement backend from explicit retained roots.
@@ -380,6 +509,11 @@ impl BalancedSequence {
         &self,
         retained_roots: &[PersistentRoot],
     ) -> Result<CompactedSequence, SequenceError> {
+        let SequenceBackend::Memory(inner) = &self.backend else {
+            return Err(SequenceError::Invalid(
+                "durable physical backends compact through quiescent physical GC, not in-memory compaction",
+            ));
+        };
         let mut canonical = Vec::new();
         canonical
             .try_reserve_exact(retained_roots.len())
@@ -391,10 +525,11 @@ impl BalancedSequence {
         }
         let nodes_before = self.node_count();
         let payload_bytes_before = self.payload_len();
-        let (inner, remapped) = self.inner.compact_to_roots(&canonical)?;
+        let (inner, remapped) = inner.compact_to_roots(&canonical)?;
         let backend = Self {
-            inner,
+            backend: SequenceBackend::Memory(inner),
             work: Cell::new(self.work.get()),
+            ledger: self.ledger.clone(),
         };
         let nodes_after = backend.node_count();
         let payload_bytes_after = backend.payload_len();
@@ -422,6 +557,10 @@ impl BalancedSequence {
     /// canonical image. The roots must arrive in the caller's canonical order
     /// (the snapshot layer uses version order); each resolves against the
     /// arena exactly like any re-entering root.
+    ///
+    /// E6 keeps this for canonical export, fsck, conformance, and tests. It
+    /// is deliberately NOT part of the normal durable authority path: seal
+    /// and reopen never call it on a physical backend.
     pub fn export_image(&self, roots: &[PersistentRoot]) -> Result<Vec<u8>, SequenceError> {
         let mut canonical = Vec::new();
         canonical
@@ -430,12 +569,19 @@ impl BalancedSequence {
         for root in roots.iter().copied() {
             canonical.push(self.resolve(root)?);
         }
-        Ok(self.inner.export_image(&canonical)?)
+        match &self.backend {
+            SequenceBackend::Memory(inner) => Ok(inner.export_image(&canonical)?),
+            SequenceBackend::Physical(store) => Ok(export_physical_image(store, &canonical)?),
+        }
     }
 
     /// Rebuilds a backend from one canonical image, returning the backend
     /// plus the image's retained roots converted to seam roots. Every node
     /// revalidates during import; the work counters start empty.
+    ///
+    /// Memory backends only: durable physical authority binds content files
+    /// through the schema6 snapshot instead, so importing an image into a
+    /// physical backend fails closed.
     pub fn import_image(bytes: &[u8]) -> Result<(Self, Vec<PersistentRoot>), SequenceError> {
         let (inner, roots) = avl::V2AvlSequence::import_image(bytes)?;
         let mut seam_roots = Vec::new();
@@ -450,11 +596,249 @@ impl BalancedSequence {
         }
         Ok((
             Self {
-                inner,
+                backend: SequenceBackend::Memory(inner),
                 work: Cell::new(SequenceWorkCounters::default()),
+                ledger: IoLedger::new(),
             },
             seam_roots,
         ))
+    }
+
+    /// Resolves one materialized root to its canonical 56-byte `T2R2` root
+    /// record for metadata snapshots. Reads exactly one node record on a
+    /// physical backend (metadata-scale: per retained version, never per
+    /// content byte).
+    pub(crate) fn canonical_root_bytes(
+        &self,
+        root: PersistentRoot,
+    ) -> Result<[u8; format_v2::V2_ROOT_RECORD_SIZE], SequenceError> {
+        Ok(format_v2::encode_v2_root(self.resolve(root)?))
+    }
+
+    /// Prepares a physical splice delta against the committed frontier
+    /// without mutating any file: shared algorithm over the delta view plus
+    /// local delta validation. Durable backends only.
+    pub(crate) fn prepare_physical_splice(
+        &self,
+        parent: Option<PersistentRoot>,
+        offset: u64,
+        delete_len: u64,
+        insert: &[u8],
+        result_len: u64,
+    ) -> Result<PhysicalDelta, SequenceError> {
+        let SequenceBackend::Physical(store) = &self.backend else {
+            return Err(SequenceError::Invalid(
+                "physical splice preparation requires a durable physical backend",
+            ));
+        };
+        let resolved = parent.map(|root| self.resolve(root)).transpose()?;
+        Ok(physical::prepare_physical_delta(
+            store, resolved, offset, delete_len, insert, result_len,
+        )?)
+    }
+
+    /// Appends a prepared delta to the content files without advancing
+    /// the in-memory frontiers or touching the catalogue: the physical half
+    /// of the durability barrier. On failure the files may hold an orphan
+    /// tail past the committed frontier, which reads ignore and the next
+    /// commit heals. Callers sync separately through
+    /// [`sync_physical_content`](Self::sync_physical_content) so append
+    /// failures (definite rejection) classify distinctly from barrier
+    /// failures (rollback-or-reopen).
+    ///
+    /// Every commit heals first: orphan tails from earlier crashed commits
+    /// (physical bytes without metadata authority) truncate back to the
+    /// frontier before new bytes append, so a prior failure can never brick
+    /// later operations. A heal failure fails closed with no bytes written.
+    pub(crate) fn commit_physical_delta(
+        &mut self,
+        delta: &PhysicalDelta,
+    ) -> Result<(), SequenceError> {
+        let SequenceBackend::Physical(store) = &mut self.backend else {
+            return Err(SequenceError::Invalid(
+                "physical delta commit requires a durable physical backend",
+            ));
+        };
+        store.heal_for_write()?;
+        store.append_payload_delta(delta.payload_bytes())?;
+        if let Err(error) = store.append_node_delta(delta.node_bytes()) {
+            let _ = store.rollback_to_committed();
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    /// Durability barrier for appended content. See
+    /// [`commit_physical_delta`](Self::commit_physical_delta) for the
+    /// failure classification contract.
+    pub(crate) fn sync_physical_content(&mut self) -> Result<(), SequenceError> {
+        let SequenceBackend::Physical(store) = &mut self.backend else {
+            return Err(SequenceError::Invalid(
+                "physical content sync requires a durable physical backend",
+            ));
+        };
+        Ok(store.sync_content()?)
+    }
+
+    /// Best-effort rollback of file ends to the committed frontier. Reports
+    /// whether the files provably match the frontier again.
+    pub(crate) fn rollback_physical_to_committed(&mut self) -> bool {
+        match &mut self.backend {
+            SequenceBackend::Memory(_) => true,
+            SequenceBackend::Physical(store) => store.rollback_to_committed(),
+        }
+    }
+
+    /// Adopts a committed delta's frontiers after its bytes are durable and
+    /// the catalogue decision is made. Plain stores, no I/O: infallible.
+    /// The algorithmic work counters move here — exactly once per splice,
+    /// only after every fallible step (append, barrier, and on the durable
+    /// path the metadata WAL) succeeded — so rejected operations never
+    /// contaminate locality history.
+    pub(crate) fn adopt_physical_delta(&mut self, delta: &PhysicalDelta) {
+        if let SequenceBackend::Physical(store) = &mut self.backend {
+            store.adopt_frontiers(delta.new_payload_end(), delta.new_node_count());
+            self.note_written(
+                delta.allocated_nodes(),
+                delta.inspected_nodes(),
+                delta.payload_bytes_allocated(),
+            );
+        }
+    }
+
+    /// Validates one THL5 committed delta during replay against file bytes
+    /// and advances the frontiers past it. Returns the validated result
+    /// root for catalogue adoption.
+    pub(crate) fn replay_physical_delta(
+        &mut self,
+        generation: u64,
+        payload_start: u64,
+        payload_end: u64,
+        node_start: u64,
+        node_end: u64,
+        delta_digest: [u8; 32],
+        result_root: &[u8; format_v2::V2_ROOT_RECORD_SIZE],
+        result_len: u64,
+    ) -> Result<PersistentRoot, SequenceError> {
+        let SequenceBackend::Physical(store) = &mut self.backend else {
+            return Err(SequenceError::Invalid(
+                "physical delta replay requires a durable physical backend",
+            ));
+        };
+        let root = physical::validate_committed_delta(
+            store,
+            generation,
+            payload_start,
+            payload_end,
+            node_start,
+            node_end,
+            delta_digest,
+            result_root,
+            result_len,
+        )?;
+        store.adopt_frontiers(payload_end, node_end);
+        Ok(PersistentRoot::balanced_v2(
+            root.node_id(),
+            LogicalLength::new(root.logical_len()),
+        ))
+    }
+
+    /// Compacts retained roots into a brand-new physical generation through
+    /// the quiescent GC builder. Returns the replacement backend (bound to
+    /// the new generation files), remapped roots in input order, and
+    /// before/after sizes for maintenance statistics.
+    pub(crate) fn compact_physical_to_roots(
+        &self,
+        retained_roots: &[PersistentRoot],
+        new_generation: u64,
+        dir: &Path,
+    ) -> Result<PhysicalCompactedSequence, SequenceError> {
+        let SequenceBackend::Physical(source) = &self.backend else {
+            return Err(SequenceError::Invalid(
+                "physical generation compaction requires a durable physical backend",
+            ));
+        };
+        let mut canonical = Vec::new();
+        canonical
+            .try_reserve_exact(retained_roots.len())
+            .map_err(|_| {
+                SequenceError::Capacity("sequence compaction root table allocation failed")
+            })?;
+        for root in retained_roots.iter().copied() {
+            canonical.push(self.resolve(root)?);
+        }
+        let build: PhysicalGcBuild = physical::compact_physical_generation(
+            source,
+            &canonical,
+            new_generation,
+            dir,
+            &self.ledger,
+        )?;
+        let mut roots = Vec::new();
+        roots.try_reserve_exact(build.roots.len()).map_err(|_| {
+            SequenceError::Capacity("sequence compaction root table allocation failed")
+        })?;
+        for root in build.roots {
+            roots.push(PersistentRoot::balanced_v2(
+                root.node_id(),
+                LogicalLength::new(root.logical_len()),
+            ));
+        }
+        Ok(PhysicalCompactedSequence {
+            backend: {
+                let replacement = Self::open_physical(build.store);
+                // GC traversal must neither masquerade as foreground work
+                // nor reset locality history: carry the cumulative counters
+                // over to the replacement, exactly like in-memory
+                // compaction.
+                replacement.work.set(self.work.get());
+                replacement
+            },
+            roots,
+            nodes_before: build.nodes_before,
+            nodes_after: build.nodes_after,
+            payload_bytes_before: build.payload_bytes_before,
+            payload_bytes_after: build.payload_bytes_after,
+        })
+    }
+
+    /// Verifies open content files cover the committed frontiers.
+    /// Durable backends only; memory backends are trivially covered.
+    pub(crate) fn check_physical_frontiers(&self) -> Result<(), SequenceError> {
+        if let SequenceBackend::Physical(store) = &self.backend {
+            store.check_files_cover_frontiers()?;
+        }
+        Ok(())
+    }
+
+    /// Heals orphan tails before writable mutation. Durable backends only;
+    /// memory backends are trivially healed.
+    pub(crate) fn heal_physical_for_write(&mut self) -> Result<(), SequenceError> {
+        if let SequenceBackend::Physical(store) = &mut self.backend {
+            store.heal_for_write()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_fail_next_physical_payload_append(&mut self) {
+        if let SequenceBackend::Physical(store) = &mut self.backend {
+            store.arm_fail_next_payload_append();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_fail_next_physical_node_append(&mut self) {
+        if let SequenceBackend::Physical(store) = &mut self.backend {
+            store.arm_fail_next_node_append();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_fail_next_physical_sync(&mut self) {
+        if let SequenceBackend::Physical(store) = &mut self.backend {
+            store.arm_fail_next_sync();
+        }
     }
 
     fn resolve(&self, root: PersistentRoot) -> Result<V2RootRecord, SequenceError> {
@@ -463,7 +847,13 @@ impl BalancedSequence {
                 "balanced sequence backend received an incompatible root",
             ));
         }
-        let canonical = self.inner.root_for_node_id(root.node_id())?;
+        let canonical = match &self.backend {
+            SequenceBackend::Memory(inner) => inner.root_for_node_id(root.node_id())?,
+            SequenceBackend::Physical(store) => {
+                let record = store.load_record(root.node_id())?;
+                V2RootRecord::from_node(root.node_id(), record).map_err(V2AvlError::from)?
+            }
+        };
         if canonical.logical_len() != root.logical_len().get() {
             return Err(SequenceError::Invalid(
                 "balanced sequence root length disagrees with arena",
@@ -515,9 +905,17 @@ impl PersistentSequence for BalancedSequence {
         output: &mut Vec<u8>,
     ) -> Result<(), Self::Error> {
         let canonical = self.resolve(root)?;
-        let (bytes, visited) =
-            self.inner
-                .read_range_counted(canonical, range.offset().get(), range.length().get())?;
+        let (bytes, visited) = match &self.backend {
+            SequenceBackend::Memory(inner) => {
+                inner.read_range_counted(canonical, range.offset().get(), range.length().get())?
+            }
+            SequenceBackend::Physical(store) => avl::V2AvlSequence::read_range_counted_on(
+                store,
+                canonical,
+                range.offset().get(),
+                range.length().get(),
+            )?,
+        };
         output.extend_from_slice(&bytes);
         self.note_read(visited, bytes.len());
         Ok(())
@@ -544,7 +942,12 @@ impl PersistentSequenceAppend for BalancedSequence {
 
     fn verify(&self, root: PersistentRoot) -> Result<(), Self::Error> {
         let canonical = self.resolve(root)?;
-        let visited = self.inner.verify_root_counted(canonical)?;
+        let visited = match &self.backend {
+            SequenceBackend::Memory(inner) => inner.verify_root_counted(canonical)?,
+            SequenceBackend::Physical(store) => {
+                avl::V2AvlSequence::verify_root_counted_on(store, canonical)?
+            }
+        };
         self.note_read(visited, 0);
         Ok(())
     }
@@ -561,9 +964,51 @@ impl PersistentSequenceSplice for BalancedSequence {
         insert: &[u8],
     ) -> Result<SpliceResult, Self::Error> {
         let resolved = parent.map(|root| self.resolve(root)).transpose()?;
-        let result = self
-            .inner
-            .splice(resolved, offset.get(), delete_len.get(), insert)?;
+        // The parent length for result accounting comes from the resolved
+        // canonical root, never from caller metadata.
+        let parent_len = resolved.map_or(0, V2RootRecord::logical_len);
+        let insert_len = u64::try_from(insert.len())
+            .map_err(|_| SequenceError::Invalid("balanced sequence insert length exceeds u64"))?;
+        let result_len = parent_len
+            .checked_sub(delete_len.get())
+            .and_then(|remaining| remaining.checked_add(insert_len))
+            .ok_or(SequenceError::Invalid(
+                "balanced sequence splice result length is inconsistent",
+            ))?;
+        if self.backend_is_physical() {
+            // Durable backend, pure path: prepare against the committed
+            // frontier, append and sync the delta (no WAL on this path —
+            // test/tooling use only), then adopt. Every phase is shared
+            // logic; only durability differs from the metadata-WAL path.
+            let delta = self.prepare_physical_splice(
+                parent,
+                offset.get(),
+                delete_len.get(),
+                insert,
+                result_len,
+            )?;
+            let (allocated, inspected, payload_allocated) = (
+                delta.allocated_nodes(),
+                delta.inspected_nodes(),
+                delta.payload_bytes_allocated(),
+            );
+            self.commit_physical_delta(&delta)?;
+            self.sync_physical_content()?;
+            self.adopt_physical_delta(&delta);
+            let root = delta.root_node_id();
+            return Ok(SpliceResult {
+                root: PersistentRoot::balanced_v2(root, LogicalLength::new(result_len)),
+                nodes_allocated: u64::try_from(allocated).unwrap_or(u64::MAX),
+                nodes_inspected: u64::try_from(inspected).unwrap_or(u64::MAX),
+                payload_bytes_allocated: u64::try_from(payload_allocated).unwrap_or(u64::MAX),
+            });
+        }
+        let SequenceBackend::Memory(inner) = &mut self.backend else {
+            return Err(SequenceError::Invalid(
+                "balanced sequence backend disappeared during splice",
+            ));
+        };
+        let result = inner.splice(resolved, offset.get(), delete_len.get(), insert)?;
         self.note_written(
             result.allocated_nodes(),
             result.inspected_nodes(),

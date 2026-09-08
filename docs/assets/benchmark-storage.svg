@@ -66,7 +66,7 @@
   <text class="value" x="844" y="194">19.67 MB</text>
   <text class="ratio" x="990" y="194" text-anchor="end">3.58×</text>
 
-  <text class="name" x="20" y="260">SQLite CAS delta</text>
+  <text class="name" x="20" y="260">SQLite content-addressed delta</text>
   <rect class="bar-other" x="330" y="234" width="273" height="38" rx="5" />
   <text class="value" x="844" y="260">37.10 MB</text>
   <text class="ratio" x="990" y="260" text-anchor="end">6.75×</text>
