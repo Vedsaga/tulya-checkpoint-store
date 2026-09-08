@@ -99,14 +99,20 @@ impl VersionId {
     }
 }
 
-/// One committed generic version: its history, identity, optional parent,
-/// and persistent root. Payloads stay opaque bytes below the adapter layer.
+/// One committed generic version: its history, identity, and optional
+/// parent. Payloads stay opaque bytes below the adapter layer.
+///
+/// This is a LOGICAL handle, deliberately separated from physical placement:
+/// compaction and reclamation relocate arena nodes, but they never change the
+/// logical identity an adapter holds. A caller-held handle obtained before GC
+/// stays valid after GC; reads and verification resolve the current physical
+/// root by [`VersionId`] internally. There is intentionally no public
+/// physical-root accessor: adapters must not derive placement from handles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Version {
     history: HistoryId,
     id: VersionId,
     parent: Option<VersionId>,
-    root: PersistentRoot,
 }
 
 impl Version {
@@ -121,9 +127,43 @@ impl Version {
     pub const fn parent(self) -> Option<VersionId> {
         self.parent
     }
+}
 
-    pub const fn root(self) -> PersistentRoot {
+/// One catalogue entry: the immutable logical version plus its current
+/// physical placement. The root is `Some` for every retained version and may
+/// become `None` for an expired version once reclamation drops its content;
+/// `len` is the exact logical byte length, authoritative without backend
+/// access so validation and replay work even for rootless entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VersionRecord {
+    version: Version,
+    root: Option<PersistentRoot>,
+    len: u64,
+}
+
+impl VersionRecord {
+    const fn version(self) -> Version {
+        self.version
+    }
+
+    const fn root(self) -> Option<PersistentRoot> {
         self.root
+    }
+
+    const fn len(self) -> u64 {
+        self.len
+    }
+
+    const fn history(self) -> HistoryId {
+        self.version.history
+    }
+
+    const fn id(self) -> VersionId {
+        self.version.id
+    }
+
+    const fn parent(self) -> Option<VersionId> {
+        self.version.parent
     }
 }
 
@@ -396,6 +436,9 @@ struct PreparedSplice<'a> {
     offset: u64,
     delete_len: u64,
     insert: &'a [u8],
+    /// Validated resulting logical length, carried so application records
+    /// catalogue length without re-deriving it from the backend.
+    len: u64,
     request_id: Option<&'a [u8]>,
     binding: Option<&'a [u8]>,
     digest: [u8; 32],
@@ -422,7 +465,10 @@ struct PreparedFork<'a> {
     next_version_id_after: u64,
     history: HistoryId,
     parent: VersionId,
-    root: PersistentRoot,
+    root: Option<PersistentRoot>,
+    /// Republished logical length, taken from the parent catalogue entry —
+    /// never from the backend, so preparation stays content-counter-neutral.
+    len: u64,
     request_id: Option<&'a [u8]>,
     binding: Option<&'a [u8]>,
     digest: [u8; 32],
@@ -441,6 +487,49 @@ struct PreparedExpire {
     history: HistoryId,
     version: VersionId,
     receipt: Option<(Vec<u8>, [u8; 32])>,
+}
+
+/// Maintenance statistics for one quiescent GC cycle.
+///
+/// Arena sizes count live nodes/payload bytes before and after, reachable or
+/// not; reclaimed deltas are checked subtraction. Version counts name the
+/// logical root set: expired versions are never GC roots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GcStats {
+    pub nodes_before: u64,
+    pub nodes_after: u64,
+    pub nodes_reclaimed: u64,
+    pub payload_bytes_before: u64,
+    pub payload_bytes_after: u64,
+    pub payload_bytes_reclaimed: u64,
+    pub retained_versions: u64,
+    pub expired_versions: u64,
+}
+
+/// Pure in-memory GC preparation: a complete scratch store with the
+/// compact replacement backend, rebuilt catalogue records (remapped retained
+/// roots, rootless expired entries), and cloned ledgers/lifecycle/bindings —
+/// plus maintenance statistics. The live store is untouched until
+/// [`apply_prepared_gc`](PersistentHistoryStore::apply_prepared_gc), so any
+/// preparation failure leaves backend, versions, ledgers, lifecycle, and
+/// bindings exactly as found. No partial compaction. Durable GC encodes its
+/// compact snapshot from the scratch store before adopting anything.
+pub(crate) struct PreparedGc {
+    store: PersistentHistoryStore,
+    stats: GcStats,
+}
+
+impl PreparedGc {
+    pub(crate) const fn stats(&self) -> GcStats {
+        self.stats
+    }
+
+    /// Borrows the compact scratch store for snapshot encoding. The live
+    /// store is unaffected; adoption happens only in
+    /// [`apply_prepared_gc`](PersistentHistoryStore::apply_prepared_gc).
+    pub(crate) const fn store(&self) -> &PersistentHistoryStore {
+        &self.store
+    }
 }
 
 /// A begun durable history creation whose frame is already authoritative in
@@ -466,7 +555,7 @@ pub(crate) struct PreparedHistoryCreate {
 pub struct PersistentHistoryStore {
     backend: BalancedSequence,
     histories: HashSet<HistoryId>,
-    versions: Vec<Version>,
+    versions: Vec<VersionRecord>,
     next_history_id: u64,
     next_version_id: u64,
     active_requests: HashMap<Vec<u8>, ActiveRequest>,
@@ -627,7 +716,7 @@ impl PersistentHistoryStore {
                         "persistent parent version belongs to a different history",
                     ));
                 }
-                self.backend.logical_len(record.root())?.get()
+                record.len()
             }
         };
         self.splice(history, parent, offset, 0, bytes, request_id, binding)
@@ -707,8 +796,7 @@ impl PersistentHistoryStore {
                         "persistent parent version belongs to a different history",
                     ));
                 }
-                let len = self.backend.logical_len(record.root())?.get();
-                (Some(record.root()), len)
+                (record.root(), record.len())
             }
         };
         if offset > parent_len {
@@ -755,7 +843,7 @@ impl PersistentHistoryStore {
             validate_request_identity(request)?;
             if let Some(active) = self.active_requests.get(request) {
                 if active.digest() == digest {
-                    let version = self.version_record(active.version())?;
+                    let version = self.version_record(active.version())?.version();
                     return Ok(SplicePreview::Replayed(version));
                 }
                 return Err(HistoryError::RequestConflict);
@@ -791,6 +879,7 @@ impl PersistentHistoryStore {
                 offset,
                 delete_len,
                 insert,
+                len: result_len,
                 request_id,
                 binding,
                 digest,
@@ -844,9 +933,12 @@ impl PersistentHistoryStore {
             history: prepared.history,
             id: prepared.version,
             parent: prepared.parent,
-            root: splice.root,
         };
-        self.versions.push(version);
+        self.versions.push(VersionRecord {
+            version,
+            root: Some(splice.root),
+            len: prepared.len,
+        });
         if let Some(request) = prepared.request_id {
             self.push_fresh_receipt(request, prepared.digest, version.id());
         }
@@ -890,12 +982,13 @@ impl PersistentHistoryStore {
             ));
         }
         let root = parent_record.root();
+        let parent_len = parent_record.len();
         let digest = history_fork_digest(history, parent, binding);
         if let Some(request) = request_id {
             validate_request_identity(request)?;
             if let Some(active) = self.active_requests.get(request) {
                 if active.digest() == digest {
-                    let version = self.version_record(active.version())?;
+                    let version = self.version_record(active.version())?.version();
                     return Ok(ForkPreview::Replayed(version));
                 }
                 return Err(HistoryError::RequestConflict);
@@ -922,6 +1015,7 @@ impl PersistentHistoryStore {
                 history,
                 parent,
                 root,
+                len: parent_len,
                 request_id,
                 binding,
                 digest,
@@ -966,13 +1060,19 @@ impl PersistentHistoryStore {
             })?;
         }
         self.next_version_id = prepared.next_version_id_after;
+        let root = prepared.root.ok_or(HistoryError::Invalid(
+            "prepared fork parent has no materialized root",
+        ))?;
         let version = Version {
             history: prepared.history,
             id: prepared.version,
             parent: Some(prepared.parent),
-            root: prepared.root,
         };
-        self.versions.push(version);
+        self.versions.push(VersionRecord {
+            version,
+            root: Some(root),
+            len: prepared.len,
+        });
         if let Some(request) = prepared.request_id {
             self.push_fresh_receipt(request, prepared.digest, version.id());
         }
@@ -1157,8 +1257,10 @@ impl PersistentHistoryStore {
                         "history log splice parent is expired",
                     ));
                 }
-                let len = self.backend.logical_len(record.root())?.get();
-                (Some(record.root()), len)
+                let root = record.root().ok_or(HistoryError::Invalid(
+                    "history log splice parent has no materialized root",
+                ))?;
+                (Some(root), record.len())
             }
         };
         if offset > parent_len {
@@ -1229,11 +1331,14 @@ impl PersistentHistoryStore {
             LogicalLength::new(delete_len),
             insert,
         )?;
-        self.versions.push(Version {
-            history,
-            id,
-            parent,
-            root: splice.root,
+        self.versions.push(VersionRecord {
+            version: Version {
+                history,
+                id,
+                parent,
+            },
+            root: Some(splice.root),
+            len: result_len,
         });
         if let Some(request) = request_id {
             validate_request_identity(request)?;
@@ -1296,7 +1401,10 @@ impl PersistentHistoryStore {
         if self.expired_versions.contains(&parent) {
             return Err(HistoryError::Invalid("history log fork parent is expired"));
         }
-        let root = parent_record.root();
+        let root = parent_record.root().ok_or(HistoryError::Invalid(
+            "history log fork parent has no materialized root",
+        ))?;
+        let parent_len = parent_record.len();
         if history_fork_digest(history, parent, binding) != digest {
             return Err(HistoryError::Invalid(
                 "history log fork digest disagrees with its operation",
@@ -1322,11 +1430,14 @@ impl PersistentHistoryStore {
         self.versions
             .try_reserve(1)
             .map_err(|_| HistoryError::Capacity("persistent version table allocation failed"))?;
-        self.versions.push(Version {
-            history,
-            id,
-            parent: Some(parent),
-            root,
+        self.versions.push(VersionRecord {
+            version: Version {
+                history,
+                id,
+                parent: Some(parent),
+            },
+            root: Some(root),
+            len: parent_len,
         });
         if let Some(request) = request_id {
             validate_request_identity(request)?;
@@ -1638,10 +1749,7 @@ impl PersistentHistoryStore {
                         "persistent parent version belongs to a different history",
                     )));
                 }
-                self.backend
-                    .logical_len(record.root())
-                    .map_err(|error| DurableError::Rejected(error.into()))?
-                    .get()
+                record.len()
             }
         };
         self.splice_durable(log, history, parent, offset, 0, bytes, request_id, binding)
@@ -1807,6 +1915,172 @@ impl PersistentHistoryStore {
         Ok(ExpireOutcome::Expired)
     }
 
+    /// Prepares one quiescent GC cycle without mutating anything.
+    ///
+    /// The sole content root set is every retained version root: expired
+    /// versions are not roots, and a retained descendant automatically
+    /// protects its own reachable content (including nodes shared with an
+    /// expired parent or fork source). Preparation validates every retained
+    /// root, marks, repacks, rebuilds, and remaps through the generic
+    /// sequence compactor, then rebuilds catalogue records with identical
+    /// logical identities, parents, lengths, and bindings: only physical
+    /// placement changes, and expired entries go rootless.
+    pub(crate) fn prepare_gc(&self) -> Result<PreparedGc, HistoryError> {
+        let mut retained_roots = Vec::new();
+        retained_roots
+            .try_reserve(self.versions.len())
+            .map_err(|_| HistoryError::Capacity("persistent GC root table allocation failed"))?;
+        let mut retained_count = 0u64;
+        let mut expired_count = 0u64;
+        for record in &self.versions {
+            if self.expired_versions.contains(&record.id()) {
+                expired_count = expired_count.checked_add(1).ok_or(HistoryError::Overflow(
+                    "persistent GC expired version count exceeds u64",
+                ))?;
+            } else {
+                let root = record.root().ok_or(HistoryError::Invalid(
+                    "persistent GC retained version has no materialized root",
+                ))?;
+                retained_roots.push(root);
+                retained_count = retained_count.checked_add(1).ok_or(HistoryError::Overflow(
+                    "persistent GC retained version count exceeds u64",
+                ))?;
+            }
+        }
+        let compacted = self.backend.compact_to_roots(&retained_roots)?;
+        let mut versions = Vec::new();
+        versions
+            .try_reserve_exact(self.versions.len())
+            .map_err(|_| HistoryError::Capacity("persistent GC catalogue allocation failed"))?;
+        let mut remapped = compacted.roots.iter();
+        for record in &self.versions {
+            if self.expired_versions.contains(&record.id()) {
+                versions.push(VersionRecord {
+                    version: record.version(),
+                    root: None,
+                    len: record.len(),
+                });
+            } else {
+                let root = remapped.next().ok_or(HistoryError::Invalid(
+                    "persistent GC remapped roots disagree with retained versions",
+                ))?;
+                versions.push(VersionRecord {
+                    version: record.version(),
+                    root: Some(*root),
+                    len: record.len(),
+                });
+            }
+        }
+        if remapped.next().is_some() {
+            return Err(HistoryError::Invalid(
+                "persistent GC remapped roots disagree with retained versions",
+            ));
+        }
+        let stats = GcStats {
+            nodes_before: compacted.nodes_before,
+            nodes_after: compacted.nodes_after,
+            nodes_reclaimed: compacted
+                .nodes_before
+                .checked_sub(compacted.nodes_after)
+                .ok_or(HistoryError::Invalid(
+                    "persistent GC reclaimed node count underflows",
+                ))?,
+            payload_bytes_before: compacted.payload_bytes_before,
+            payload_bytes_after: compacted.payload_bytes_after,
+            payload_bytes_reclaimed: compacted
+                .payload_bytes_before
+                .checked_sub(compacted.payload_bytes_after)
+                .ok_or(HistoryError::Invalid(
+                    "persistent GC reclaimed payload count underflows",
+                ))?,
+            retained_versions: retained_count,
+            expired_versions: expired_count,
+        };
+        // Assemble the scratch store: the compact backend and rebuilt
+        // catalogue move in; every other table clones with pre-reserved
+        // capacity. Ledgers, lifecycle, bindings, and counters are identical
+        // by construction — GC never adds, removes, or reorders them.
+        let mut store = Self {
+            backend: compacted.backend,
+            histories: HashSet::new(),
+            versions,
+            next_history_id: self.next_history_id,
+            next_version_id: self.next_version_id,
+            active_requests: HashMap::new(),
+            retired_requests: HashMap::new(),
+            receipt_order: VecDeque::new(),
+            expired_versions: HashSet::new(),
+            history_bindings: HashMap::new(),
+            version_bindings: HashMap::new(),
+            poisoned: false,
+        };
+        store
+            .histories
+            .try_reserve(self.histories.len())
+            .map_err(|_| HistoryError::Capacity("persistent GC table allocation failed"))?;
+        store.histories.extend(self.histories.iter().copied());
+        store
+            .active_requests
+            .try_reserve(self.active_requests.len())
+            .map_err(|_| HistoryError::Capacity("persistent GC table allocation failed"))?;
+        store.active_requests.extend(
+            self.active_requests
+                .iter()
+                .map(|(id, record)| (id.clone(), *record)),
+        );
+        store
+            .retired_requests
+            .try_reserve(self.retired_requests.len())
+            .map_err(|_| HistoryError::Capacity("persistent GC table allocation failed"))?;
+        store.retired_requests.extend(
+            self.retired_requests
+                .iter()
+                .map(|(id, digest)| (id.clone(), *digest)),
+        );
+        store
+            .receipt_order
+            .try_reserve(self.receipt_order.len())
+            .map_err(|_| HistoryError::Capacity("persistent GC table allocation failed"))?;
+        store
+            .receipt_order
+            .extend(self.receipt_order.iter().cloned());
+        store
+            .expired_versions
+            .try_reserve(self.expired_versions.len())
+            .map_err(|_| HistoryError::Capacity("persistent GC table allocation failed"))?;
+        store
+            .expired_versions
+            .extend(self.expired_versions.iter().copied());
+        store
+            .history_bindings
+            .try_reserve(self.history_bindings.len())
+            .map_err(|_| HistoryError::Capacity("persistent GC table allocation failed"))?;
+        store.history_bindings.extend(
+            self.history_bindings
+                .iter()
+                .map(|(id, bound)| (*id, bound.clone())),
+        );
+        store
+            .version_bindings
+            .try_reserve(self.version_bindings.len())
+            .map_err(|_| HistoryError::Capacity("persistent GC table allocation failed"))?;
+        store.version_bindings.extend(
+            self.version_bindings
+                .iter()
+                .map(|(id, bound)| (*id, bound.clone())),
+        );
+        Ok(PreparedGc { store, stats })
+    }
+
+    /// Applies prepared GC with infallible ownership moves: the compact
+    /// backend and rebuilt catalogue replace the live ones atomically, with
+    /// no fallible remapping or allocation remaining. Ledgers, lifecycle,
+    /// bindings, and counters are already identical and stay put.
+    pub(crate) fn apply_prepared_gc(&mut self, prepared: PreparedGc) {
+        self.backend = prepared.store.backend;
+        self.versions = prepared.store.versions;
+    }
+
     /// Durably expires through preview, ExpireVersion record, barrier, and
     /// apply. Already-expired versions return before any WAL I/O with zero
     /// new authority bytes.
@@ -1968,18 +2242,24 @@ impl PersistentHistoryStore {
         output: &mut Vec<u8>,
     ) -> Result<(), HistoryError> {
         let record = self.committed_version(version)?;
+        let root = record.root().ok_or(HistoryError::Invalid(
+            "persistent version has no materialized root",
+        ))?;
         let range = SequenceRange::new(LogicalLength::new(offset), LogicalLength::new(length))
             .ok_or(HistoryError::Invalid(
                 "persistent history read range exceeds u64",
             ))?;
-        self.backend.read_range(record.root(), range, output)?;
+        self.backend.read_range(root, range, output)?;
         Ok(())
     }
 
     /// Recomputes every reachable node's metadata and commitment.
     pub fn verify(&self, version: Version) -> Result<(), HistoryError> {
         let record = self.committed_version(version)?;
-        self.backend.verify(record.root())?;
+        let root = record.root().ok_or(HistoryError::Invalid(
+            "persistent version has no materialized root",
+        ))?;
+        self.backend.verify(root)?;
         Ok(())
     }
 
@@ -1998,7 +2278,7 @@ impl PersistentHistoryStore {
         if self.expired_versions.contains(&id) {
             return Err(HistoryError::VersionExpired);
         }
-        Ok(record)
+        Ok(record.version())
     }
 
     /// Counts committed versions. Used for reopen statistics and tests.
@@ -2006,6 +2286,16 @@ impl PersistentHistoryStore {
     /// entries.
     pub fn version_count(&self) -> usize {
         self.versions.len()
+    }
+
+    /// Reports the exact logical byte length of one retained version,
+    /// resolved from catalogue metadata without backend access. Expired
+    /// versions fail with [`VersionExpired`](HistoryError::VersionExpired):
+    /// callers must no longer derive lengths through physical roots, which
+    /// compaction relocates and reclamation may drop.
+    pub fn logical_len(&self, version: Version) -> Result<LogicalLength, HistoryError> {
+        let record = self.committed_version(version)?;
+        Ok(LogicalLength::new(record.len()))
     }
 
     /// Reports the horizon visibility of one request identity.
@@ -2054,9 +2344,13 @@ impl PersistentHistoryStore {
     }
 
     /// Lists committed versions in identity order for adapter map
-    /// reconstruction. The dense table is already identity-ordered.
+    /// reconstruction. The dense table is already identity-ordered; only
+    /// logical handles escape, never physical placement.
     pub fn all_versions(&self) -> Vec<Version> {
-        self.versions.clone()
+        self.versions
+            .iter()
+            .map(|record| record.version())
+            .collect()
     }
 
     /// Borrows the opaque adapter binding recorded for a version, if any.
@@ -2081,10 +2375,10 @@ impl PersistentHistoryStore {
         if self.expired_versions.contains(&id) {
             return Err(HistoryError::VersionExpired);
         }
-        Ok(record)
+        Ok(record.version())
     }
 
-    fn version_record(&self, id: VersionId) -> Result<Version, HistoryError> {
+    fn version_record(&self, id: VersionId) -> Result<VersionRecord, HistoryError> {
         let index = usize::try_from(id.id())
             .map_err(|_| HistoryError::Overflow("persistent version identifier exceeds usize"))?;
         let record = self
@@ -2100,14 +2394,26 @@ impl PersistentHistoryStore {
         Ok(record)
     }
 
+    /// Resolves the current physical root of one known version. Fails closed
+    /// for unknown identities and for expired versions whose content has
+    /// been reclaimed: a rootless entry has no valid placement to hand out.
+    /// Test-only introspection: production code resolves placement through
+    /// version-scoped operations, never by raw identity.
+    #[cfg(test)]
+    pub(crate) fn physical_root(&self, id: VersionId) -> Result<PersistentRoot, HistoryError> {
+        self.version_record(id)?.root().ok_or(HistoryError::Invalid(
+            "persistent version has no materialized root",
+        ))
+    }
+
     /// Resolves a caller-held version against the committed table so a
     /// fabricated or stale value fails closed instead of addressing the arena.
     /// Expired versions fail with [`VersionExpired`](HistoryError::VersionExpired):
     /// public read/verify acquire live state, while internal metadata paths
     /// use [`version_record`](Self::version_record) directly.
-    fn committed_version(&self, version: Version) -> Result<Version, HistoryError> {
+    fn committed_version(&self, version: Version) -> Result<VersionRecord, HistoryError> {
         let record = self.version_record(version.id())?;
-        if record != version {
+        if record.version() != version {
             return Err(HistoryError::Invalid(
                 "persistent version does not match committed history",
             ));
@@ -2130,19 +2436,27 @@ impl PersistentHistoryStore {
     /// authenticity traces to commit-time and log-replay validation while
     /// the artifact digest protects these bytes.
     pub fn import_snapshot(snapshot: snapshot::HistorySnapshot) -> Result<Self, HistoryError> {
-        let (backend, roots) = if snapshot.versions.is_empty() {
+        // The image root table covers exactly the materialized roots in
+        // version order: zero materialized roots means an empty image and an
+        // empty backend, valid even with a non-empty reclaimed catalogue.
+        let materialized = snapshot
+            .versions
+            .iter()
+            .filter(|entry| entry.root_present)
+            .count();
+        let (backend, roots) = if materialized == 0 {
             if !snapshot.image.is_empty() {
                 return Err(HistoryError::Invalid(
-                    "history snapshot image without versions is malformed",
+                    "history snapshot image without materialized roots is malformed",
                 ));
             }
             (BalancedSequence::new(), Vec::new())
         } else {
             BalancedSequence::import_image(&snapshot.image)?
         };
-        if roots.len() != snapshot.versions.len() {
+        if roots.len() != materialized {
             return Err(HistoryError::Invalid(
-                "history snapshot image roots disagree with its version table",
+                "history snapshot image roots disagree with its materialized versions",
             ));
         }
         let mut store = Self {
@@ -2196,6 +2510,7 @@ impl PersistentHistoryStore {
             .versions
             .try_reserve(snapshot.versions.len())
             .map_err(|_| HistoryError::Capacity("history snapshot import allocation failed"))?;
+        let mut materialized_index = 0usize;
         for (index, entry) in snapshot.versions.iter().enumerate() {
             let id = VersionId::new(u64::try_from(index).map_err(|_| {
                 HistoryError::Overflow("history snapshot version identity exceeds u64")
@@ -2226,11 +2541,34 @@ impl PersistentHistoryStore {
                 })?;
                 let _ = store.expired_versions.insert(id);
             }
-            store.versions.push(Version {
-                history: entry.history,
-                id,
-                parent: entry.parent,
-                root: roots[index],
+            let root = if entry.root_present {
+                Some(*roots.get(materialized_index).ok_or(HistoryError::Invalid(
+                    "history snapshot image roots disagree with its materialized versions",
+                ))?)
+            } else {
+                if entry.lifecycle == VersionLifecycle::Retained {
+                    return Err(HistoryError::Invalid(
+                        "history snapshot retained version has no materialized root",
+                    ));
+                }
+                None
+            };
+            if entry.root_present {
+                materialized_index =
+                    materialized_index
+                        .checked_add(1)
+                        .ok_or(HistoryError::Overflow(
+                            "history snapshot materialized index exceeds usize",
+                        ))?;
+            }
+            store.versions.push(VersionRecord {
+                version: Version {
+                    history: entry.history,
+                    id,
+                    parent: entry.parent,
+                },
+                root,
+                len: entry.len,
             });
             if let Some(bytes) = &entry.binding {
                 store.version_bindings.try_reserve(1).map_err(|_| {
@@ -2239,13 +2577,18 @@ impl PersistentHistoryStore {
                 let _ = store.version_bindings.insert(id, bytes.clone());
             }
         }
+        if materialized_index != materialized {
+            return Err(HistoryError::Invalid(
+                "history snapshot image roots disagree with its materialized versions",
+            ));
+        }
         for record in &snapshot.active {
             // Structural cross-references only: version existence and
             // coordinate agreement. Operation digests bind commit deltas,
             // which version content cannot reproduce, so digest authenticity
             // traces to commit-time and log-replay validation while the
             // artifact digest protects these bytes.
-            let version = store.version_record(record.version)?;
+            let version = store.version_record(record.version)?.version();
             store
                 .active_requests
                 .try_reserve(1)
@@ -3076,7 +3419,6 @@ mod tests {
             history,
             id: VersionId(999),
             parent: None,
-            root: version.root(),
         };
         let mut output = Vec::new();
         assert_eq!(
@@ -3088,11 +3430,13 @@ mod tests {
             Err(HistoryError::Invalid("persistent version is unknown"))
         );
 
+        // Logical tampering (a parent the committed version never had)
+        // fails against the committed table; callers cannot supply roots
+        // at all, so physical forgery is unrepresentable by type.
         let tampered = Version {
             history,
             id: version.id(),
-            parent: version.parent(),
-            root: PersistentRoot::balanced_v2(0, LogicalLength::new(999)),
+            parent: Some(version.id()),
         };
         assert_eq!(
             store.read(tampered, 0, 4, &mut output),
@@ -3520,7 +3864,7 @@ mod tests {
         assert_eq!(reopened.versions.len(), 1);
         let mut output = Vec::new();
         reopened
-            .read(reopened.versions[0], 0, 6, &mut output)
+            .read(reopened.versions[0].version(), 0, 6, &mut output)
             .unwrap();
         assert_eq!(output, b"stable");
 
@@ -3945,7 +4289,7 @@ mod tests {
         assert_eq!(v1.id().id(), 1);
         assert_eq!(v1.history(), history);
         assert_eq!(v1.parent(), Some(v0.id()));
-        assert_eq!(v1.root(), v0.root());
+        assert_eq!(store.physical_root(v1.id()), store.physical_root(v0.id()));
         // Zero content-node/payload growth: fork is catalogue metadata only.
         // (Fork may write WAL/catalogue metadata; that is not content.)
         assert_eq!(
@@ -3981,12 +4325,12 @@ mod tests {
         let v2 = splice_new(&mut store, history, Some(v1.id()), 5, 0, b"[tail]");
         let v3 = fork_new(&mut store, history, v0.id(), None, None);
         assert_eq!(v3.parent(), Some(v0.id()));
-        assert_eq!(v3.root(), v0.root());
+        assert_eq!(store.physical_root(v3.id()), store.physical_root(v0.id()));
         assert_eq!(read_full(&store, v3, 12), b"base-payload");
         assert_eq!(read_full(&store, v0, 12), b"base-payload");
         // Later descendants are untouched and distinct.
         assert_eq!(read_full(&store, v2, 18), b"EDIT-[tail]payload");
-        assert_ne!(v3.root(), v2.root());
+        assert_ne!(store.physical_root(v3.id()), store.physical_root(v2.id()));
     }
 
     #[test]
@@ -4001,8 +4345,14 @@ mod tests {
         assert_ne!(first.id(), second.id());
         assert_eq!(first.parent(), Some(v0.id()));
         assert_eq!(second.parent(), Some(v0.id()));
-        assert_eq!(first.root(), v0.root());
-        assert_eq!(second.root(), v0.root());
+        assert_eq!(
+            store.physical_root(first.id()),
+            store.physical_root(v0.id())
+        );
+        assert_eq!(
+            store.physical_root(second.id()),
+            store.physical_root(v0.id())
+        );
         assert_eq!(
             counters_after.nodes_allocated,
             counters_before.nodes_allocated
@@ -4124,7 +4474,10 @@ mod tests {
         for _ in 0..1000 {
             let forked = fork_new(&mut store, history, v0.id(), None, None);
             assert_eq!(forked.parent(), Some(v0.id()));
-            assert_eq!(forked.root(), v0.root());
+            assert_eq!(
+                store.physical_root(forked.id()),
+                store.physical_root(v0.id())
+            );
             assert_eq!(forked.id().id(), previous + 1);
             previous = forked.id().id();
         }
@@ -4152,7 +4505,10 @@ mod tests {
         for id in [1u64, 500, 1000] {
             let version = store.lookup_version(VersionId::new(id)).unwrap();
             assert_eq!(version.parent(), Some(v0.id()));
-            assert_eq!(version.root(), v0.root());
+            assert_eq!(
+                store.physical_root(version.id()),
+                store.physical_root(v0.id())
+            );
             let mut output = Vec::new();
             store.read(version, 0, 16, &mut output).unwrap();
             assert_eq!(output, &parent_payload[..16]);
@@ -4446,7 +4802,7 @@ mod tests {
             }
         };
         assert_eq!(v1.parent(), Some(v0.id()));
-        assert_eq!(v1.root(), v0.root());
+        assert_eq!(store.physical_root(v1.id()), store.physical_root(v0.id()));
         // Same fork request replays with no new log bytes.
         let len_before = log.read_all().unwrap().len();
         assert_eq!(
@@ -4486,7 +4842,10 @@ mod tests {
         let got = reopened.lookup_version(v1.id()).unwrap();
         assert_eq!(got, v1);
         assert_eq!(got.parent(), Some(v0.id()));
-        assert_eq!(got.root(), reopened.lookup_version(v0.id()).unwrap().root());
+        assert_eq!(
+            reopened.physical_root(got.id()),
+            reopened.physical_root(v0.id())
+        );
         let mut output = Vec::new();
         reopened.read(got, 0, 9, &mut output).unwrap();
         assert_eq!(output, b"fork-base");
@@ -4557,8 +4916,8 @@ mod tests {
         let forked = recovered.lookup_version(VersionId::new(1)).unwrap();
         assert_eq!(forked.parent(), Some(VersionId::new(0)));
         assert_eq!(
-            forked.root(),
-            recovered.lookup_version(VersionId::new(0)).unwrap().root()
+            recovered.physical_root(forked.id()),
+            recovered.physical_root(VersionId::new(0))
         );
         // Unknown history.
         assert!(recover_history_store(&honest_log(|record| {
@@ -4683,7 +5042,7 @@ mod tests {
     }
 
     #[test]
-    fn staging_epoch_gates_reject_thl3_and_schema3() {
+    fn staging_epoch_gates_reject_old_epochs() {
         // A THL3 log is byte-identical to THL4 except the frame magic
         // (record layouts for pre-expire kinds are unchanged), so patching
         // the magic on valid bytes is a faithful old-epoch control: the E4
@@ -4725,14 +5084,22 @@ mod tests {
         let mut snap_store = PersistentHistoryStore::new();
         let snap_history = snap_store.create_history().unwrap();
         append_new(&mut snap_store, snap_history, None, b"epoch-base");
-        let schema4_bytes =
+        let schema5_bytes =
             snapshot::encode_history_snapshot(&snap_store, 0, thl4_bytes.len() as u64).unwrap();
-        assert!(snapshot::decode_history_snapshot(&schema4_bytes).is_ok());
-        let mut schema3_bytes = schema4_bytes.clone();
+        assert!(snapshot::decode_history_snapshot(&schema5_bytes).is_ok());
+        let mut schema3_bytes = schema5_bytes.clone();
         assert_eq!(&schema3_bytes[0..4], b"THS1");
         schema3_bytes[12..16].copy_from_slice(&3u32.to_le_bytes());
         assert!(matches!(
             snapshot::decode_history_snapshot(&schema3_bytes),
+            Err(HistoryError::Invalid(_))
+        ));
+        // Schema 4 (every version materialized) likewise fails: only the
+        // current staging epoch opens.
+        let mut schema4_old_bytes = schema5_bytes.clone();
+        schema4_old_bytes[12..16].copy_from_slice(&4u32.to_le_bytes());
+        assert!(matches!(
+            snapshot::decode_history_snapshot(&schema4_old_bytes),
             Err(HistoryError::Invalid(_))
         ));
     }
@@ -4779,8 +5146,8 @@ mod tests {
             let version = imported.lookup_version(VersionId::new(id)).unwrap();
             assert_eq!(version.parent(), Some(v0.id()));
             assert_eq!(
-                version.root(),
-                imported.lookup_version(v0.id()).unwrap().root()
+                imported.physical_root(version.id()),
+                imported.physical_root(v0.id())
             );
             imported.verify(version).unwrap();
         }
@@ -4824,7 +5191,7 @@ mod tests {
         assert_eq!(store.is_expired(v0.id()), Ok(true));
         // Catalogue entry intact: root, parent, binding, and table position.
         let record = store.version_record(v0.id()).unwrap();
-        assert_eq!(record, v0);
+        assert_eq!(record.version(), v0);
         assert_eq!(store.versions.len(), 1);
         assert_eq!(store.next_version_id, 1);
         assert!(store.expired_versions.contains(&v0.id()));
@@ -4903,7 +5270,7 @@ mod tests {
         let v3 = splice_new(&mut store, history, Some(v2.id()), 0, 0, b"+");
         assert_eq!(v3.parent(), Some(v2.id()));
         let v4 = fork_new(&mut store, history, v2.id(), None, None);
-        assert_eq!(v4.root(), v2.root());
+        assert_eq!(store.physical_root(v4.id()), store.physical_root(v2.id()));
         // The expired version itself rejects every fresh acquisition.
         assert_eq!(
             store.splice(history, Some(v1.id()), 0, 0, b"x", Some(b"fresh-req"), None),
@@ -5040,7 +5407,7 @@ mod tests {
         let mut store = PersistentHistoryStore::new();
         let history = store.create_history().unwrap();
         let v0 = append_new(&mut store, history, None, b"stable-bytes-1234");
-        let root_before = store.version_record(v0.id()).unwrap().root();
+        let root_before = store.version_record(v0.id()).unwrap().root().unwrap();
         let mut bytes_before = Vec::new();
         store
             .backend
@@ -5051,7 +5418,7 @@ mod tests {
             )
             .unwrap();
         expire_new(&mut store, v0.id());
-        let root_after = store.version_record(v0.id()).unwrap().root();
+        let root_after = store.version_record(v0.id()).unwrap().root().unwrap();
         assert_eq!(root_after, root_before);
         let mut bytes_after = Vec::new();
         store
@@ -5137,7 +5504,10 @@ mod tests {
         };
         assert_ne!(fresh.id(), committed[0].id());
         assert_eq!(fresh.parent(), Some(v0.id()));
-        assert_eq!(fresh.root(), v0.root());
+        assert_eq!(
+            store.physical_root(fresh.id()),
+            store.physical_root(v0.id())
+        );
         assert_eq!(
             store.request_receipt_status(&fork_request_id(0)),
             RequestReceiptStatus::Active(fresh.id())
@@ -5833,6 +6203,280 @@ mod tests {
         );
     }
 
+    // ---- E5 quiescent GC tests ----
+
+    #[test]
+    fn gc_relocates_retained_root_and_preserves_logical_handle() {
+        // E5.22: V0's exclusive nodes force V1's retained root to move
+        // physically, while the pre-GC logical handle keeps working.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let big = vec![0x11u8; 1024 * 1024];
+        let v0 = append_new(&mut store, history, None, &big);
+        let v1 = append_new(&mut store, history, None, b"small-survivor");
+        expire_new(&mut store, v0.id());
+        let old_root = store.physical_root(v1.id()).unwrap();
+        let counters_before = store.work_counters();
+        let prepared = store.prepare_gc().unwrap();
+        let stats = prepared.stats();
+        assert_eq!(stats.retained_versions, 1);
+        assert_eq!(stats.expired_versions, 1);
+        assert!(stats.nodes_reclaimed > 0);
+        assert!(stats.payload_bytes_reclaimed > 0);
+        // Preparation alone mutates nothing, including foreground counters.
+        assert_eq!(store.physical_root(v1.id()).unwrap(), old_root);
+        assert_eq!(store.work_counters(), counters_before);
+        store.apply_prepared_gc(prepared);
+        let new_root = store.physical_root(v1.id()).unwrap();
+        assert_ne!(
+            new_root.node_id(),
+            old_root.node_id(),
+            "reclamation must relocate the survivor"
+        );
+        // The pre-GC logical handle reads and verifies exactly.
+        assert_eq!(read_full(&store, v1, 14), b"small-survivor");
+        store.verify(v1).unwrap();
+        assert_eq!(store.logical_len(v1).unwrap().get(), 14);
+        assert_eq!(v1.id(), VersionId::new(1));
+        assert_eq!(store.next_version_id, 2);
+        // The expired version stays known-but-unacquirable with no root.
+        assert_eq!(store.is_expired(v0.id()), Ok(true));
+        assert_eq!(
+            store.read(v0, 0, 1, &mut Vec::new()),
+            Err(HistoryError::VersionExpired)
+        );
+        assert!(store.physical_root(v0.id()).is_err());
+    }
+
+    #[test]
+    fn gc_keeps_retained_child_of_expired_parent_usable() {
+        // E5.23: V1's subtree protects its own content; V0's exclusive
+        // prefix nodes may disappear without affecting V1.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let big = vec![0x22u8; 256 * 1024];
+        let v0 = append_new(&mut store, history, None, &big);
+        let v1 = splice_new(&mut store, history, Some(v0.id()), 0, 0, b"HEAD-");
+        expire_new(&mut store, v0.id());
+        let prepared = store.prepare_gc().unwrap();
+        assert_eq!(prepared.stats().retained_versions, 1);
+        store.apply_prepared_gc(prepared);
+        assert_eq!(store.is_expired(v0.id()), Ok(true));
+        assert_eq!(store.is_retained(v1.id()), Ok(true));
+        assert_eq!(v1.parent(), Some(v0.id()));
+        let mut output = Vec::new();
+        store
+            .read(v1, 0, store.logical_len(v1).unwrap().get(), &mut output)
+            .unwrap();
+        assert_eq!(&output[..5], b"HEAD-");
+        assert_eq!(output.len(), 256 * 1024 + 5);
+        assert_eq!(&output[5..], &big[..]);
+        store.verify(v1).unwrap();
+        let forked = fork_new(&mut store, history, v1.id(), None, None);
+        assert_eq!(store.logical_len(forked).unwrap().get(), 256 * 1024 + 5);
+        let edited = splice_new(&mut store, history, Some(v1.id()), 5, 0, b"[e]");
+        assert_eq!(store.logical_len(edited).unwrap().get(), 256 * 1024 + 8);
+    }
+
+    #[test]
+    fn gc_protects_fork_shared_content() {
+        // E5.24: V1 = Fork(V0) names the same root; expiring V0 must not
+        // reclaim a byte of V1's content.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let big = vec![0x33u8; 512 * 1024];
+        let v0 = append_new(&mut store, history, None, &big);
+        let v1 = fork_new(&mut store, history, v0.id(), None, None);
+        expire_new(&mut store, v0.id());
+        let prepared = store.prepare_gc().unwrap();
+        let stats = prepared.stats();
+        store.apply_prepared_gc(prepared);
+        assert_eq!(stats.nodes_reclaimed, 0);
+        assert_eq!(stats.payload_bytes_reclaimed, 0);
+        assert_eq!(read_full(&store, v1, 512 * 1024), big);
+        store.verify(v1).unwrap();
+    }
+
+    #[test]
+    fn gc_all_expired_empties_backend_and_keeps_catalogue() {
+        // E5.25: every version expired -> zero nodes, zero payload, full
+        // catalogue, then a fresh root works from the empty backend.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"doomed-a");
+        let v1 = append_new(&mut store, history, None, b"doomed-b");
+        let v2 = fork_new(&mut store, history, v0.id(), None, None);
+        expire_new(&mut store, v0.id());
+        expire_new(&mut store, v1.id());
+        expire_new(&mut store, v2.id());
+        let prepared = store.prepare_gc().unwrap();
+        let stats = prepared.stats();
+        assert_eq!(stats.retained_versions, 0);
+        assert_eq!(stats.expired_versions, 3);
+        store.apply_prepared_gc(prepared);
+        assert_eq!(stats.nodes_after, 0);
+        assert_eq!(stats.payload_bytes_after, 0);
+        assert_eq!(store.version_count(), 3);
+        assert_eq!(store.backend.node_count(), 0);
+        assert_eq!(store.backend.payload_len(), 0);
+        assert!(store.backend.is_empty());
+        for id in [v0.id(), v1.id(), v2.id()] {
+            assert_eq!(store.is_expired(id), Ok(true));
+        }
+        // Snapshot of the reclaimed state encodes an empty image.
+        let bytes = snapshot::encode_history_snapshot(&store, 0, 0).unwrap();
+        let snapshot = snapshot::decode_history_snapshot(&bytes).unwrap();
+        assert!(snapshot.image.is_empty());
+        assert_eq!(snapshot.versions.len(), 3);
+        let imported = PersistentHistoryStore::import_snapshot(snapshot).unwrap();
+        assert_eq!(imported.version_count(), 3);
+        // A fresh root in the existing history works from the empty backend
+        // with the next monotonic identity — never reusing 0..3.
+        let v3 = append_new(&mut store, history, None, b"reborn");
+        assert_eq!(v3.id(), VersionId::new(3));
+        assert_eq!(read_full(&store, v3, 6), b"reborn");
+        store.verify(v3).unwrap();
+    }
+
+    #[test]
+    fn gc_twice_reclaims_nothing_further() {
+        // E5.27: a second GC over compact state is a fixed point — the
+        // independent re-mark finds no garbage the first pass left behind.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let big = vec![0x44u8; 300 * 1024];
+        let v0 = append_new(&mut store, history, None, &big);
+        let v1 = splice_new(&mut store, history, Some(v0.id()), 0, 1024, b"");
+        let v2 = fork_new(&mut store, history, v1.id(), None, None);
+        expire_new(&mut store, v0.id());
+        let first = store.prepare_gc().unwrap();
+        let first_stats = first.stats();
+        assert!(first_stats.nodes_reclaimed > 0);
+        store.apply_prepared_gc(first);
+        let root_after_first = store.physical_root(v2.id()).unwrap();
+        let second = store.prepare_gc().unwrap();
+        let second_stats = second.stats();
+        assert_eq!(second_stats.nodes_reclaimed, 0);
+        assert_eq!(second_stats.payload_bytes_reclaimed, 0);
+        assert_eq!(second_stats.nodes_before, second_stats.nodes_after);
+        assert_eq!(
+            second_stats.payload_bytes_before,
+            second_stats.payload_bytes_after
+        );
+        store.apply_prepared_gc(second);
+        // Stability: placement no longer moves once fully swept.
+        assert_eq!(store.physical_root(v2.id()).unwrap(), root_after_first);
+        assert_eq!(
+            read_full(&store, v2, 300 * 1024 - 1024),
+            big[1024..].to_vec()
+        );
+        assert_eq!(
+            read_full(&store, v1, 300 * 1024 - 1024),
+            big[1024..].to_vec()
+        );
+    }
+
+    #[test]
+    fn gc_preserves_stable_version_ids_across_reclamation() {
+        // E5.21: identities, lifecycle, counters, and post-GC allocation.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let mut ids = Vec::new();
+        for index in 0..5 {
+            let payload = format!("stable-{index}");
+            ids.push(append_new(&mut store, history, None, payload.as_bytes()).id());
+        }
+        assert_eq!(
+            ids.iter().map(|id| id.id()).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+        expire_new(&mut store, ids[1]);
+        expire_new(&mut store, ids[3]);
+        let prepared = store.prepare_gc().unwrap();
+        assert_eq!(prepared.stats().retained_versions, 3);
+        assert_eq!(prepared.stats().expired_versions, 2);
+        store.apply_prepared_gc(prepared);
+        for (index, id) in ids.iter().enumerate() {
+            assert_eq!(id.id(), index as u64);
+            assert_eq!(store.lookup_version(*id).is_ok(), index % 2 == 0);
+            assert_eq!(store.is_expired(*id), Ok(index % 2 == 1));
+        }
+        assert_eq!(store.next_version_id, 5);
+        let expected: Vec<(u64, &[u8])> =
+            vec![(0, b"stable-0"), (2, b"stable-2"), (4, b"stable-4")];
+        for (id, bytes) in expected {
+            let version = store.lookup_version(VersionId::new(id)).unwrap();
+            let mut output = Vec::new();
+            store
+                .read(version, 0, bytes.len() as u64, &mut output)
+                .unwrap();
+            assert_eq!(output, bytes);
+        }
+        // Post-GC allocation never reuses expired identities.
+        let next = append_new(&mut store, history, None, b"stable-5");
+        assert_eq!(next.id(), VersionId::new(5));
+        assert_eq!(store.next_version_id, 6);
+    }
+
+    #[test]
+    fn gc_reclaims_99_percent_branch_forest() {
+        // E5.26 CI-scale: 2 MiB base, 200 branches with independent 8 KiB
+        // replacements, 198 expired, 2 survivors plus base retained.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let base_payload = vec![0x55u8; 2 * 1024 * 1024];
+        let base = append_new(&mut store, history, None, &base_payload);
+        let mut branches = Vec::new();
+        for index in 0..200usize {
+            let mut insert = vec![0u8; 8 * 1024];
+            let tag = format!("branch-{index:03}");
+            insert[..tag.len()].copy_from_slice(tag.as_bytes());
+            let branch = splice_new(
+                &mut store,
+                history,
+                Some(base.id()),
+                (index as u64 * 9973) % (2 * 1024 * 1024 - 8 * 1024),
+                8 * 1024,
+                &insert,
+            );
+            branches.push((branch, insert));
+        }
+        for (branch, _) in branches.iter().take(198) {
+            expire_new(&mut store, branch.id());
+        }
+        let counters_before = store.work_counters();
+        let prepared = store.prepare_gc().unwrap();
+        let stats = prepared.stats();
+        assert_eq!(stats.retained_versions, 3);
+        assert_eq!(stats.expired_versions, 198);
+        assert_eq!(store.work_counters(), counters_before);
+        store.apply_prepared_gc(prepared);
+        assert!(stats.nodes_reclaimed > 0);
+        assert!(stats.payload_bytes_reclaimed > 0);
+        // Survivors exact: base plus the two retained branches.
+        assert_eq!(read_full(&store, base, 2 * 1024 * 1024), base_payload);
+        for position in [198usize, 199] {
+            let (branch, insert) = &branches[position];
+            let len = store.logical_len(*branch).unwrap().get();
+            assert_eq!(len, 2 * 1024 * 1024);
+            let mut output = Vec::new();
+            store.read(*branch, 0, len, &mut output).unwrap();
+            let mut expected = base_payload.clone();
+            let offset = (position as u64 * 9973) % (2 * 1024 * 1024 - 8 * 1024);
+            expected[offset as usize..offset as usize + 8 * 1024].copy_from_slice(insert);
+            assert_eq!(output, expected);
+            store.verify(*branch).unwrap();
+        }
+        // Expired branches fail public acquisition.
+        for (branch, _) in branches.iter().take(198) {
+            assert_eq!(store.is_expired(branch.id()), Ok(true));
+            assert_eq!(
+                store.read(*branch, 0, 1, &mut Vec::new()),
+                Err(HistoryError::VersionExpired)
+            );
+        }
+    }
+
     #[test]
     fn snapshot_horizon_round_trip_preserves_exact_receipt_state() {
         // E4.29 (store-level): 4100 receipts with mixed retire/expire, then
@@ -6008,5 +6652,101 @@ mod tests {
             .collect();
         forged.retired = Vec::new();
         assert_eq!(round_trip(forged), (true, true));
+    }
+
+    #[test]
+    fn snapshot_schema5_root_presence_vectors_fail_closed() {
+        // E5.33: root-presence/length rules fail closed on decode and import
+        // alike, with wire integrity kept valid via struct round trip.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"presence-base");
+        let v1 = fork_new(&mut store, history, v0.id(), Some(b"req-p"), None);
+        // Retire the receipt so later lifecycle forgeries isolate presence
+        // rules instead of tripping the active-receipt validator first.
+        store.retire_request(b"req-p").unwrap();
+        let honest_bytes = snapshot::encode_history_snapshot(&store, 0, 0).unwrap();
+        let honest = snapshot::decode_history_snapshot(&honest_bytes).unwrap();
+        assert!(honest.versions.iter().all(|entry| entry.root_present));
+        let round_trip = |forged: snapshot::HistorySnapshot| {
+            let bytes = snapshot::encode_history_snapshot_struct(&forged).unwrap();
+            let decoded = snapshot::decode_history_snapshot(&bytes);
+            let imported = PersistentHistoryStore::import_snapshot(forged);
+            (decoded.is_err(), imported.is_err())
+        };
+        // Retained version without a materialized root.
+        let mut forged = honest.clone();
+        forged.versions[0].root_present = false;
+        assert_eq!(round_trip(forged), (true, true));
+        // Valid rootless-expired mixes are covered by the store-path
+        // round-trip test below: a struct mutation alone cannot rebuild the
+        // image root table, so presence-count disagreement is exercised
+        // next. Presence counts agree with the image only at import, which
+        // every authority path runs: decode accepts the structurally fine
+        // artifact, import fails the count agreement.
+        let mut skewed = honest.clone();
+        skewed.versions[0].lifecycle = VersionLifecycle::Expired;
+        skewed.versions[0].root_present = false;
+        skewed.versions[1].lifecycle = VersionLifecycle::Expired;
+        skewed.versions[1].root_present = false;
+        let skewed_bytes = snapshot::encode_history_snapshot_struct(&skewed).unwrap();
+        let skewed_decoded = snapshot::decode_history_snapshot(&skewed_bytes).unwrap();
+        assert_eq!(skewed_decoded.versions.len(), 2);
+        assert!(PersistentHistoryStore::import_snapshot(skewed).is_err());
+        // Active receipt pointing at an expired version: revive the
+        // retired receipt as active against the expired fork. Receipt
+        // validation runs against lifecycle even when the expired root is
+        // still materialized.
+        let mut live = honest.clone();
+        live.versions[1].lifecycle = VersionLifecycle::Expired;
+        live.retired.clear();
+        live.active.push(snapshot::SnapshotActive {
+            request_id: b"req-p".to_vec(),
+            digest: history_fork_digest(history, v1.id(), None),
+            version: v1.id(),
+        });
+        assert_eq!(round_trip(live), (true, true));
+    }
+
+    #[test]
+    fn snapshot_mixed_materialized_and_reclaimed_round_trip() {
+        // Valid controls: pre-GC seal keeps expired roots materialized;
+        // post-GC seal leaves them rootless; both reopen exact.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"mixed-base");
+        let v1 = fork_new(&mut store, history, v0.id(), Some(b"req-m"), None);
+        expire_new(&mut store, v0.id());
+        // Pre-GC: expired root still materialized, image covers both.
+        let pre_bytes = snapshot::encode_history_snapshot(&store, 0, 0).unwrap();
+        let pre = snapshot::decode_history_snapshot(&pre_bytes).unwrap();
+        assert!(pre.versions.iter().all(|entry| entry.root_present));
+        let pre_imported = PersistentHistoryStore::import_snapshot(pre).unwrap();
+        assert_eq!(pre_imported.is_expired(v0.id()), Ok(true));
+        assert!(pre_imported.physical_root(v0.id()).is_ok());
+        // req-m resolves to the retained fork V1, so expiry of V0 leaves it
+        // active on both sides of the round trip.
+        assert_eq!(
+            pre_imported.request_receipt_status(b"req-m"),
+            RequestReceiptStatus::Active(v1.id())
+        );
+        // Post-GC: expired rootless, image covers the retained fork only.
+        let prepared = store.prepare_gc().unwrap();
+        store.apply_prepared_gc(prepared);
+        let post_bytes = snapshot::encode_history_snapshot(&store, 1, 0).unwrap();
+        let post = snapshot::decode_history_snapshot(&post_bytes).unwrap();
+        assert!(!post.versions[0].root_present);
+        assert!(post.versions[1].root_present);
+        let post_imported = PersistentHistoryStore::import_snapshot(post).unwrap();
+        assert_eq!(post_imported.is_expired(v0.id()), Ok(true));
+        assert!(post_imported.physical_root(v0.id()).is_err());
+        assert_eq!(post_imported.is_retained(v1.id()), Ok(true));
+        let mut output = Vec::new();
+        post_imported.read(v1, 0, 10, &mut output).unwrap();
+        assert_eq!(output, b"mixed-base");
+        assert_eq!(
+            post_imported.request_receipt_status(b"req-m"),
+            RequestReceiptStatus::Active(v1.id())
+        );
     }
 }

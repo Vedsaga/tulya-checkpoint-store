@@ -71,7 +71,23 @@ fn public_surface_covers_the_full_durable_lifecycle() {
         }
     };
     assert_eq!(forked.parent(), Some(v0.id()));
-    assert_eq!(forked.root(), v0.root());
+    // Same logical length and exact bytes through the public API: placement
+    // itself is no longer caller-visible.
+    assert_eq!(
+        first.store().logical_len(forked).unwrap(),
+        first.store().logical_len(v0).unwrap()
+    );
+    let mut forked_bytes = Vec::new();
+    first
+        .store()
+        .read(
+            forked,
+            0,
+            first.store().logical_len(forked).unwrap().get(),
+            &mut forked_bytes,
+        )
+        .unwrap();
+    assert_eq!(forked_bytes, b"aaa");
     drop(first);
 
     let second = WritableHistoryAuthority::open(temp.path()).unwrap();
@@ -86,7 +102,12 @@ fn public_surface_covers_the_full_durable_lifecycle() {
     let v2 = second.store().lookup_version(v2.id()).unwrap();
     second
         .store()
-        .read(v2, 0, v2.root().logical_len().get(), &mut output)
+        .read(
+            v2,
+            0,
+            second.store().logical_len(v2).unwrap().get(),
+            &mut output,
+        )
         .unwrap();
     assert_eq!(output, b"aaabbbccc");
     drop(second);
@@ -118,4 +139,17 @@ fn public_surface_covers_the_full_durable_lifecycle() {
         tulya_core::persistent_history::RequestReceiptStatus::Retired
     );
     assert_eq!(third.store().request_receipt_capacity(), 4096);
+    drop(third);
+
+    // Quiescent GC is part of the surface: compact, publish, reopen exact.
+    let mut fourth = WritableHistoryAuthority::open(temp.path()).unwrap();
+    let summary = fourth.gc_quiescent().unwrap();
+    assert_eq!(summary.generation, 2);
+    assert!(summary.cleanup_complete);
+    drop(fourth);
+
+    let compact = WritableHistoryAuthority::open(temp.path()).unwrap();
+    assert_eq!(compact.generation(), 2);
+    assert_eq!(compact.store().version_count(), 4);
+    assert!(compact.store().is_expired(v0.id()).unwrap());
 }

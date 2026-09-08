@@ -250,12 +250,36 @@ fn plan_retained_arena(
     state: &V2CommittedState,
     retained_versions: &[u32],
 ) -> Result<(Vec<u64>, Vec<V2RetainedPayloadRange>), V2CompactionError> {
-    let arena_len = u64::try_from(state.payload.len())
+    let mut seeds: Vec<u64> = Vec::new();
+    seeds
+        .try_reserve(retained_versions.len())
+        .map_err(|_| V2CompactionError::Capacity("v2 compaction seed allocation failed"))?;
+    for version_id in retained_versions.iter().copied() {
+        let index = usize::try_from(version_id).map_err(|_| {
+            V2CompactionError::Overflow("v2 compaction retained version identifier exceeds usize")
+        })?;
+        let version = state.versions.get(index).ok_or(V2CompactionError::Invalid(
+            "v2 compaction retained version is absent",
+        ))?;
+        seeds.push(version.root().node_id());
+    }
+    plan_reachable_arena(&state.payload, &state.nodes, &seeds)
+}
+
+/// Generic reachability core shared by checkpoint compaction and history-core
+/// GC: iterative worklist from explicit root node seeds over a node table,
+/// with no version-table or checkpoint vocabulary. `nodes` index equals node
+/// ID; every seed must name a table entry.
+pub(super) fn plan_reachable_arena(
+    payload: &[u8],
+    nodes: &[V2NodeRecord],
+    seeds: &[u64],
+) -> Result<(Vec<u64>, Vec<V2RetainedPayloadRange>), V2CompactionError> {
+    let arena_len = u64::try_from(payload.len())
         .map_err(|_| V2CompactionError::Overflow("v2 compaction payload length exceeds u64"))?;
-    let work_capacity = state
-        .nodes
+    let work_capacity = nodes
         .len()
-        .checked_add(retained_versions.len())
+        .checked_add(seeds.len())
         .ok_or(V2CompactionError::Overflow(
             "v2 compaction node worklist size exceeds usize",
         ))?;
@@ -267,30 +291,22 @@ fn plan_retained_arena(
     worklist.try_reserve(work_capacity).map_err(|_| {
         V2CompactionError::Capacity("v2 compaction node worklist allocation failed")
     })?;
-    for version_id in retained_versions.iter().copied() {
-        let index = usize::try_from(version_id).map_err(|_| {
-            V2CompactionError::Overflow("v2 compaction retained version identifier exceeds usize")
-        })?;
-        let version = state.versions.get(index).ok_or(V2CompactionError::Invalid(
-            "v2 compaction retained version is absent",
-        ))?;
-        claim_node(&mut retained, &mut worklist, version.root().node_id());
+    for seed in seeds.iter().copied() {
+        // Out-of-table seeds fail closed on first pop below with the same
+        // node-table error as dangling branch children.
+        claim_node(&mut retained, &mut worklist, seed);
     }
     let mut ranges: Vec<V2RetainedPayloadRange> = Vec::new();
-    ranges.try_reserve(state.nodes.len()).map_err(|_| {
+    ranges.try_reserve(nodes.len()).map_err(|_| {
         V2CompactionError::Capacity("v2 compaction payload range allocation failed")
     })?;
     while let Some(node_id) = worklist.pop() {
         let index = usize::try_from(node_id).map_err(|_| {
             V2CompactionError::Overflow("v2 compaction node identifier exceeds usize")
         })?;
-        let node = state
-            .nodes
-            .get(index)
-            .copied()
-            .ok_or(V2CompactionError::Invalid(
-                "v2 compaction node reference is outside the node table",
-            ))?;
+        let node = nodes.get(index).copied().ok_or(V2CompactionError::Invalid(
+            "v2 compaction node reference is outside the node table",
+        ))?;
         match v2_node_fields(node)? {
             V2NodeFields::Leaf {
                 payload_offset,
@@ -683,7 +699,16 @@ fn repack_compact_payload(
     state: &V2CommittedState,
     plan: &V2CompactionPlan,
 ) -> Result<(Vec<u8>, Vec<V2PayloadRangeMapping>), V2CompactionError> {
-    let ranges = plan.retained_payload_ranges();
+    repack_compact_ranges(&state.payload, plan.retained_payload_ranges())
+}
+
+/// Generic payload-repack core shared by checkpoint compaction and
+/// history-core GC: validates sorted source ranges and dense-copies their
+/// exact bytes, with no arena or checkpoint vocabulary.
+pub(super) fn repack_compact_ranges(
+    payload: &[u8],
+    ranges: &[V2RetainedPayloadRange],
+) -> Result<(Vec<u8>, Vec<V2PayloadRangeMapping>), V2CompactionError> {
     let mut total = 0u64;
     for range in ranges {
         total = total
@@ -695,8 +720,8 @@ fn repack_compact_payload(
     let total_usize = usize::try_from(total).map_err(|_| {
         V2CompactionError::Overflow("v2 compaction compact payload length exceeds usize")
     })?;
-    let mut payload: Vec<u8> = Vec::new();
-    payload.try_reserve_exact(total_usize).map_err(|_| {
+    let mut compact: Vec<u8> = Vec::new();
+    compact.try_reserve_exact(total_usize).map_err(|_| {
         V2CompactionError::Capacity("v2 compaction compact payload allocation failed")
     })?;
     let mut mapping: Vec<V2PayloadRangeMapping> = Vec::new();
@@ -722,16 +747,15 @@ fn repack_compact_payload(
         let end_usize = usize::try_from(end).map_err(|_| {
             V2CompactionError::Overflow("v2 compaction retained payload end exceeds usize")
         })?;
-        let bytes = state
-            .payload
+        let bytes = payload
             .get(start_usize..end_usize)
             .ok_or(V2CompactionError::Invalid(
                 "v2 compaction retained payload range is outside the source payload",
             ))?;
-        let new_offset = u64::try_from(payload.len()).map_err(|_| {
+        let new_offset = u64::try_from(compact.len()).map_err(|_| {
             V2CompactionError::Overflow("v2 compaction compact payload offset exceeds u64")
         })?;
-        payload.extend_from_slice(bytes);
+        compact.extend_from_slice(bytes);
         mapping.push(V2PayloadRangeMapping {
             old_offset: range.offset(),
             length: range.length(),
@@ -739,7 +763,7 @@ fn repack_compact_payload(
         });
         previous_end = end;
     }
-    Ok((payload, mapping))
+    Ok((compact, mapping))
 }
 
 /// Rebuilds every retained node canonically in ascending old-ID order.
@@ -756,11 +780,30 @@ fn rebuild_compact_nodes(
     compact_payload: &[u8],
     payload_mapping: &[V2PayloadRangeMapping],
 ) -> Result<(Vec<V2NodeRecord>, Vec<V2NodeIdMapping>), V2CompactionError> {
-    let retained = plan.retained_nodes();
-    let mut nodes: Vec<V2NodeRecord> = Vec::new();
-    nodes.try_reserve_exact(retained.len()).map_err(|_| {
-        V2CompactionError::Capacity("v2 compaction compact node table allocation failed")
-    })?;
+    rebuild_compact_records(
+        &state.nodes,
+        plan.retained_nodes(),
+        compact_payload,
+        payload_mapping,
+    )
+}
+
+/// Generic node-rebuild core shared by checkpoint compaction and history-core
+/// GC: canonical reconstruction of every retained record in ascending old-ID
+/// order (children remap before parents), with height/length/commitment
+/// equality against source. No version or checkpoint vocabulary.
+pub(super) fn rebuild_compact_records(
+    nodes: &[V2NodeRecord],
+    retained: &[u64],
+    compact_payload: &[u8],
+    payload_mapping: &[V2PayloadRangeMapping],
+) -> Result<(Vec<V2NodeRecord>, Vec<V2NodeIdMapping>), V2CompactionError> {
+    let mut rebuilt_nodes: Vec<V2NodeRecord> = Vec::new();
+    rebuilt_nodes
+        .try_reserve_exact(retained.len())
+        .map_err(|_| {
+            V2CompactionError::Capacity("v2 compaction compact node table allocation failed")
+        })?;
     let mut mapping: Vec<V2NodeIdMapping> = Vec::new();
     mapping
         .try_reserve_exact(retained.len())
@@ -769,8 +812,7 @@ fn rebuild_compact_nodes(
         let old_index = usize::try_from(old_id).map_err(|_| {
             V2CompactionError::Overflow("v2 compaction source node identifier exceeds usize")
         })?;
-        let old = state
-            .nodes
+        let old = nodes
             .get(old_index)
             .copied()
             .ok_or(V2CompactionError::Invalid(
@@ -840,7 +882,7 @@ fn rebuild_compact_nodes(
                 })?;
                 let left_root = V2RootRecord::from_node(
                     new_left,
-                    nodes
+                    rebuilt_nodes
                         .get(left_index)
                         .copied()
                         .ok_or(V2CompactionError::Invalid(
@@ -849,7 +891,7 @@ fn rebuild_compact_nodes(
                 )?;
                 let right_root = V2RootRecord::from_node(
                     new_right,
-                    nodes
+                    rebuilt_nodes
                         .get(right_index)
                         .copied()
                         .ok_or(V2CompactionError::Invalid(
@@ -892,16 +934,16 @@ fn rebuild_compact_nodes(
                 rebuilt
             }
         };
-        let new_id = u64::try_from(nodes.len()).map_err(|_| {
+        let new_id = u64::try_from(rebuilt_nodes.len()).map_err(|_| {
             V2CompactionError::Overflow("v2 compaction compact node identifier exceeds u64")
         })?;
-        nodes.push(rebuilt);
+        rebuilt_nodes.push(rebuilt);
         mapping.push(V2NodeIdMapping {
             old_node: old_id,
             new_node: new_id,
         });
     }
-    Ok((nodes, mapping))
+    Ok((rebuilt_nodes, mapping))
 }
 
 /// Rebuilds every retained version with dense sequential IDs.
@@ -1074,7 +1116,10 @@ fn remapped_version_id(
         })
 }
 
-fn remapped_node_id(mapping: &[V2NodeIdMapping], old_node: u64) -> Result<u64, V2CompactionError> {
+pub(super) fn remapped_node_id(
+    mapping: &[V2NodeIdMapping],
+    old_node: u64,
+) -> Result<u64, V2CompactionError> {
     mapping
         .binary_search_by(|entry| entry.old_node.cmp(&old_node))
         .map(|index| mapping[index].new_node)

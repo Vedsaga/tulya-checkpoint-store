@@ -11,12 +11,13 @@
 //! ```text
 //! magic[4] = THS1
 //! total_len[u64]          (exact byte length of the whole artifact)
-//! schema[u32] = 4         (staging epoch: 1 = pre-E2 append grammar, rejected;
+//! schema[u32] = 5         (staging epoch: 1 = pre-E2 append grammar, rejected;
 //!                          2 = E2 splice-only grammar, rejected; 3 = E3
 //!                          fork grammar without lifecycle/receipt bounds,
-//!                          rejected: an E4 snapshot may mark versions expired
-//!                          and prunes receipts to the staging horizon, which
-//!                          E3 binaries cannot interpret)
+//!                          rejected; 4 = E4 lifecycle grammar with every
+//!                          version materialized, rejected: an E5 snapshot may
+//!                          leave reclaimed expired versions rootless, which
+//!                          E4 binaries cannot interpret)
 //! generation[u64]
 //! represented_wal_end[u64](exact hot-log prefix byte length represented)
 //! history_count[u64]
@@ -30,16 +31,21 @@
 //! histories:  per entry: binding-present[u8] + len[u64] + bytes
 //! versions:   per entry: history[u64] + parent[u64, MAX = none] +
 //!                            binding-present[u8] + len[u64] + bytes +
-//!                            lifecycle[u8] (0 = retained, 1 = expired)
+//!                            lifecycle[u8] (0 = retained, 1 = expired) +
+//!                            root_present[u8] (0 = reclaimed/absent,
+//!                                               1 = materialized) +
+//!                            len[u64] (exact logical byte length)
 //! active:     per entry, strictly ascending request id:
 //!             req_len[u64] + req + digest[32] + version[u64]
 //! retired:    per entry, strictly ascending request id:
 //!             req_len[u64] + req + digest[32]
 //! receipt_order: oldest-to-newest retained receipt ids, in insertion order:
 //!             per entry: req_len[u64] + req
-//! image[..]               (canonical T2I2 bytes, empty iff no versions;
-//!                          may still cover expired versions: expiration
-//!                          reclaims nothing, E5 owns reclamation)
+//! image[..]               (canonical T2I2 bytes; its root table covers
+//!                          exactly the materialized roots in version order,
+//!                          empty iff no version materializes a root — valid
+//!                          even with a non-empty catalogue when every version
+//!                          is expired and reclaimed)
 //! sha256[32] over everything before it
 //! ```
 //!
@@ -54,15 +60,14 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
 const HISTORY_SNAPSHOT_MAGIC: [u8; 4] = *b"THS1";
-/// Staging snapshot schema epoch: 4 covers splice + fork plus version
-/// lifecycle and the bounded receipt horizon. Schemas 1-3 fail closed at
-/// decode: schema-1 carries append-grammar digests, schema-2 carries
-/// splice-only catalogues, and schema-3 carries unbounded receipts with no
-/// lifecycle marks — an E4 snapshot may mark versions expired and prune
-/// receipts to the staging horizon, which older binaries cannot interpret.
-/// There is deliberately no migration (zero external users).
+/// Staging snapshot schema epoch: 5 covers splice + fork plus version
+/// lifecycle, the bounded receipt horizon, and optional expired roots after
+/// reclamation. Schemas 1-4 fail closed at decode; in particular schema-4
+/// pairs every version with a materialized image root, which a reclaimed E5
+/// snapshot no longer provides. There is deliberately no migration (zero
+/// external users).
 /// NOT a release format version; E9 freezes release Format v1.
-const HISTORY_SNAPSHOT_SCHEMA: u32 = 4;
+const HISTORY_SNAPSHOT_SCHEMA: u32 = 5;
 const HISTORY_SNAPSHOT_HEADER_SIZE: usize = 96;
 const HISTORY_SNAPSHOT_DIGEST_DOMAIN: &[u8] = b"tulya-history/v1/snapshot\0";
 const NO_PARENT: u64 = u64::MAX;
@@ -72,9 +77,17 @@ pub struct SnapshotVersion {
     pub history: HistoryId,
     pub parent: Option<VersionId>,
     pub binding: Option<Vec<u8>>,
-    /// One-way lifecycle mark. The immutable `Version` itself is unchanged;
+    /// One-way lifecycle mark. The immutable logical `Version` is unchanged;
     /// this byte is the separate lifecycle metadata E4 adds.
     pub lifecycle: VersionLifecycle,
+    /// Whether this version materializes a physical root in the image root
+    /// table. Retained versions must always materialize; expired versions
+    /// may be rootless after reclamation.
+    pub root_present: bool,
+    /// Exact logical byte length, authoritative without backend access — the
+    /// catalogue truth that lets validation and replay work even for
+    /// rootless entries.
+    pub len: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,15 +154,29 @@ pub fn encode_history_snapshot(
         .try_reserve_exact(store.versions.len())
         .map_err(|_| HistoryError::Capacity("history snapshot root table allocation failed"))?;
     for record in &store.versions {
-        roots.push(record.root());
+        match record.root() {
+            Some(root) => roots.push(root),
+            None => {
+                if !store.expired_versions.contains(&record.id()) {
+                    return Err(HistoryError::Invalid(
+                        "history snapshot source retained version has no materialized root",
+                    ));
+                }
+            }
+        }
     }
-    let image = if store.versions.is_empty() {
-        if !store.backend.is_empty() {
+    let image = if roots.is_empty() {
+        if store.backend.is_empty() {
+            Vec::new()
+        } else if store.versions.iter().all(|record| record.root().is_none()) {
+            // Nothing retained reaches content: unreachable arena bytes are
+            // simply not exported, with no requirement on the live backend.
+            Vec::new()
+        } else {
             return Err(HistoryError::Invalid(
-                "history snapshot source arena is not empty for zero versions",
+                "history snapshot source arena is not empty for zero materialized roots",
             ));
         }
-        Vec::new()
     } else {
         store.backend.export_image(&roots)?
     };
@@ -193,6 +220,8 @@ pub fn encode_history_snapshot(
             } else {
                 VersionLifecycle::Retained
             },
+            root_present: record.root().is_some(),
+            len: record.len(),
         });
     }
     // The live horizon invariant the decoder rechecks: every retained
@@ -234,10 +263,11 @@ pub fn encode_history_snapshot(
 ///
 /// Structural only: density, coordinate agreement, ledger order, lengths,
 /// and the trailing digest are enforced exactly like the store path, but
-/// semantic lineage rules (same-history parents, binding uniqueness) are
-/// deliberately NOT re-checked here — they are decode/import's job. That
-/// split is what lets tests and conformance tooling construct otherwise
-/// well-formed corruption vectors with recomputed integrity.
+/// semantic rules (same-history parents, binding uniqueness, retained
+/// materialization, receipt-horizon agreement) are deliberately NOT
+/// re-checked here — they are decode/import's job. That split is what lets
+/// tests and conformance tooling construct otherwise well-formed corruption
+/// vectors with recomputed integrity.
 pub fn encode_history_snapshot_struct(snapshot: &HistorySnapshot) -> Result<Vec<u8>, HistoryError> {
     if snapshot.next_history_id as usize != snapshot.history_bindings.len() {
         return Err(HistoryError::Invalid(
@@ -262,12 +292,14 @@ pub fn encode_history_snapshot_struct(snapshot: &HistorySnapshot) -> Result<Vec<
         put_u64(&mut body, record.history.id())?;
         put_u64(&mut body, record.parent.map_or(NO_PARENT, VersionId::id))?;
         put_optional_bytes(&mut body, record.binding.as_deref())?;
-        body.try_reserve_exact(1)
+        body.try_reserve_exact(2)
             .map_err(|_| HistoryError::Capacity("history snapshot allocation failed"))?;
         body.push(match record.lifecycle {
             VersionLifecycle::Retained => 0,
             VersionLifecycle::Expired => 1,
         });
+        body.push(u8::from(record.root_present));
+        put_u64(&mut body, record.len)?;
     }
     let mut previous_active: Option<&[u8]> = None;
     for record in &snapshot.active {
@@ -510,11 +542,28 @@ pub fn decode_history_snapshot(bytes: &[u8]) -> Result<HistorySnapshot, HistoryE
                 ));
             }
         };
+        let root_present = match cursor.take(1)? {
+            [0] => false,
+            [1] => true,
+            _ => {
+                return Err(HistoryError::Invalid(
+                    "history snapshot version root presence is unsupported",
+                ));
+            }
+        };
+        let len = cursor.take_u64()?;
+        if lifecycle == VersionLifecycle::Retained && !root_present {
+            return Err(HistoryError::Invalid(
+                "history snapshot retained version has no materialized root",
+            ));
+        }
         versions.push(SnapshotVersion {
             history: HistoryId::new(history),
             parent,
             binding,
             lifecycle,
+            root_present,
+            len,
         });
     }
     let mut active: Vec<SnapshotActive> = Vec::new();
@@ -1056,6 +1105,70 @@ mod tests {
         assert_eq!(bytes[lifecycle_offset], 0);
         let mut forged = bytes.clone();
         forged[lifecycle_offset] = 2;
+        let digest_start = forged.len() - 32;
+        let mut hasher = Sha256::new();
+        hasher.update(HISTORY_SNAPSHOT_DIGEST_DOMAIN);
+        hasher.update(&forged[..digest_start]);
+        let digest = hasher.finalize();
+        forged[digest_start..].copy_from_slice(&digest);
+        assert!(matches!(
+            decode_history_snapshot(&forged),
+            Err(HistoryError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn invalid_materialized_root_fails_import_with_valid_integrity() {
+        // Corrupt the image payload section, then recompute the artifact
+        // digest: decode accepts the structurally fine envelope, but import
+        // revalidates every node and fails closed on the broken root.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        store
+            .append(history, None, b"root-integrity", None, None)
+            .unwrap();
+        let bytes = encode_history_snapshot(&store, 1, 0).unwrap();
+        let honest = decode_history_snapshot(&bytes).unwrap();
+        assert!(!honest.image.is_empty());
+        let mut forged = bytes.clone();
+        let image_start = forged.len() - 32 - honest.image.len();
+        // Flip a byte inside the image payload section (past the 72-byte
+        // T2I2 header so the table geometry still parses).
+        forged[image_start + 80] ^= 0xFF;
+        let digest_start = forged.len() - 32;
+        let mut hasher = Sha256::new();
+        hasher.update(HISTORY_SNAPSHOT_DIGEST_DOMAIN);
+        hasher.update(&forged[..digest_start]);
+        let digest = hasher.finalize();
+        forged[digest_start..].copy_from_slice(&digest);
+        let decoded = decode_history_snapshot(&forged).unwrap();
+        assert_eq!(decoded.versions.len(), 1);
+        assert!(PersistentHistoryStore::import_snapshot(decoded).is_err());
+    }
+
+    #[test]
+    fn malformed_version_binding_fails_closed_with_valid_integrity() {
+        // Patch a version binding length to empty (present flag with zero
+        // length) and recompute the artifact digest: only the binding gate
+        // can reject.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        store
+            .append(history, None, b"data", None, Some(b"bind-1"))
+            .unwrap();
+        let bytes = encode_history_snapshot(&store, 1, 0).unwrap();
+        // Versions section starts after the 96-byte header plus the history
+        // table (one entry, no binding: 8 bytes): entry opens with history
+        // u64 + parent u64, then the binding length u64.
+        let binding_len_offset = HISTORY_SNAPSHOT_HEADER_SIZE + 8 + 8 + 8;
+        let stored = u64::from_le_bytes(
+            bytes[binding_len_offset..binding_len_offset + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(stored, b"bind-1".len() as u64 + 1);
+        let mut forged = bytes.clone();
+        forged[binding_len_offset..binding_len_offset + 8].copy_from_slice(&1u64.to_le_bytes());
         let digest_start = forged.len() - 32;
         let mut hasher = Sha256::new();
         hasher.update(HISTORY_SNAPSHOT_DIGEST_DOMAIN);
