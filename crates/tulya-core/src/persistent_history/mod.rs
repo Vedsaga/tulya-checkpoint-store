@@ -1926,6 +1926,19 @@ impl PersistentHistoryStore {
     /// logical identities, parents, lengths, and bindings: only physical
     /// placement changes, and expired entries go rootless.
     pub(crate) fn prepare_gc(&self) -> Result<PreparedGc, HistoryError> {
+        // Materialized consistency first: a catalogue length disagreeing
+        // with its root must fail here, before compaction could drop an
+        // expired root and destroy the evidence. No traversal needed — the
+        // root carries authenticated length metadata.
+        for record in &self.versions {
+            if let Some(root) = record.root() {
+                if record.len() != root.logical_len().get() {
+                    return Err(HistoryError::Invalid(
+                        "persistent GC version length disagrees with its materialized root",
+                    ));
+                }
+            }
+        }
         let mut retained_roots = Vec::new();
         retained_roots
             .try_reserve(self.versions.len())
@@ -1964,6 +1977,14 @@ impl PersistentHistoryStore {
                 let root = remapped.next().ok_or(HistoryError::Invalid(
                     "persistent GC remapped roots disagree with retained versions",
                 ))?;
+                // The rebuild core already checks old/new root lengths
+                // against each other; tie the relocated root explicitly to
+                // the authoritative catalogue length before assembling.
+                if root.logical_len().get() != record.len() {
+                    return Err(HistoryError::Invalid(
+                        "persistent GC remapped root disagrees with catalogue length",
+                    ));
+                }
                 versions.push(VersionRecord {
                     version: record.version(),
                     root: Some(*root),
@@ -2541,6 +2562,15 @@ impl PersistentHistoryStore {
                 })?;
                 let _ = store.expired_versions.insert(id);
             }
+            // Length is authoritative catalogue metadata, never derived
+            // silently: zero is rejected for every entry, and a materialized
+            // root must agree with the catalogue value before the record
+            // commits.
+            if entry.len == 0 {
+                return Err(HistoryError::Invalid(
+                    "history snapshot version length is zero",
+                ));
+            }
             let root = if entry.root_present {
                 Some(*roots.get(materialized_index).ok_or(HistoryError::Invalid(
                     "history snapshot image roots disagree with its materialized versions",
@@ -2553,6 +2583,13 @@ impl PersistentHistoryStore {
                 }
                 None
             };
+            if let Some(root) = root {
+                if entry.len != root.logical_len().get() {
+                    return Err(HistoryError::Invalid(
+                        "history snapshot version length disagrees with its materialized root",
+                    ));
+                }
+            }
             if entry.root_present {
                 materialized_index =
                     materialized_index
@@ -6200,6 +6237,160 @@ mod tests {
                 .unwrap()
                 .parent(),
             Some(VersionId::new(0))
+        );
+    }
+
+    // ---- E5 closure: catalogue length / materialized root consistency ----
+
+    #[test]
+    fn length_root_mismatch_fails_encode_prepare_and_import() {
+        // A forged catalogue length must fail at every gate with the
+        // length-disagreement error: seal encode, GC preparation, snapshot
+        // import — never laundered, never silently overwritten.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"consistency-1234");
+        let v1 = fork_new(&mut store, history, v0.id(), None, None);
+        expire_new(&mut store, v0.id());
+        let counters = store.work_counters();
+        // Corrupt the retained fork's catalogue length in memory.
+        store.versions[1].len += 1;
+        assert_eq!(
+            snapshot::encode_history_snapshot(&store, 0, 0),
+            Err(HistoryError::Invalid(
+                "history snapshot source version length disagrees with its materialized root"
+            ))
+        );
+        assert_eq!(
+            store.prepare_gc().map(|prepared| prepared.stats()),
+            Err(HistoryError::Invalid(
+                "persistent GC version length disagrees with its materialized root"
+            ))
+        );
+        // Both guards are read-only: backend, catalogue, and counters
+        // exact (checked before any content read, which legitimately bumps
+        // read counters).
+        assert_eq!(store.work_counters(), counters);
+        assert_eq!(store.version_count(), 2);
+        // Restore the fork, corrupt the expired-but-materialized root
+        // instead: GC must fail rather than launder via root drop.
+        store.versions[1].len -= 1;
+        store.versions[0].len += 1;
+        assert_eq!(
+            snapshot::encode_history_snapshot(&store, 0, 0),
+            Err(HistoryError::Invalid(
+                "history snapshot source version length disagrees with its materialized root"
+            ))
+        );
+        assert_eq!(
+            store.prepare_gc().map(|prepared| prepared.stats()),
+            Err(HistoryError::Invalid(
+                "persistent GC version length disagrees with its materialized root"
+            ))
+        );
+        // Restore: every gate succeeds with identical state.
+        store.versions[0].len -= 1;
+        snapshot::encode_history_snapshot(&store, 0, 0).unwrap();
+        let stats = store.prepare_gc().unwrap().stats();
+        assert_eq!(stats.retained_versions, 1);
+        assert_eq!(store.work_counters(), counters);
+        assert_eq!(read_full(&store, v1, 16), b"consistency-1234");
+    }
+
+    #[test]
+    fn schema5_length_mismatch_rejects_at_import() {
+        // Retained mismatch: valid integrity, structurally parsable decode,
+        // fail-closed import with the length-disagreement error.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"length-import!");
+        let v1 = fork_new(&mut store, history, v0.id(), None, None);
+        let honest = snapshot::decode_history_snapshot(
+            &snapshot::encode_history_snapshot(&store, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let mut forged = honest.clone();
+        forged.versions[1].len += 1;
+        let forged_bytes = snapshot::encode_history_snapshot_struct(&forged).unwrap();
+        // Decode parses structurally; only the materialized agreement fails.
+        let decoded = snapshot::decode_history_snapshot(&forged_bytes).unwrap();
+        assert_eq!(decoded.versions[1].len, 15);
+        for snapshot in [decoded, forged] {
+            assert_eq!(
+                PersistentHistoryStore::import_snapshot(snapshot).unwrap_err(),
+                HistoryError::Invalid(
+                    "history snapshot version length disagrees with its materialized root"
+                )
+            );
+        }
+        let _ = (v0, v1);
+    }
+
+    #[test]
+    fn schema5_expired_materialized_mismatch_rejects_at_import() {
+        // Same gate for an expired-but-still-materialized version: proves GC
+        // could not later launder the mismatch by dropping the root.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"expired-length");
+        let _v1 = fork_new(&mut store, history, v0.id(), None, None);
+        expire_new(&mut store, v0.id());
+        let honest = snapshot::decode_history_snapshot(
+            &snapshot::encode_history_snapshot(&store, 0, 0).unwrap(),
+        )
+        .unwrap();
+        assert!(honest.versions[0].root_present);
+        let mut forged = honest;
+        forged.versions[0].len += 1;
+        let forged_bytes = snapshot::encode_history_snapshot_struct(&forged).unwrap();
+        snapshot::decode_history_snapshot(&forged_bytes).unwrap();
+        assert_eq!(
+            PersistentHistoryStore::import_snapshot(forged).unwrap_err(),
+            HistoryError::Invalid(
+                "history snapshot version length disagrees with its materialized root"
+            )
+        );
+    }
+
+    #[test]
+    fn schema5_rootless_zero_length_rejects() {
+        // Control: valid post-GC rootless entries carry their preserved
+        // nonzero length and round-trip; forged zero length fails at decode
+        // and at struct import alike.
+        let mut store = PersistentHistoryStore::new();
+        let history = store.create_history().unwrap();
+        let v0 = append_new(&mut store, history, None, b"rootless-len14!");
+        let _v1 = fork_new(&mut store, history, v0.id(), None, None);
+        expire_new(&mut store, v0.id());
+        let prepared = store.prepare_gc().unwrap();
+        store.apply_prepared_gc(prepared);
+        let honest = snapshot::decode_history_snapshot(
+            &snapshot::encode_history_snapshot(&store, 0, 0).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(honest.versions[0].lifecycle, VersionLifecycle::Expired);
+        assert!(!honest.versions[0].root_present);
+        assert_eq!(honest.versions[0].len, 15);
+        let imported = PersistentHistoryStore::import_snapshot(honest.clone()).unwrap();
+        assert_eq!(
+            imported
+                .logical_len(imported.lookup_version(VersionId::new(1)).unwrap())
+                .unwrap()
+                .get(),
+            15
+        );
+        let mut forged = honest;
+        forged.versions[0].len = 0;
+        let forged_bytes = snapshot::encode_history_snapshot_struct(&forged).unwrap();
+        assert_eq!(
+            snapshot::decode_history_snapshot(&forged_bytes),
+            Err(HistoryError::Invalid(
+                "history snapshot version length is zero"
+            ))
+        );
+        assert_eq!(
+            PersistentHistoryStore::import_snapshot(forged).unwrap_err(),
+            HistoryError::Invalid("history snapshot version length is zero")
         );
     }
 

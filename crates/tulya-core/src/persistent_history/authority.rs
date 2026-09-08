@@ -637,10 +637,7 @@ fn cleanup_superseded_generations(dir: &Path, current: u64) -> bool {
             Some(name) => name,
             None => continue,
         };
-        let stale = superseded_generation_file(name, current);
-        let stale_tmp = name.ends_with(".tmp")
-            && (name.starts_with("history-snap-") || name.starts_with("history-"));
-        if !stale && !stale_tmp {
+        if !superseded_generation_file(name, current) && !stale_tulya_temp_file(name) {
             continue;
         }
         if fs::remove_file(&path).is_err() {
@@ -651,6 +648,31 @@ fn cleanup_superseded_generations(dir: &Path, current: u64) -> bool {
         complete = false;
     }
     complete
+}
+
+/// Reports whether a directory entry is a stale Tulya temp artifact:
+/// exactly the canonical generation temp names the staging path itself
+/// writes (`history-{u64}.wal.tmp`, `history-snap-{u64}.ths.tmp`, and the
+/// manifest temp), never a prefix family. Unrelated application files that
+/// merely share a prefix are never matched.
+fn stale_tulya_temp_file(name: &str) -> bool {
+    let Some(base) = name.strip_suffix(".tmp") else {
+        return false;
+    };
+    if base == HISTORY_MANIFEST_FILE {
+        return true;
+    }
+    for (prefix, suffix) in [("history-", ".wal"), ("history-snap-", ".ths")] {
+        if let Some(rest) = base
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(suffix))
+        {
+            if rest.parse::<u64>().is_ok() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Reports whether a directory entry is a superseded Tulya generation file:
@@ -765,6 +787,9 @@ mod tests {
         encode_history_log_frame, encode_history_log_record, DurableHistoryLog, HistoryLogRecord,
     };
     use super::super::manifest::ManifestSealed;
+    use super::super::manifest::{
+        decode_history_manifest, encode_history_manifest, HistoryManifest, HISTORY_MANIFEST_FILE,
+    };
     use super::super::snapshot::{decode_history_snapshot, encode_history_snapshot_struct};
     use super::super::{
         history_fork_digest, history_splice_digest, CommitOutcome, HistoryId, VersionId,
@@ -2467,6 +2492,199 @@ mod tests {
         assert_eq!(reopened.generation, 2);
         assert_eq!(reopened.store.is_expired(v0.id()), Ok(true));
         assert_eq!(reopened.store.version_count(), 1);
+    }
+
+    /// Rewrites the sealed generation-1 snapshot with a forged catalogue
+    /// length, keeping artifact integrity valid, and rebinds the manifest
+    /// sealed digest to match: reopen must fail at snapshot import with the
+    /// length-disagreement error, not at manifest/integrity checks.
+    fn reopen_with_forged_sealed_len(
+        dir: &Path,
+        version_index: usize,
+        delta: u64,
+    ) -> Result<OpenedHistory, DurableError> {
+        let snap_path = dir.join(history_snapshot_filename(1));
+        let bytes = fs::read(&snap_path).unwrap();
+        let mut snapshot = decode_history_snapshot(&bytes).unwrap();
+        snapshot.versions[version_index].len += delta;
+        let forged = encode_history_snapshot_struct(&snapshot).unwrap();
+        fs::write(&snap_path, &forged).unwrap();
+        let manifest_bytes = fs::read(dir.join(HISTORY_MANIFEST_FILE)).unwrap();
+        let manifest = decode_history_manifest(&manifest_bytes).unwrap();
+        let rebound = HistoryManifest::for_generation(
+            manifest.generation(),
+            Some(ManifestSealed::for_snapshot(forged.len() as u64, &forged)),
+        );
+        fs::write(
+            dir.join(HISTORY_MANIFEST_FILE),
+            encode_history_manifest(&rebound),
+        )
+        .unwrap();
+        open_history_authority(dir)
+    }
+
+    #[test]
+    fn open_rejects_retained_length_mismatch_in_sealed_snapshot() {
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority
+            .append(history, None, b"sealed-length!", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        let _v1 = authority_forked(&mut authority, history, v0.id());
+        authority.seal().unwrap();
+        drop(authority);
+        let error = reopen_with_forged_sealed_len(temp.path(), 1, 1).unwrap_err();
+        assert!(matches!(
+            error,
+            DurableError::Rejected(crate::persistent_history::HistoryError::Invalid(
+                "history snapshot version length disagrees with its materialized root"
+            ))
+        ));
+    }
+
+    #[test]
+    fn open_rejects_expired_materialized_mismatch_in_sealed_snapshot() {
+        // Same gate for an expired-but-materialized version: GC could not
+        // later launder this by dropping the root.
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority
+            .append(history, None, b"sealed-length!", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        let _v1 = authority_forked(&mut authority, history, v0.id());
+        authority.expire(v0.id()).unwrap();
+        authority.seal().unwrap();
+        drop(authority);
+        let error = reopen_with_forged_sealed_len(temp.path(), 0, 1).unwrap_err();
+        assert!(matches!(
+            error,
+            DurableError::Rejected(crate::persistent_history::HistoryError::Invalid(
+                "history snapshot version length disagrees with its materialized root"
+            ))
+        ));
+    }
+
+    #[test]
+    fn gc_cleanup_preserves_unrelated_files_byte_exact() {
+        // B.2: only canonical Tulya temp names are recognized — files that
+        // merely share a prefix must survive GC byte-exact, while genuine
+        // stale generation temps are removed.
+        let temp = fixture_dir();
+        let mut authority = WritableHistoryAuthority::open(temp.path()).unwrap();
+        let history = authority.create_history(Some(b"thread-a")).unwrap();
+        let v0 = match authority
+            .append(history, None, b"cleanup-scope", None, None)
+            .unwrap()
+        {
+            CommitOutcome::Committed(version) => version,
+            CommitOutcome::Replayed(_) | CommitOutcome::Retired => {
+                panic!("root append must create")
+            }
+        };
+        authority.seal().unwrap();
+        let unrelated: Vec<(&str, &[u8])> = vec![
+            ("history-notes.tmp", b"application notes"),
+            ("history-backup.tmp", b"application backup"),
+            ("history-abc.wal.tmp", b"not a generation temp"),
+            ("history-snap-copy.ths.tmp", b"not a generation temp"),
+            ("history-42.txt.tmp", b"not a generation temp"),
+            ("user-data.bin", b"opaque user bytes"),
+        ];
+        for (name, bytes) in &unrelated {
+            std::fs::write(temp.path().join(name), bytes).unwrap();
+        }
+        // Canonical stale temps: never part of any authority, safe to drop.
+        std::fs::write(temp.path().join("history-0.wal.tmp"), b"stale").unwrap();
+        std::fs::write(temp.path().join("history-snap-0.ths.tmp"), b"stale").unwrap();
+        std::fs::write(temp.path().join("history-manifest.json.tmp"), b"stale").unwrap();
+        let summary = authority.gc_quiescent().unwrap();
+        assert_eq!(summary.generation, 2);
+        assert!(summary.cleanup_complete);
+        // Canonical stale temps are gone.
+        for stale in [
+            "history-0.wal.tmp",
+            "history-snap-0.ths.tmp",
+            "history-manifest.json.tmp",
+        ] {
+            assert!(
+                !temp.path().join(stale).exists(),
+                "stale canonical temp {stale} must be removed"
+            );
+        }
+        // Every unrelated file survives byte-exact.
+        for (name, bytes) in &unrelated {
+            assert_eq!(
+                fs::read(temp.path().join(name)).unwrap(),
+                *bytes,
+                "unrelated file {name} must survive GC byte-exact"
+            );
+        }
+        drop(authority);
+        let reopened = open_history_authority(temp.path()).unwrap();
+        assert_eq!(reopened.store.version_count(), 1);
+        let got = reopened.store.lookup_version(v0.id()).unwrap();
+        let mut output = Vec::new();
+        reopened
+            .store
+            .read(
+                got,
+                0,
+                reopened.store.logical_len(got).unwrap().get(),
+                &mut output,
+            )
+            .unwrap();
+        assert_eq!(output, b"cleanup-scope");
+    }
+
+    #[test]
+    fn stale_temp_grammar_matches_only_canonical_names() {
+        for canonical in [
+            "history-0.wal.tmp",
+            "history-00000000000000000004.wal.tmp",
+            "history-snap-0.ths.tmp",
+            "history-snap-00000000000000000004.ths.tmp",
+            "history-manifest.json.tmp",
+        ] {
+            assert!(stale_tulya_temp_file(canonical), "{canonical} must match");
+            assert!(
+                !superseded_generation_file(canonical, 4),
+                "{canonical} is a temp, not a final generation file"
+            );
+        }
+        for unrelated in [
+            "history-notes.tmp",
+            "history-backup.tmp",
+            "history-abc.wal.tmp",
+            "history-snap-copy.ths.tmp",
+            "history-42.txt.tmp",
+            "user-data.bin",
+            "history-manifest.json",
+            "history-00000000000000000004.wal",
+            "history-snap-00000000000000000004.ths",
+        ] {
+            assert!(
+                !stale_tulya_temp_file(unrelated),
+                "{unrelated} must never match"
+            );
+        }
+        // Final-file grammar unchanged: only non-current generations.
+        assert!(superseded_generation_file(&history_wal_filename(3), 4));
+        assert!(!superseded_generation_file(&history_wal_filename(4), 4));
+        assert!(!superseded_generation_file("history-notes.tmp", 4));
     }
 
     #[test]

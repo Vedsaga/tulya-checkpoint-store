@@ -155,7 +155,18 @@ pub fn encode_history_snapshot(
         .map_err(|_| HistoryError::Capacity("history snapshot root table allocation failed"))?;
     for record in &store.versions {
         match record.root() {
-            Some(root) => roots.push(root),
+            Some(root) => {
+                // The catalogue length is authoritative without traversal:
+                // the root already carries authenticated length metadata, so
+                // a malformed in-memory state fails here instead of being
+                // laundered into a sealed generation.
+                if record.len() != root.logical_len().get() {
+                    return Err(HistoryError::Invalid(
+                        "history snapshot source version length disagrees with its materialized root",
+                    ));
+                }
+                roots.push(root);
+            }
             None => {
                 if !store.expired_versions.contains(&record.id()) {
                     return Err(HistoryError::Invalid(
@@ -436,9 +447,12 @@ fn snapshot_digest(prefix: &[u8]) -> [u8; 32] {
 /// Structural rules enforced here: magic, schema, exact total length,
 /// trailing digest, dense identity tables matching their allocation
 /// counters, topological parents, strictly ascending ledger order with no
-/// duplicates or active/retired overlap, bounded identifier lengths, and
-/// exact byte consumption. Semantic payload verification happens at import,
-/// where backend reads recompute every active digest.
+/// duplicates or active/retired overlap, bounded identifier lengths, nonzero
+/// version lengths, retained materialization, and exact byte consumption.
+/// Import validates image/root/lifecycle/lineage/receipt consistency;
+/// operation digests are preserved byte-exact and trace to commit/replay
+/// validation, with snapshot artifact integrity protecting their stored
+/// bytes.
 pub fn decode_history_snapshot(bytes: &[u8]) -> Result<HistorySnapshot, HistoryError> {
     let mut cursor = SnapshotCursor { bytes, pos: 0 };
     if cursor.take(4)? != HISTORY_SNAPSHOT_MAGIC {
@@ -552,6 +566,13 @@ pub fn decode_history_snapshot(bytes: &[u8]) -> Result<HistorySnapshot, HistoryE
             }
         };
         let len = cursor.take_u64()?;
+        // Every logical state is non-empty: a rootless expired version
+        // retains the nonzero length it had before reclamation.
+        if len == 0 {
+            return Err(HistoryError::Invalid(
+                "history snapshot version length is zero",
+            ));
+        }
         if lifecycle == VersionLifecycle::Retained && !root_present {
             return Err(HistoryError::Invalid(
                 "history snapshot retained version has no materialized root",
