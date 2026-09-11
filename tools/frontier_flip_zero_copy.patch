@@ -1,0 +1,405 @@
+diff --git a/crates/tulya-core/src/persistent_sequence/avl.rs b/crates/tulya-core/src/persistent_sequence/avl.rs
+index ccf4197..0000000 100644
+--- a/crates/tulya-core/src/persistent_sequence/avl.rs
++++ b/crates/tulya-core/src/persistent_sequence/avl.rs
+@@ -155,6 +155,18 @@ pub(super) trait ArenaStore {
+     /// Reads one exact payload range `[start..end)`, failing closed outside
+     /// the arena.
+     fn arena_read_payload(&self, start: u64, end: u64) -> Result<Vec<u8>, V2AvlError>;
++    /// Materializes a leaf view of an existing immutable payload range.
++    ///
++    /// The default arena policy copies the bytes into fresh payload so the
++    /// legacy in-memory/image representation keeps its contiguous-allocation
++    /// invariant. Durable physical arenas may override this and return the
++    /// original `start`, allowing fresh leaf metadata to alias an immutable
++    /// subrange without rewriting those payload bytes.
++    fn arena_alias_payload(&mut self, start: u64, end: u64) -> Result<(u64, Vec<u8>), V2AvlError> {
++        let bytes = self.arena_read_payload(start, end)?;
++        let offset = self.arena_append_payload(&bytes)?;
++        Ok((offset, bytes))
++    }
+     /// Appends payload bytes, returning the base offset they occupy.
+     fn arena_append_payload(&mut self, bytes: &[u8]) -> Result<u64, V2AvlError>;
+     /// Pushes one node, returning its dense identifier.
+@@ -414,13 +426,9 @@ impl V2AvlSequence {
+                     .checked_add(payload_len)
+                     .ok_or(V2AvlError::Overflow("v2 leaf split range exceeds u64"))?;
+-                // Bounded boundary fragments: the source leaf itself respects
+-                // the staging bound, so both copies stay within it.
+-                let left_bytes = arena.arena_read_payload(payload_offset, left_end)?;
+-                let right_bytes = arena.arena_read_payload(left_end, leaf_end)?;
+-                let left = Self::allocate_leaf_on(arena, &left_bytes)?;
+-                let right = Self::allocate_leaf_on(arena, &right_bytes)?;
++                // Preserve immutable boundary bytes by range whenever the
++                // arena supports it. The pure in-memory arena intentionally
++                // falls back to copying so its canonical image format remains
++                // unchanged; the durable physical arena aliases the ranges.
++                let left = Self::allocate_leaf_slice_on(arena, payload_offset, left_end)?;
++                let right = Self::allocate_leaf_slice_on(arena, left_end, leaf_end)?;
+                 Ok((Some(left), Some(right)))
+             }
+             ArenaNode::Branch { left, right, .. } => {
+@@ -503,6 +511,35 @@ impl V2AvlSequence {
+         ))
+     }
+ 
++    /// Allocates leaf metadata for an immutable source-payload subrange.
++    ///
++    /// `ArenaStore::arena_alias_payload` chooses the physical policy. The
++    /// durable store keeps the original payload coordinates (zero payload
++    /// rewrite); the legacy in-memory arena copies the bytes and returns the
++    /// fresh coordinate. In both cases the commitment is recomputed from the
++    /// exact bytes and the returned leaf is canonical.
++    fn allocate_leaf_slice_on<A: ArenaStore>(
++        arena: &mut A,
++        start: u64,
++        end: u64,
++    ) -> Result<V2RootRecord, V2AvlError> {
++        if start >= end {
++            return Err(V2AvlError::Invalid(
++                "v2 leaf slice must reference a non-empty payload range",
++            ));
++        }
++        let (payload_offset, bytes) = arena.arena_alias_payload(start, end)?;
++        let record = V2NodeRecord::leaf(payload_offset, &bytes)?;
++        let payload_len = record.logical_len();
++        Self::allocate_node_on(
++            arena,
++            ArenaNode::Leaf {
++                payload_offset,
++                payload_len,
++                record,
++            },
++        )
++    }
++
+     /// Allocates one bounded leaf. The record constructor enforces
+     /// non-emptiness and the staging payload bound.
+     fn allocate_leaf_on<A: ArenaStore>(
+ diff --git a/crates/tulya-core/src/persistent_sequence/physical.rs b/crates/tulya-core/src/persistent_sequence/physical.rs
+index 9376825..0000000 100644
+--- a/crates/tulya-core/src/persistent_sequence/physical.rs
++++ b/crates/tulya-core/src/persistent_sequence/physical.rs
+@@ -1117,6 +1117,12 @@ impl ArenaStore for PhysicalContentStore {
+         self.read_payload_range(start, end)
+     }
+ 
++    fn arena_alias_payload(&mut self, start: u64, end: u64) -> Result<(u64, Vec<u8>), V2AvlError> {
++        let bytes = self.read_payload_range(start, end)?;
++        Ok((start, bytes))
++    }
++
+     fn arena_append_payload(&mut self, bytes: &[u8]) -> Result<u64, V2AvlError> {
+         let offset = self.committed_payload_end;
+         self.append_payload_delta(bytes)?;
+@@ -1267,14 +1273,11 @@ fn build_delta_arena_node(
+         V2NodeFields::Leaf {
+             payload_offset,
+             payload_len,
+         } => {
+-            let new_end = view
++            let available_end = view
+                 .base_payload_end
+                 .checked_add(view.payload_delta.len() as u64)
+                 .ok_or(V2AvlError::Overflow(
+                     "history physical payload frontier exceeds u64",
+                 ))?;
+-            if payload_offset < view.base_payload_end
+-                || payload_offset
+-                    .checked_add(payload_len)
+-                    .ok_or(V2AvlError::Overflow("v2 leaf payload range exceeds u64"))?
+-                    > new_end
+-            {
++            let payload_end = payload_offset
++                .checked_add(payload_len)
++                .ok_or(V2AvlError::Overflow("v2 leaf payload range exceeds u64"))?;
++            if payload_end > available_end {
+                 return Err(V2AvlError::Invalid(
+                     "history physical delta leaf references payload outside its range",
+                 ));
+@@ -1364,6 +1367,12 @@ impl ArenaStore for DeltaView<'_> {
+         Ok(first)
+     }
+ 
++    fn arena_alias_payload(&mut self, start: u64, end: u64) -> Result<(u64, Vec<u8>), V2AvlError> {
++        let bytes = self.arena_read_payload(start, end)?;
++        Ok((start, bytes))
++    }
++
+     fn arena_append_payload(&mut self, bytes: &[u8]) -> Result<u64, V2AvlError> {
+         let offset = self
+             .base_payload_end
+@@ -1512,11 +1521,10 @@ pub(crate) fn physical_delta_digest(
+ /// Runs the shared splice algorithm against a preparation view and validates
+ /// the resulting delta locally (E6.14): fresh node identifiers cover exactly
+ /// `[node_start..node_end)`, fresh payload covers exactly
+-/// `[payload_start..payload_end)`, every fresh leaf references valid payload
+-/// under the no-shared-extents policy, every fresh branch references an old
+-/// committed node or an earlier fresh node, every record decodes
+-/// canonically, the result root resolves, and its length and commitment
+-/// match the prepared semantic result. No file mutation occurs.
++/// `[payload_start..payload_end)`, every fresh leaf references valid immutable
++/// payload in the combined committed-plus-fresh arena, every fresh branch
++/// references an old committed node or an earlier fresh node, every record
++/// decodes canonically, the result root resolves, and its length and
++/// commitment match the prepared semantic result. No file mutation occurs.
+@@ -1585,8 +1593,8 @@ fn validate_fresh_delta(
+ ) -> Result<(), V2AvlError> {
+     use super::image_v2::{v2_node_fields, V2NodeFields};
+@@ -1610,33 +1618,49 @@ fn validate_fresh_delta(
+             V2NodeFields::Leaf {
+                 payload_offset,
+                 payload_len,
+             } => {
+-                // No shared extents (E2 policy carried into the physical
+-                // delta): every fresh leaf lands wholly inside fresh payload.
+-                if payload_offset < old_payload_end
+-                    || payload_offset
+-                        .checked_add(payload_len)
+-                        .ok_or(V2AvlError::Overflow("v2 leaf payload range exceeds u64"))?
+-                        > new_payload_end
+-                {
++                let leaf_end = payload_offset
++                    .checked_add(payload_len)
++                    .ok_or(V2AvlError::Overflow("v2 leaf payload range exceeds u64"))?;
++                if leaf_end > new_payload_end {
+                     return Err(V2AvlError::Invalid(
+                         "history physical delta leaf references payload outside its range",
+                     ));
+                 }
+-                let expected = V2NodeRecord::leaf(
+-                    payload_offset,
+-                    payload
+-                        .get(
+-                            (payload_offset - old_payload_end) as usize
+-                                ..(payload_offset - old_payload_end + payload_len) as usize,
+-                        )
+-                        .ok_or(V2AvlError::Invalid(
+-                            "history physical delta leaf references payload outside its range",
+-                        ))?,
+-                )?;
++                let bytes = if leaf_end <= old_payload_end {
++                    base.read_payload_range(payload_offset, leaf_end)?
++                } else if payload_offset >= old_payload_end {
++                    let start = usize::try_from(payload_offset - old_payload_end)
++                        .map_err(|_| V2AvlError::Overflow("v2 payload start exceeds usize"))?;
++                    let end = usize::try_from(leaf_end - old_payload_end)
++                        .map_err(|_| V2AvlError::Overflow("v2 payload end exceeds usize"))?;
++                    payload
++                        .get(start..end)
++                        .ok_or(V2AvlError::Invalid(
++                            "history physical delta leaf references payload outside its range",
++                        ))?
++                        .to_vec()
++                } else {
++                    let mut bytes = base.read_payload_range(payload_offset, old_payload_end)?;
++                    let fresh_end = usize::try_from(leaf_end - old_payload_end)
++                        .map_err(|_| V2AvlError::Overflow("v2 payload end exceeds usize"))?;
++                    bytes.extend_from_slice(payload.get(..fresh_end).ok_or(
++                        V2AvlError::Invalid(
++                            "history physical delta leaf references payload outside its range",
++                        ),
++                    )?);
++                    bytes
++                };
++                let expected = V2NodeRecord::leaf(payload_offset, &bytes)?;
+                 if expected != record {
+                     return Err(V2AvlError::Invalid(
+                         "history physical delta leaf verification failed",
+ diff --git a/crates/tulya-core/src/persistent_sequence/compaction_v2.rs b/crates/tulya-core/src/persistent_sequence/compaction_v2.rs
+index 5b10233..0000000 100644
+--- a/crates/tulya-core/src/persistent_sequence/compaction_v2.rs
++++ b/crates/tulya-core/src/persistent_sequence/compaction_v2.rs
+@@ -79,10 +79,10 @@ impl From<V2BackendError> for V2CompactionError {
+ 
+ /// One retained source payload range, recorded verbatim from a retained leaf.
+ ///
+-/// Ranges are reported per retained leaf node without merging or
+-/// deduplication: a future remapping unit must see exactly what the reachable
+-/// leaves reference. Overlapping entries can only arise from a malformed arena
+-/// because canonical appends allocate disjoint delta ranges; they are preserved
+-/// here so the remapping unit can reject or handle them explicitly.
++/// Ranges are reported per retained leaf node without merging or
++/// deduplication: the remapping unit must see exactly what the reachable leaves
++/// reference. Durable path-copy leaves may intentionally alias immutable
++/// subranges owned by older versions, so overlaps and duplicates are valid
++/// input and are coalesced only while building the compact payload image.
+@@ -699,12 +699,12 @@ fn repack_compact_payload(
+ }
+ 
+ /// Generic payload-repack core shared by checkpoint compaction and
+-/// history-core GC: validates sorted source ranges and dense-copies their
+-/// exact bytes, with no arena or checkpoint vocabulary.
++/// history-core GC: validates sorted source ranges and copies the union of
++/// their exact bytes densely. Overlapping/duplicate immutable leaf views map
++/// into the same compact bytes instead of being recopied.
+ pub(super) fn repack_compact_ranges(
+     payload: &[u8],
+     ranges: &[V2RetainedPayloadRange],
+ ) -> Result<(Vec<u8>, Vec<V2PayloadRangeMapping>), V2CompactionError> {
+-    let mut total = 0u64;
++    let payload_len = u64::try_from(payload.len()).map_err(|_| {
++        V2CompactionError::Overflow("v2 compaction source payload length exceeds u64")
++    })?;
++    let mut total = 0u64;
++    let mut have_union = false;
++    let mut union_end = 0u64;
++    let mut previous_key: Option<(u64, u64)> = None;
+     for range in ranges {
+-        total = total
+-            .checked_add(range.length())
+-            .ok_or(V2CompactionError::Overflow(
+-                "v2 compaction compact payload length exceeds u64",
+-            ))?;
++        let key = (range.offset(), range.length());
++        if previous_key.is_some_and(|previous| key < previous) {
++            return Err(V2CompactionError::Invalid(
++                "v2 compaction retained payload ranges are not sorted",
++            ));
++        }
++        previous_key = Some(key);
++        let end = range
++            .offset()
++            .checked_add(range.length())
++            .ok_or(V2CompactionError::Overflow(
++                "v2 compaction retained payload range exceeds u64",
++            ))?;
++        if end > payload_len {
++            return Err(V2CompactionError::Invalid(
++                "v2 compaction retained payload range is outside the source payload",
++            ));
++        }
++        let contribution = if !have_union || range.offset() > union_end {
++            have_union = true;
++            range.length()
++        } else {
++            end.saturating_sub(union_end)
++        };
++        total = total.checked_add(contribution).ok_or(
++            V2CompactionError::Overflow("v2 compaction compact payload length exceeds u64"),
++        )?;
++        union_end = union_end.max(end);
+     }
+     let total_usize = usize::try_from(total).map_err(|_| {
+         V2CompactionError::Overflow("v2 compaction compact payload length exceeds usize")
+@@ -719,35 +719,55 @@ pub(super) fn repack_compact_ranges(
+     mapping.try_reserve_exact(ranges.len()).map_err(|_| {
+         V2CompactionError::Capacity("v2 compaction payload mapping allocation failed")
+     })?;
+-    let mut previous_end = 0u64;
++    let mut have_union = false;
++    let mut union_source_start = 0u64;
++    let mut union_source_end = 0u64;
++    let mut union_compact_start = 0u64;
+     for range in ranges {
+-        if range.offset() < previous_end {
+-            return Err(V2CompactionError::Invalid(
+-                "v2 compaction retained payload ranges overlap or duplicate",
+-            ));
+-        }
+         let end = range
+             .offset()
+             .checked_add(range.length())
+             .ok_or(V2CompactionError::Overflow(
+                 "v2 compaction retained payload range exceeds u64",
+             ))?;
+-        let start_usize = usize::try_from(range.offset()).map_err(|_| {
+-            V2CompactionError::Overflow("v2 compaction retained payload offset exceeds usize")
+-        })?;
+-        let end_usize = usize::try_from(end).map_err(|_| {
+-            V2CompactionError::Overflow("v2 compaction retained payload end exceeds usize")
+-        })?;
+-        let bytes = payload
+-            .get(start_usize..end_usize)
+-            .ok_or(V2CompactionError::Invalid(
+-                "v2 compaction retained payload range is outside the source payload",
+-            ))?;
+-        let new_offset = u64::try_from(compact.len()).map_err(|_| {
+-            V2CompactionError::Overflow("v2 compaction compact payload offset exceeds u64")
+-        })?;
+-        compact.extend_from_slice(bytes);
++        if !have_union || range.offset() > union_source_end {
++            have_union = true;
++            union_source_start = range.offset();
++            union_source_end = end;
++            union_compact_start = u64::try_from(compact.len()).map_err(|_| {
++                V2CompactionError::Overflow("v2 compaction compact payload offset exceeds u64")
++            })?;
++            let start_usize = usize::try_from(range.offset()).map_err(|_| {
++                V2CompactionError::Overflow("v2 compaction retained payload offset exceeds usize")
++            })?;
++            let end_usize = usize::try_from(end).map_err(|_| {
++                V2CompactionError::Overflow("v2 compaction retained payload end exceeds usize")
++            })?;
++            compact.extend_from_slice(payload.get(start_usize..end_usize).ok_or(
++                V2CompactionError::Invalid(
++                    "v2 compaction retained payload range is outside the source payload",
++                ),
++            )?);
++        } else if end > union_source_end {
++            let extension_start = usize::try_from(union_source_end).map_err(|_| {
++                V2CompactionError::Overflow("v2 compaction retained payload offset exceeds usize")
++            })?;
++            let extension_end = usize::try_from(end).map_err(|_| {
++                V2CompactionError::Overflow("v2 compaction retained payload end exceeds usize")
++            })?;
++            compact.extend_from_slice(payload.get(extension_start..extension_end).ok_or(
++                V2CompactionError::Invalid(
++                    "v2 compaction retained payload range is outside the source payload",
++                ),
++            )?);
++            union_source_end = end;
++        }
++        let new_offset = union_compact_start
++            .checked_add(range.offset() - union_source_start)
++            .ok_or(V2CompactionError::Overflow(
++                "v2 compaction compact payload offset exceeds u64",
++            ))?;
+         mapping.push(V2PayloadRangeMapping {
+             old_offset: range.offset(),
+             length: range.length(),
+             new_offset,
+         });
+-        previous_end = end;
+     }
++    if compact.len() != total_usize {
++        return Err(V2CompactionError::Invalid(
++            "v2 compaction compact payload union length disagrees with its plan",
++        ));
++    }
+     Ok((compact, mapping))
+ }
+@@ -1279,6 +1299,31 @@ mod tests {
+             .collect()
+     }
+ 
++    #[test]
++    fn overlapping_leaf_views_repack_to_one_payload_union() {
++        let payload = b"abcdefgh".to_vec();
++        let ranges = vec![
++            V2RetainedPayloadRange {
++                offset: 0,
++                length: 3,
++            },
++            V2RetainedPayloadRange {
++                offset: 0,
++                length: 8,
++            },
++            V2RetainedPayloadRange {
++                offset: 3,
++                length: 5,
++            },
++        ];
++        let (compact, mapping) = repack_compact_ranges(&payload, &ranges).unwrap();
++        assert_eq!(compact, payload);
++        assert_eq!(
++            mapping
++                .iter()
++                .map(|entry| (entry.old_offset(), entry.length(), entry.new_offset()))
++                .collect::<Vec<_>>(),
++            vec![(0, 3, 0), (0, 8, 0), (3, 5, 3)]
++        );
++    }
++
+     /// Builds the shared A/B/C/D/E sparse-history fixture:
+     /// A(cp-1, v0/n0) -> B(cp-2, v1/n1-n2) -> C(cp-3, v2/n3-n4);
