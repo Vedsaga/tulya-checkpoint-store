@@ -22,7 +22,9 @@ jobs:
           components: rustfmt, clippy
       - name: Apply point replacement fast path
         run: python3 tools/apply_point_replace_fast_path.py
-      - name: Format
+      - name: Format staged source
+        run: cargo fmt --all
+      - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
