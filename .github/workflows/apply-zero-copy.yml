@@ -22,10 +22,8 @@ jobs:
           toolchain: '1.80'
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Apply zero-copy payload-range patch
-        run: |
-          git apply --check --recount tools/frontier_flip_zero_copy.patch
-          git apply --recount tools/frontier_flip_zero_copy.patch
+      - name: Apply exact zero-copy source updates
+        run: python3 tools/apply_frontier_zero_copy.py
       - name: Format
         run: cargo fmt --all
       - name: Clippy
