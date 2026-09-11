@@ -1,0 +1,22 @@
+name: frontier-flip-smoke
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.80'
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --features local-server --locked -- -D warnings
+      - run: python3 -m py_compile benchmarks/frontier_flip/*.py
+      - run: python3 benchmarks/frontier_flip/run.py --profile smoke --output-dir /tmp/tulya-frontier-flip-smoke
