@@ -1108,6 +1108,11 @@ impl ArenaStore for PhysicalContentStore {
         self.read_payload_range(start, end)
     }
 
+    fn arena_alias_payload(&mut self, start: u64, end: u64) -> Result<(u64, Vec<u8>), V2AvlError> {
+        let bytes = self.read_payload_range(start, end)?;
+        Ok((start, bytes))
+    }
+
     fn arena_append_payload(&mut self, bytes: &[u8]) -> Result<u64, V2AvlError> {
         let offset = self.committed_payload_end;
         self.append_payload_delta(bytes)?;
@@ -1276,18 +1281,16 @@ fn build_delta_arena_node(
             payload_offset,
             payload_len,
         } => {
-            let new_end = view
+            let available_end = view
                 .base_payload_end
                 .checked_add(view.payload_delta.len() as u64)
                 .ok_or(V2AvlError::Overflow(
                     "history physical payload frontier exceeds u64",
                 ))?;
-            if payload_offset < view.base_payload_end
-                || payload_offset
-                    .checked_add(payload_len)
-                    .ok_or(V2AvlError::Overflow("v2 leaf payload range exceeds u64"))?
-                    > new_end
-            {
+            let payload_end = payload_offset
+                .checked_add(payload_len)
+                .ok_or(V2AvlError::Overflow("v2 leaf payload range exceeds u64"))?;
+            if payload_end > available_end {
                 return Err(V2AvlError::Invalid(
                     "history physical delta leaf references payload outside its range",
                 ));
@@ -1386,6 +1389,11 @@ impl ArenaStore for DeltaView<'_> {
         let second = self.arena_read_payload(self.base_payload_end, end)?;
         first.extend_from_slice(&second);
         Ok(first)
+    }
+
+    fn arena_alias_payload(&mut self, start: u64, end: u64) -> Result<(u64, Vec<u8>), V2AvlError> {
+        let bytes = self.arena_read_payload(start, end)?;
+        Ok((start, bytes))
     }
 
     fn arena_append_payload(&mut self, bytes: &[u8]) -> Result<u64, V2AvlError> {
@@ -1524,11 +1532,11 @@ pub(crate) fn physical_delta_digest(
 /// Runs the shared splice algorithm against a preparation view and validates
 /// the resulting delta locally (E6.14): fresh node identifiers cover exactly
 /// `[node_start..node_end)`, fresh payload covers exactly
-/// `[payload_start..payload_end)`, every fresh leaf references valid payload
-/// under the no-shared-extents policy, every fresh branch references an old
-/// committed node or an earlier fresh node, every record decodes
-/// canonically, the result root resolves, and its length and commitment
-/// match the prepared semantic result. No file mutation occurs.
+/// `[payload_start..payload_end)`, every fresh leaf references valid immutable
+/// payload in the combined committed-plus-fresh arena, every fresh branch
+/// references an old committed node or an earlier fresh node, every record
+/// decodes canonically, the result root resolves, and its length and
+/// commitment match the prepared semantic result. No file mutation occurs.
 pub(super) fn prepare_physical_delta(
     base: &PhysicalContentStore,
     parent: Option<V2RootRecord>,
@@ -1653,29 +1661,39 @@ fn validate_fresh_delta(
                 payload_offset,
                 payload_len,
             } => {
-                // No shared extents (E2 policy carried into the physical
-                // delta): every fresh leaf lands wholly inside fresh payload.
-                if payload_offset < old_payload_end
-                    || payload_offset
-                        .checked_add(payload_len)
-                        .ok_or(V2AvlError::Overflow("v2 leaf payload range exceeds u64"))?
-                        > new_payload_end
-                {
+                let leaf_end = payload_offset
+                    .checked_add(payload_len)
+                    .ok_or(V2AvlError::Overflow("v2 leaf payload range exceeds u64"))?;
+                if leaf_end > new_payload_end {
                     return Err(V2AvlError::Invalid(
                         "history physical delta leaf references payload outside its range",
                     ));
                 }
-                let expected = V2NodeRecord::leaf(
-                    payload_offset,
+                let bytes = if leaf_end <= old_payload_end {
+                    base.read_payload_range(payload_offset, leaf_end)?
+                } else if payload_offset >= old_payload_end {
+                    let start = usize::try_from(payload_offset - old_payload_end)
+                        .map_err(|_| V2AvlError::Overflow("v2 payload start exceeds usize"))?;
+                    let end = usize::try_from(leaf_end - old_payload_end)
+                        .map_err(|_| V2AvlError::Overflow("v2 payload end exceeds usize"))?;
                     payload
-                        .get(
-                            (payload_offset - old_payload_end) as usize
-                                ..(payload_offset - old_payload_end + payload_len) as usize,
-                        )
+                        .get(start..end)
                         .ok_or(V2AvlError::Invalid(
                             "history physical delta leaf references payload outside its range",
-                        ))?,
-                )?;
+                        ))?
+                        .to_vec()
+                } else {
+                    let mut bytes = base.read_payload_range(payload_offset, old_payload_end)?;
+                    let fresh_end = usize::try_from(leaf_end - old_payload_end)
+                        .map_err(|_| V2AvlError::Overflow("v2 payload end exceeds usize"))?;
+                    bytes.extend_from_slice(payload.get(..fresh_end).ok_or(
+                        V2AvlError::Invalid(
+                            "history physical delta leaf references payload outside its range",
+                        ),
+                    )?);
+                    bytes
+                };
+                let expected = V2NodeRecord::leaf(payload_offset, &bytes)?;
                 if expected != record {
                     return Err(V2AvlError::Invalid(
                         "history physical delta leaf verification failed",

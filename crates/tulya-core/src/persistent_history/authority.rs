@@ -3969,8 +3969,8 @@ mod tests {
     fn physical_splice_locality_1gib_diagnostic() {
         let foreground = cold_splice_locality_row(1024 * 1024 * 1024);
         assert!(
-            foreground.payload_bytes_read <= 2 * 16384,
-            "payload read {} exceeds two boundary leaves",
+            foreground.payload_bytes_read <= 3 * 16384,
+            "payload read {} exceeds three integrity-checked boundary-leaf reads",
             foreground.payload_bytes_read
         );
         assert!(
@@ -4025,8 +4025,8 @@ mod tests {
         // these may scale with the 10 MiB parent (identical bounds hold at
         // 100 MiB and 1 GiB below).
         assert!(
-            foreground.payload_bytes_read <= 2 * 16384,
-            "payload read {} exceeds two boundary leaves",
+            foreground.payload_bytes_read <= 3 * 16384,
+            "payload read {} exceeds three integrity-checked boundary-leaf reads",
             foreground.payload_bytes_read
         );
         assert!(
@@ -4221,8 +4221,8 @@ mod tests {
         // IDENTICAL bounds to the 10 MiB case: this equality is the
         // no-parent-scaling proof, not the individual values.
         assert!(
-            foreground.payload_bytes_read <= 2 * 16384,
-            "payload read {} exceeds two boundary leaves",
+            foreground.payload_bytes_read <= 3 * 16384,
+            "payload read {} exceeds three integrity-checked boundary-leaf reads",
             foreground.payload_bytes_read
         );
         assert!(

@@ -105,10 +105,10 @@ impl From<V2BackendError> for V2CompactionError {
 /// One retained source payload range, recorded verbatim from a retained leaf.
 ///
 /// Ranges are reported per retained leaf node without merging or
-/// deduplication: a future remapping unit must see exactly what the reachable
-/// leaves reference. Overlapping entries can only arise from a malformed arena
-/// because canonical appends allocate disjoint delta ranges; they are preserved
-/// here so the remapping unit can reject or handle them explicitly.
+/// deduplication: the remapping unit must see exactly what the reachable leaves
+/// reference. Durable path-copy leaves may intentionally alias immutable
+/// subranges owned by older versions, so overlaps and duplicates are valid
+/// input and are coalesced only while building the compact payload image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct V2RetainedPayloadRange {
     offset: u64,
@@ -690,11 +690,12 @@ fn try_clone_request_id(request_id: &[u8]) -> Result<Vec<u8>, V2CompactionError>
     Ok(cloned)
 }
 
-/// Validates retained source ranges and repacks their exact bytes densely.
+/// Validates retained source ranges and repacks their byte union densely.
 ///
-/// Ranges arrive ordered by `(offset, length)`. Gaps (deleted leaves) are
-/// valid and simply disappear; any overlap, duplicate, backward move, overflow,
-/// or out-of-bounds reference fails closed instead of being silently merged.
+/// Ranges arrive ordered by `(offset, length)`. Gaps (deleted leaves) simply
+/// disappear. Overlap and duplicates are valid immutable aliases; backward
+/// order, overflow, out-of-bounds references, and commitment disagreement
+/// still fail closed.
 fn repack_compact_payload(
     state: &V2CommittedState,
     plan: &V2CompactionPlan,
@@ -703,19 +704,51 @@ fn repack_compact_payload(
 }
 
 /// Generic payload-repack core shared by checkpoint compaction and
-/// history-core GC: validates sorted source ranges and dense-copies their
-/// exact bytes, with no arena or checkpoint vocabulary.
+/// history-core GC: validates sorted source ranges and copies the union of
+/// their exact bytes densely. Overlapping/duplicate immutable leaf views map
+/// into the same compact bytes instead of being recopied.
 pub(super) fn repack_compact_ranges(
     payload: &[u8],
     ranges: &[V2RetainedPayloadRange],
 ) -> Result<(Vec<u8>, Vec<V2PayloadRangeMapping>), V2CompactionError> {
+    let payload_len = u64::try_from(payload.len()).map_err(|_| {
+        V2CompactionError::Overflow("v2 compaction source payload length exceeds u64")
+    })?;
     let mut total = 0u64;
+    let mut have_union = false;
+    let mut union_end = 0u64;
+    let mut previous_key: Option<(u64, u64)> = None;
     for range in ranges {
-        total = total
+        let key = (range.offset(), range.length());
+        if previous_key.is_some_and(|previous| key < previous) {
+            return Err(V2CompactionError::Invalid(
+                "v2 compaction retained payload ranges are not sorted",
+            ));
+        }
+        previous_key = Some(key);
+        let end = range
+            .offset()
             .checked_add(range.length())
+            .ok_or(V2CompactionError::Overflow(
+                "v2 compaction retained payload range exceeds u64",
+            ))?;
+        if end > payload_len {
+            return Err(V2CompactionError::Invalid(
+                "v2 compaction retained payload range is outside the source payload",
+            ));
+        }
+        let contribution = if !have_union || range.offset() > union_end {
+            have_union = true;
+            range.length()
+        } else {
+            end.saturating_sub(union_end)
+        };
+        total = total
+            .checked_add(contribution)
             .ok_or(V2CompactionError::Overflow(
                 "v2 compaction compact payload length exceeds u64",
             ))?;
+        union_end = union_end.max(end);
     }
     let total_usize = usize::try_from(total).map_err(|_| {
         V2CompactionError::Overflow("v2 compaction compact payload length exceeds usize")
@@ -728,40 +761,64 @@ pub(super) fn repack_compact_ranges(
     mapping.try_reserve_exact(ranges.len()).map_err(|_| {
         V2CompactionError::Capacity("v2 compaction payload mapping allocation failed")
     })?;
-    let mut previous_end = 0u64;
+    let mut have_union = false;
+    let mut union_source_start = 0u64;
+    let mut union_source_end = 0u64;
+    let mut union_compact_start = 0u64;
     for range in ranges {
-        if range.offset() < previous_end {
-            return Err(V2CompactionError::Invalid(
-                "v2 compaction retained payload ranges overlap or duplicate",
-            ));
-        }
         let end = range
             .offset()
             .checked_add(range.length())
             .ok_or(V2CompactionError::Overflow(
                 "v2 compaction retained payload range exceeds u64",
             ))?;
-        let start_usize = usize::try_from(range.offset()).map_err(|_| {
-            V2CompactionError::Overflow("v2 compaction retained payload offset exceeds usize")
-        })?;
-        let end_usize = usize::try_from(end).map_err(|_| {
-            V2CompactionError::Overflow("v2 compaction retained payload end exceeds usize")
-        })?;
-        let bytes = payload
-            .get(start_usize..end_usize)
-            .ok_or(V2CompactionError::Invalid(
-                "v2 compaction retained payload range is outside the source payload",
+        if !have_union || range.offset() > union_source_end {
+            have_union = true;
+            union_source_start = range.offset();
+            union_source_end = end;
+            union_compact_start = u64::try_from(compact.len()).map_err(|_| {
+                V2CompactionError::Overflow("v2 compaction compact payload offset exceeds u64")
+            })?;
+            let start_usize = usize::try_from(range.offset()).map_err(|_| {
+                V2CompactionError::Overflow("v2 compaction retained payload offset exceeds usize")
+            })?;
+            let end_usize = usize::try_from(end).map_err(|_| {
+                V2CompactionError::Overflow("v2 compaction retained payload end exceeds usize")
+            })?;
+            compact.extend_from_slice(payload.get(start_usize..end_usize).ok_or(
+                V2CompactionError::Invalid(
+                    "v2 compaction retained payload range is outside the source payload",
+                ),
+            )?);
+        } else if end > union_source_end {
+            let extension_start = usize::try_from(union_source_end).map_err(|_| {
+                V2CompactionError::Overflow("v2 compaction retained payload offset exceeds usize")
+            })?;
+            let extension_end = usize::try_from(end).map_err(|_| {
+                V2CompactionError::Overflow("v2 compaction retained payload end exceeds usize")
+            })?;
+            compact.extend_from_slice(payload.get(extension_start..extension_end).ok_or(
+                V2CompactionError::Invalid(
+                    "v2 compaction retained payload range is outside the source payload",
+                ),
+            )?);
+            union_source_end = end;
+        }
+        let new_offset = union_compact_start
+            .checked_add(range.offset() - union_source_start)
+            .ok_or(V2CompactionError::Overflow(
+                "v2 compaction compact payload offset exceeds u64",
             ))?;
-        let new_offset = u64::try_from(compact.len()).map_err(|_| {
-            V2CompactionError::Overflow("v2 compaction compact payload offset exceeds u64")
-        })?;
-        compact.extend_from_slice(bytes);
         mapping.push(V2PayloadRangeMapping {
             old_offset: range.offset(),
             length: range.length(),
             new_offset,
         });
-        previous_end = end;
+    }
+    if compact.len() != total_usize {
+        return Err(V2CompactionError::Invalid(
+            "v2 compaction compact payload union length disagrees with its plan",
+        ));
     }
     Ok((compact, mapping))
 }
@@ -1235,6 +1292,34 @@ mod tests {
             .iter()
             .map(|range| (range.offset(), range.length()))
             .collect()
+    }
+
+    #[test]
+    fn overlapping_leaf_views_repack_to_one_payload_union() {
+        let payload = b"abcdefgh".to_vec();
+        let ranges = vec![
+            V2RetainedPayloadRange {
+                offset: 0,
+                length: 3,
+            },
+            V2RetainedPayloadRange {
+                offset: 0,
+                length: 8,
+            },
+            V2RetainedPayloadRange {
+                offset: 3,
+                length: 5,
+            },
+        ];
+        let (compact, mapping) = repack_compact_ranges(&payload, &ranges).unwrap();
+        assert_eq!(compact, payload);
+        assert_eq!(
+            mapping
+                .iter()
+                .map(|entry| (entry.old_offset(), entry.length(), entry.new_offset()))
+                .collect::<Vec<_>>(),
+            vec![(0, 3, 0), (0, 8, 0), (3, 5, 3)]
+        );
     }
 
     /// Builds the shared A/B/C/D/E sparse-history fixture:
@@ -1972,18 +2057,21 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_retained_payload_ranges_fail_closed() {
-        // Each range is individually in-bounds, so reachability retains both
-        // leaves; preparation must reject the overlap instead of merging it.
-        let overlapping = overlapping_range_state();
-        assert!(plan_v2_compaction(&overlapping).is_ok());
+    fn payload_aliases_compact_once_and_inconsistent_aliases_fail_closed() {
+        // This fixture stores an overlapping leaf whose commitment was built
+        // from different bytes than the range it names. Overlap is now legal,
+        // but the commitment mismatch remains corruption and fails closed.
+        let inconsistent = overlapping_range_state();
+        assert!(plan_v2_compaction(&inconsistent).is_ok());
         assert_eq!(
-            prepare_v2_compaction(&overlapping),
+            prepare_v2_compaction(&inconsistent),
             Err(V2CompactionError::Invalid(
-                "v2 compaction retained payload ranges overlap or duplicate"
+                "v2 compaction rebuilt leaf commitment disagrees with source"
             ))
         );
 
+        // Exact duplicate immutable views are valid aliases. Compaction keeps
+        // one copy of the payload union while preserving both leaf mappings.
         let payload = b"aaa";
         let leaf = V2NodeRecord::leaf(0, payload).unwrap();
         let first_root = V2RootRecord::from_node(0, leaf).unwrap();
@@ -2008,12 +2096,10 @@ mod tests {
             ..Default::default()
         };
         assert!(plan_v2_compaction(&duplicate).is_ok());
-        assert_eq!(
-            prepare_v2_compaction(&duplicate),
-            Err(V2CompactionError::Invalid(
-                "v2 compaction retained payload ranges overlap or duplicate"
-            ))
-        );
+        let prepared = prepare_v2_compaction(&duplicate).unwrap();
+        assert_eq!(prepared.payload(), payload);
+        assert_eq!(prepared.payload_mapping().len(), 2);
+        assert_eq!(prepared.nodes().len(), 2);
     }
 
     #[test]
@@ -2282,7 +2368,7 @@ mod tests {
         assert_eq!(
             compact_v2_state(&mut state),
             Err(V2CompactionError::Invalid(
-                "v2 compaction retained payload ranges overlap or duplicate"
+                "v2 compaction rebuilt leaf commitment disagrees with source"
             ))
         );
         assert_eq!(state.payload, payload);
@@ -2551,7 +2637,7 @@ mod tests {
         assert_eq!(
             prepare_compacted_v2_sealed_artifact(&state),
             Err(V2CompactionError::Invalid(
-                "v2 compaction retained payload ranges overlap or duplicate"
+                "v2 compaction rebuilt leaf commitment disagrees with source"
             ))
         );
         assert_unchanged_against_twin(&state, &twin);

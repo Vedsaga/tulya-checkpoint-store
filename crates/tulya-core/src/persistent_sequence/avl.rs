@@ -167,6 +167,18 @@ pub(super) trait ArenaStore {
     /// Reads one exact payload range `[start..end)`, failing closed outside
     /// the arena.
     fn arena_read_payload(&self, start: u64, end: u64) -> Result<Vec<u8>, V2AvlError>;
+    /// Materializes a leaf view of an existing immutable payload range.
+    ///
+    /// The default arena policy copies the bytes into fresh payload so the
+    /// legacy in-memory/image representation keeps its contiguous-allocation
+    /// invariant. Durable physical arenas may override this and return the
+    /// original `start`, allowing fresh leaf metadata to alias an immutable
+    /// subrange without rewriting those payload bytes.
+    fn arena_alias_payload(&mut self, start: u64, end: u64) -> Result<(u64, Vec<u8>), V2AvlError> {
+        let bytes = self.arena_read_payload(start, end)?;
+        let offset = self.arena_append_payload(&bytes)?;
+        Ok((offset, bytes))
+    }
     /// Appends payload bytes, returning the base offset they occupy.
     fn arena_append_payload(&mut self, bytes: &[u8]) -> Result<u64, V2AvlError>;
     /// Pushes one node, returning its dense identifier.
@@ -454,12 +466,12 @@ impl V2AvlSequence {
                 let leaf_end = payload_offset
                     .checked_add(payload_len)
                     .ok_or(V2AvlError::Overflow("v2 leaf split range exceeds u64"))?;
-                // Bounded boundary fragments: the source leaf itself respects
-                // the staging bound, so both copies stay within it.
-                let left_bytes = arena.arena_read_payload(payload_offset, left_end)?;
-                let right_bytes = arena.arena_read_payload(left_end, leaf_end)?;
-                let left = Self::allocate_leaf_on(arena, &left_bytes)?;
-                let right = Self::allocate_leaf_on(arena, &right_bytes)?;
+                // Preserve immutable boundary bytes by range whenever the
+                // arena supports it. The pure in-memory arena intentionally
+                // falls back to copying so its canonical image format remains
+                // unchanged; the durable physical arena aliases the ranges.
+                let left = Self::allocate_leaf_slice_on(arena, payload_offset, left_end)?;
+                let right = Self::allocate_leaf_slice_on(arena, left_end, leaf_end)?;
                 Ok((Some(left), Some(right)))
             }
             ArenaNode::Branch { left, right, .. } => {
@@ -543,6 +555,36 @@ impl V2AvlSequence {
         level.pop().ok_or(V2AvlError::Invalid(
             "v2 sequence insert produced no content",
         ))
+    }
+
+    /// Allocates leaf metadata for an immutable source-payload subrange.
+    ///
+    /// `ArenaStore::arena_alias_payload` chooses the physical policy. The
+    /// durable store keeps the original payload coordinates (zero payload
+    /// rewrite); the legacy in-memory arena copies the bytes and returns the
+    /// fresh coordinate. In both cases the commitment is recomputed from the
+    /// exact bytes and the returned leaf is canonical.
+    fn allocate_leaf_slice_on<A: ArenaStore>(
+        arena: &mut A,
+        start: u64,
+        end: u64,
+    ) -> Result<V2RootRecord, V2AvlError> {
+        if start >= end {
+            return Err(V2AvlError::Invalid(
+                "v2 leaf slice must reference a non-empty payload range",
+            ));
+        }
+        let (payload_offset, bytes) = arena.arena_alias_payload(start, end)?;
+        let record = V2NodeRecord::leaf(payload_offset, &bytes)?;
+        let payload_len = record.logical_len();
+        Self::allocate_node_on(
+            arena,
+            ArenaNode::Leaf {
+                payload_offset,
+                payload_len,
+                record,
+            },
+        )
     }
 
     /// Allocates one bounded leaf. The record constructor enforces
