@@ -1,0 +1,59 @@
+name: frontier-point-replace
+
+on:
+  push:
+    branches:
+      - feat/frontier-flip-zero-copy
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.80'
+          components: rustfmt, clippy
+      - name: Apply point replacement fast path
+        run: python3 tools/apply_point_replace_fast_path.py
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Differential AVL test
+        run: cargo test -p tulya-core point_replace_fast_path_matches_general_splice_and_preserves_parent --locked
+      - name: Full workspace tests
+        run: cargo test --workspace --locked
+      - name: Run identical quick frontier benchmark
+        run: |
+          python3 benchmarks/frontier_flip/run.py --profile quick --output-dir /tmp/frontier-point-replace
+          python3 - <<'PY'
+          import json
+          p='/tmp/frontier-point-replace/summary.json'
+          d=json.load(open(p))
+          random=next(c for c in d['results'] if c['manifest']['topology']=='random')
+          t=random['tulya']
+          n=t['node_allocation']['per_update_fresh_node_records']
+          print(json.dumps({
+              'storage_bytes': t['storage_bytes'],
+              'storage_ratio_to_info': t['storage_ratio_to_info'],
+              'node_allocation': n,
+              'verification': t['verification'],
+          }, sort_keys=True))
+          assert t['verification']['failures'] == 0
+          assert n['mean'] < 20.0, n
+          assert t['storage_bytes'] < 3014182, t['storage_bytes']
+          PY
+      - name: Commit validated fast path
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates/tulya-core/src/persistent_sequence/avl.rs
+          git commit -m "perf: specialize persistent one-byte replacement"
+          git push origin HEAD:feat/frontier-flip-zero-copy
