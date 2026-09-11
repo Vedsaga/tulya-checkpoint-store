@@ -372,7 +372,17 @@ impl V2AvlSequence {
             let node = Self::node_for_root_on(arena, root)?;
             Self::validate_node_on(arena, &node)?;
         }
-        match Self::splice_inner_on(arena, parent, offset, delete_len, insert, &mut inspected) {
+        let edited = match parent {
+            // Point replacement is the hot path for the frontier benchmark and
+            // for fixed-width state. Avoid the general split/split/concat/concat
+            // construction: descend once, rebuild only the touched leaf and its
+            // ancestry, and preserve all untouched subtrees.
+            Some(root) if delete_len == 1 && insert.len() == 1 => {
+                Self::replace_one_byte_on(arena, root, offset, insert[0], &mut inspected)
+            }
+            _ => Self::splice_inner_on(arena, parent, offset, delete_len, insert, &mut inspected),
+        };
+        match edited {
             Ok(root) => Ok(V2SpliceResult {
                 root,
                 allocated_nodes: arena.arena_node_count() - node_start,
@@ -382,6 +392,91 @@ impl V2AvlSequence {
             Err(error) => {
                 arena.arena_truncate(payload_start, node_start);
                 Err(error)
+            }
+        }
+    }
+
+    /// Specialized fixed-length one-byte replacement. Semantics are
+    /// identical to `splice(root, offset, 1, &[byte])`, but this path performs
+    /// one descent instead of two global splits and two concatenations.
+    ///
+    /// At the touched leaf, immutable prefix/suffix ranges are aliased when
+    /// the arena supports it (the durable backend does), one fresh payload
+    /// byte is allocated, and a small local AVL subtree is built. Every branch
+    /// above it is path-copied/rebalanced; untouched siblings are shared.
+    fn replace_one_byte_on<A: ArenaStore>(
+        arena: &mut A,
+        root: V2RootRecord,
+        offset: u64,
+        byte: u8,
+        inspected: &mut usize,
+    ) -> Result<V2RootRecord, V2AvlError> {
+        if offset >= root.logical_len() {
+            return Err(V2AvlError::Invalid(
+                "v2 point replacement offset exceeds parent length",
+            ));
+        }
+        *inspected = inspected.saturating_add(1);
+        let node = Self::node_for_root_on(arena, root)?;
+        Self::validate_node_on(arena, &node)?;
+        match node {
+            ArenaNode::Leaf {
+                payload_offset,
+                payload_len,
+                ..
+            } => {
+                if offset >= payload_len {
+                    return Err(V2AvlError::Invalid(
+                        "v2 point replacement offset exceeds leaf length",
+                    ));
+                }
+                let target = payload_offset
+                    .checked_add(offset)
+                    .ok_or(V2AvlError::Overflow(
+                        "v2 point replacement payload offset exceeds u64",
+                    ))?;
+                let after_target = target.checked_add(1).ok_or(V2AvlError::Overflow(
+                    "v2 point replacement payload offset exceeds u64",
+                ))?;
+                let leaf_end =
+                    payload_offset
+                        .checked_add(payload_len)
+                        .ok_or(V2AvlError::Overflow(
+                            "v2 point replacement leaf range exceeds u64",
+                        ))?;
+
+                let left = if target == payload_offset {
+                    None
+                } else {
+                    Some(Self::allocate_leaf_slice_on(arena, payload_offset, target)?)
+                };
+                let middle = Some(Self::allocate_leaf_on(arena, &[byte])?);
+                let right = if after_target == leaf_end {
+                    None
+                } else {
+                    Some(Self::allocate_leaf_slice_on(arena, after_target, leaf_end)?)
+                };
+
+                let combined = Self::concat_optional_on(arena, left, middle, inspected)?;
+                Self::concat_optional_on(arena, combined, right, inspected)?.ok_or(
+                    V2AvlError::Invalid("v2 point replacement produced an empty leaf subtree"),
+                )
+            }
+            ArenaNode::Branch { left, right, .. } => {
+                let left_len = left.logical_len();
+                if offset < left_len {
+                    let new_left = Self::replace_one_byte_on(arena, left, offset, byte, inspected)?;
+                    Self::rebalance_on(arena, new_left, right, inspected)
+                } else {
+                    let new_right = Self::replace_one_byte_on(
+                        arena,
+                        right,
+                        offset - left_len,
+                        byte,
+                        inspected,
+                    )?;
+                    Self::rebalance_on(arena, left, new_right, inspected)
+                }
             }
         }
     }
@@ -1497,6 +1592,77 @@ mod tests {
             .verify_root(result.root())
             .expect("splice root should verify");
         result.root()
+    }
+
+    #[test]
+    fn point_replace_fast_path_matches_general_splice_and_preserves_parent() {
+        let mut base = vec![0u8; MAX_LEAF_PAYLOAD_BYTES * 4 + 17];
+        for (index, value) in base.iter_mut().enumerate() {
+            *value = u8::try_from(index % 251).unwrap();
+        }
+
+        let offsets = [
+            0usize,
+            1,
+            MAX_LEAF_PAYLOAD_BYTES - 1,
+            MAX_LEAF_PAYLOAD_BYTES,
+            MAX_LEAF_PAYLOAD_BYTES + 1,
+            base.len() / 2,
+            base.len() - 2,
+            base.len() - 1,
+        ];
+
+        for (case, offset) in offsets.into_iter().enumerate() {
+            let replacement = 251u8.wrapping_add(u8::try_from(case).unwrap());
+
+            let mut fast = V2AvlSequence::default();
+            let fast_parent = fast.splice(None, 0, 0, &base).unwrap().root();
+            let fast_result = fast
+                .splice(
+                    Some(fast_parent),
+                    u64::try_from(offset).unwrap(),
+                    1,
+                    &[replacement],
+                )
+                .expect("point replacement fast path should succeed")
+                .root();
+
+            let mut general = V2AvlSequence::default();
+            let general_parent = general.splice(None, 0, 0, &base).unwrap().root();
+            let payload_start = general.arena_payload_len();
+            let node_start = general.arena_node_count();
+            let mut inspected = 0usize;
+            let general_result = V2AvlSequence::splice_inner_on(
+                &mut general,
+                Some(general_parent),
+                u64::try_from(offset).unwrap(),
+                1,
+                &[replacement],
+                &mut inspected,
+            )
+            .expect("reference general splice should succeed");
+            assert!(general.arena_payload_len() >= payload_start);
+            assert!(general.arena_node_count() > node_start);
+
+            let fast_bytes = fast
+                .read_range(fast_result, 0, fast_result.logical_len())
+                .unwrap();
+            let general_bytes = general
+                .read_range(general_result, 0, general_result.logical_len())
+                .unwrap();
+            assert_eq!(fast_bytes, general_bytes);
+
+            let mut expected = base.clone();
+            expected[offset] = replacement;
+            assert_eq!(fast_bytes, expected);
+            assert_eq!(
+                fast.read_range(fast_parent, 0, fast_parent.logical_len())
+                    .unwrap(),
+                base
+            );
+            fast.verify_root(fast_result).unwrap();
+            general.verify_root(general_result).unwrap();
+        }
     }
 
     #[test]
