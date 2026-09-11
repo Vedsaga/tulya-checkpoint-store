@@ -9,6 +9,9 @@ use serde_json::{json, Value};
 use tulya_core::persistent_history::authority::{open_history_authority, WritableHistoryAuthority};
 use tulya_core::persistent_history::{CommitOutcome, Version};
 
+const PHYSICAL_NODE_HEADER_BYTES: u64 = 16;
+const PHYSICAL_NODE_RECORD_BYTES: u64 = 72;
+
 #[derive(Parser, Debug)]
 #[command(name = "frontier-flip-tulya")]
 struct Args {
@@ -214,6 +217,58 @@ fn directory_storage_breakdown(root: &Path) -> Result<Value, Box<dyn Error>> {
     }))
 }
 
+fn physical_node_file_bytes(root: &Path) -> Result<u64, Box<dyn Error>> {
+    let mut total = 0u64;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("content-") && name.ends_with(".nodes") {
+            total = total
+                .checked_add(metadata.len())
+                .ok_or("node file byte count overflow")?;
+        }
+    }
+    Ok(total)
+}
+
+fn physical_node_record_count(bytes: u64) -> Result<u64, Box<dyn Error>> {
+    if bytes < PHYSICAL_NODE_HEADER_BYTES {
+        return Err("physical node file is shorter than its header".into());
+    }
+    let body = bytes - PHYSICAL_NODE_HEADER_BYTES;
+    if body % PHYSICAL_NODE_RECORD_BYTES != 0 {
+        return Err("physical node file body is not record aligned".into());
+    }
+    Ok(body / PHYSICAL_NODE_RECORD_BYTES)
+}
+
+fn node_allocation_json(values: &[u64]) -> Value {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let percentile = |percent: usize| -> u64 {
+        if sorted.is_empty() {
+            return 0;
+        }
+        sorted[(sorted.len() - 1) * percent / 100]
+    };
+    let total: u64 = values.iter().copied().sum();
+    json!({
+        "count": values.len(),
+        "total": total,
+        "mean": if values.is_empty() { 0.0 } else { total as f64 / values.len() as f64 },
+        "min": sorted.first().copied().unwrap_or(0),
+        "p50": percentile(50),
+        "p95": percentile(95),
+        "p99": percentile(99),
+        "max": sorted.last().copied().unwrap_or(0),
+    })
+}
+
 fn expected_bit(base: &[u8], ops: &[FlipOp], mut version: u64, bit: u64) -> u8 {
     let byte = base[(bit / 8) as usize];
     let mut value = (byte >> (bit % 8)) & 1;
@@ -274,10 +329,15 @@ fn run(args: &Args) -> Result<Value, Box<dyn Error>> {
         return Err("fresh Tulya history did not assign root version id 0".into());
     }
 
+    let initial_node_file_bytes = physical_node_file_bytes(&args.db)?;
+    let initial_node_records = physical_node_record_count(initial_node_file_bytes)?;
+    let mut previous_node_records = initial_node_records;
+
     let mut versions = Vec::with_capacity(ops.len() + 1);
     versions.push(root);
     let mut update_latencies = Vec::with_capacity(ops.len());
     let mut parent_read_latencies = Vec::with_capacity(ops.len());
+    let mut fresh_node_records_per_update = Vec::with_capacity(ops.len());
 
     for op in &ops {
         let parent = versions
@@ -318,6 +378,26 @@ fn run(args: &Args) -> Result<Value, Box<dyn Error>> {
             .into());
         }
         versions.push(child);
+
+        // Measure after the timed splice so filesystem metadata inspection does
+        // not contaminate update latency. Physical nodes are append-only.
+        let node_file_bytes = physical_node_file_bytes(&args.db)?;
+        let node_records = physical_node_record_count(node_file_bytes)?;
+        let fresh = node_records
+            .checked_sub(previous_node_records)
+            .ok_or("physical node record count regressed during append-only updates")?;
+        fresh_node_records_per_update.push(fresh);
+        previous_node_records = node_records;
+    }
+
+    let final_node_file_bytes = physical_node_file_bytes(&args.db)?;
+    let final_node_records = physical_node_record_count(final_node_file_bytes)?;
+    let fresh_node_records_total = final_node_records
+        .checked_sub(initial_node_records)
+        .ok_or("final physical node count is below the initial tree")?;
+    let observed_fresh_total: u64 = fresh_node_records_per_update.iter().copied().sum();
+    if observed_fresh_total != fresh_node_records_total {
+        return Err("per-update node allocation accounting does not sum to final growth".into());
     }
 
     let pre_seal_storage = directory_storage_breakdown(&args.db)?;
@@ -381,6 +461,17 @@ fn run(args: &Args) -> Result<Value, Box<dyn Error>> {
             "post_seal_file_bytes": post_seal_file_bytes,
             "pre_seal_breakdown": pre_seal_storage,
             "post_seal_breakdown": post_seal_storage,
+        },
+        "node_allocation": {
+            "record_size_bytes": PHYSICAL_NODE_RECORD_BYTES,
+            "file_header_bytes": PHYSICAL_NODE_HEADER_BYTES,
+            "initial_node_file_bytes": initial_node_file_bytes,
+            "initial_node_records": initial_node_records,
+            "final_node_file_bytes": final_node_file_bytes,
+            "final_node_records": final_node_records,
+            "fresh_node_records_total": fresh_node_records_total,
+            "fresh_node_bytes_total": fresh_node_records_total * PHYSICAL_NODE_RECORD_BYTES,
+            "per_update_fresh_node_records": node_allocation_json(&fresh_node_records_per_update),
         },
         "latency": {
             "open_ns": open_ns,
