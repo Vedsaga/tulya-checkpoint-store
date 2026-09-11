@@ -1,5 +1,4 @@
 diff --git a/crates/tulya-core/src/persistent_sequence/avl.rs b/crates/tulya-core/src/persistent_sequence/avl.rs
-index ccf4197..0000000 100644
 --- a/crates/tulya-core/src/persistent_sequence/avl.rs
 +++ b/crates/tulya-core/src/persistent_sequence/avl.rs
 @@ -155,6 +155,18 @@ pub(super) trait ArenaStore {
@@ -76,8 +75,7 @@ index ccf4197..0000000 100644
      /// Allocates one bounded leaf. The record constructor enforces
      /// non-emptiness and the staging payload bound.
      fn allocate_leaf_on<A: ArenaStore>(
- diff --git a/crates/tulya-core/src/persistent_sequence/physical.rs b/crates/tulya-core/src/persistent_sequence/physical.rs
-index 9376825..0000000 100644
+diff --git a/crates/tulya-core/src/persistent_sequence/physical.rs b/crates/tulya-core/src/persistent_sequence/physical.rs
 --- a/crates/tulya-core/src/persistent_sequence/physical.rs
 +++ b/crates/tulya-core/src/persistent_sequence/physical.rs
 @@ -1117,6 +1117,12 @@ impl ArenaStore for PhysicalContentStore {
@@ -143,9 +141,6 @@ index 9376825..0000000 100644
 +/// references an old committed node or an earlier fresh node, every record
 +/// decodes canonically, the result root resolves, and its length and
 +/// commitment match the prepared semantic result. No file mutation occurs.
-@@ -1585,8 +1593,8 @@ fn validate_fresh_delta(
- ) -> Result<(), V2AvlError> {
-     use super::image_v2::{v2_node_fields, V2NodeFields};
 @@ -1610,33 +1618,49 @@ fn validate_fresh_delta(
              V2NodeFields::Leaf {
                  payload_offset,
@@ -206,8 +201,7 @@ index 9376825..0000000 100644
                  if expected != record {
                      return Err(V2AvlError::Invalid(
                          "history physical delta leaf verification failed",
- diff --git a/crates/tulya-core/src/persistent_sequence/compaction_v2.rs b/crates/tulya-core/src/persistent_sequence/compaction_v2.rs
-index 5b10233..0000000 100644
+diff --git a/crates/tulya-core/src/persistent_sequence/compaction_v2.rs b/crates/tulya-core/src/persistent_sequence/compaction_v2.rs
 --- a/crates/tulya-core/src/persistent_sequence/compaction_v2.rs
 +++ b/crates/tulya-core/src/persistent_sequence/compaction_v2.rs
 @@ -79,10 +79,10 @@ impl From<V2BackendError> for V2CompactionError {
