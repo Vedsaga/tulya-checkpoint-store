@@ -30,6 +30,8 @@ jobs:
       - run: cargo run --release --locked --example branch_forest_tulya -- --db /tmp/tulya-branch-forest-ci --corpus tests/fixtures/branch-forest/tiny.jsonl
       - run: cargo run --release --locked --example branch_forest_sqlite -- --db /tmp/sqlite-branch-forest-ci --corpus tests/fixtures/branch-forest/tiny.jsonl
       - run: python3 benchmarks/branch_forest/crash_demo.py --corpus tests/fixtures/branch-forest/tiny.jsonl --output-dir /tmp/tulya-branch-forest-crash-ci
+      - run: python3 -m py_compile benchmarks/frontier_flip/*.py
+      - run: python3 benchmarks/frontier_flip/run.py --profile smoke --output-dir /tmp/tulya-frontier-flip-smoke
       - run: cargo package -p tulya-core --locked
 
   langgraph:
