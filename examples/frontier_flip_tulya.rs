@@ -196,7 +196,9 @@ fn run(args: &Args) -> Result<Value, Box<dyn Error>> {
 
         let read_started = Instant::now();
         let mut current = Vec::with_capacity(1);
-        authority.store().read(parent, byte_offset, 1, &mut current)?;
+        authority
+            .store()
+            .read(parent, byte_offset, 1, &mut current)?;
         parent_read_latencies.push(read_started.elapsed().as_nanos());
         if current.len() != 1 {
             return Err("Tulya parent-byte read returned the wrong length".into());
