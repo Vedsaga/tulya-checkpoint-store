@@ -429,6 +429,14 @@ def run_tulya(binary: Path, case_dir: Path, base_path: Path, history_path: Path,
     storage = int(result["storage"]["post_seal_file_bytes"])
     result["storage_bytes"] = storage
     result["storage_ratio_to_info"] = ratio(storage, info_bits)
+    base_bytes = int(result["base_bytes"])
+    history_info_bits = info_bits - int(result["base_bits"])
+    result["storage_bytes_above_base"] = storage - base_bytes
+    result["history_information_bits"] = history_info_bits
+    result["history_information_bytes_ceiling"] = (history_info_bits + 7) // 8
+    result["storage_above_base_ratio_to_history_info"] = (
+        ratio(storage - base_bytes, history_info_bits) if history_info_bits else 0.0
+    )
     result["command"] = command
     return result
 
@@ -448,6 +456,9 @@ def case_manifest(base_bytes: int, updates: int, topology: str, seed: int, base_
         "base_sha256": base_sha256,
         "lean_arbitrary_parent_family_info_bits": theorem_bits,
         "topology_family_info_bits": topology_bits,
+        "base_information_bits": n_bits,
+        "history_information_bits": topology_bits - n_bits,
+        "history_information_bytes_ceiling": (topology_bits - n_bits + 7) // 8,
         "headline_ratio_is_lean_theorem_backed": topology == "random",
         "lean_count": "2^n * m! * n^m",
         "fixed_parent_count": "2^n * n^m",
