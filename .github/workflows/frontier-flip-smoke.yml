@@ -1,0 +1,44 @@
+name: frontier-flip-smoke
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: frontier-flip-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.80'
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --features local-server --locked -- -D warnings
+      - run: python3 -m py_compile benchmarks/frontier_flip/*.py
+      - run: python3 benchmarks/frontier_flip/run.py --profile smoke --output-dir /tmp/tulya-frontier-flip-smoke
+      - run: python3 - <<'PY'
+          import json
+          from pathlib import Path
+          result = json.loads(Path('/tmp/tulya-frontier-flip-smoke/summary.json').read_text())
+          assert result['benchmark'] == 'TULYA_FRONTIER_FLIP_V1'
+          assert result['case_count'] == 1
+          case = result['results'][0]
+          assert case['manifest']['topology'] == 'random'
+          assert case['manifest']['headline_ratio_is_lean_theorem_backed'] is True
+          assert case['tulya']['exact'] is True
+          cow = next(x for x in case['baselines'] if x['backend'] == 'chunked-cow-tree-4k')
+          assert cow['exact'] is True
+          print(json.dumps({
+              'tulya_storage_ratio': case['tulya']['storage_ratio_to_info'],
+              'cow_storage_ratio': cow['storage_ratio_to_info'],
+              'tulya_storage_bytes': case['tulya']['storage_bytes'],
+          }, indent=2))
+          PY
