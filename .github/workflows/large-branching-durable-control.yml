@@ -1,0 +1,57 @@
+name: large-branching-durable-control
+
+on:
+  push:
+    branches:
+      - feat/frontier-flip-zero-copy
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.80'
+          components: rustfmt, clippy
+      - name: Python syntax
+        run: |
+          python3 -m py_compile benchmarks/large_branching_state/run.py
+          python3 -m py_compile benchmarks/large_branching_state/durable_compare.py
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy Tulya benchmark example
+        run: cargo clippy --example large_branching_state_tulya --locked -- -D warnings
+      - name: Durable control smoke
+        run: |
+          python3 benchmarks/large_branching_state/durable_compare.py \
+            --base-bytes 16777216 \
+            --edit-bytes 40960 \
+            --updates 64 \
+            --topology random \
+            --seed 1 \
+            --output-dir /tmp/large-branching-durable \
+            --cleanup-heavy
+          python3 - <<'PY'
+          import json
+          p='/tmp/large-branching-durable/summary.json'
+          d=json.load(open(p))
+          r=d['results'][0]
+          assert r['durable_cow']['verification_failures'] == 0, r['durable_cow']
+          assert r['tulya']['verification']['failures'] == 0, r['tulya']['verification']
+          assert r['durable_cow']['storage_bytes'] > 0
+          assert r['tulya']['storage_bytes'] > 0
+          assert r['durable_cow']['update_replace_durable']['count'] == 64
+          assert r['tulya']['latency']['update_splice']['count'] == 64
+          print(json.dumps({
+            'durable_cow_storage': r['durable_cow']['storage_bytes'],
+            'durable_cow_update_p50_ns': r['durable_cow']['update_replace_durable']['p50_ns'],
+            'tulya_storage': r['tulya']['storage_bytes'],
+            'tulya_update_p50_ns': r['tulya']['latency']['update_splice']['p50_ns'],
+            'comparison': r['comparison'],
+          }, sort_keys=True))
+          PY
