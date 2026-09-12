@@ -6,18 +6,26 @@ on:
       - feat/frontier-flip-zero-copy
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   smoke:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: '1.80'
           components: rustfmt, clippy
       - name: Python syntax
         run: python3 -m py_compile benchmarks/large_branching_state/run.py
-      - name: Format
+      - name: Format source
+        run: cargo fmt --all
+      - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy example
         run: cargo clippy --example large_branching_state_tulya --locked -- -D warnings
@@ -49,3 +57,13 @@ jobs:
             'tulya_nodes_per_update': r['tulya']['node_allocation']['per_update_fresh_node_records'],
           }, sort_keys=True))
           PY
+      - name: Commit formatted benchmark source
+        run: |
+          if git diff --quiet -- examples/large_branching_state_tulya.rs; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add examples/large_branching_state_tulya.rs
+          git commit -m "style: rustfmt large branching benchmark"
+          git push origin HEAD:feat/frontier-flip-zero-copy
