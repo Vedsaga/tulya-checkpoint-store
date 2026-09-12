@@ -18,13 +18,19 @@ jobs:
         run: |
           python3 benchmarks/real_agent_trace/scout_orchard_prefix.py \
             --output-dir /tmp/orchard-prefix \
-            --target-instances 2 \
-            --page-length 10 \
-            --max-rows 100
+            --target-instances 8 \
+            --page-length 20 \
+            --max-rows 500
           python3 - <<'PY'
           import json
           d=json.load(open('/tmp/orchard-prefix/summary.json'))
-          assert d['instances_analyzed'] >= 1, d
-          print(json.dumps(d['aggregate'], sort_keys=True))
-          print(json.dumps(d['instances'][:2], sort_keys=True))
+          assert d['instances_analyzed'] >= 8, d
+          print(json.dumps({
+            'rows_fetched': d['rows_fetched'],
+            'unique_instances_seen': d['unique_instances_seen'],
+            'instances_with_multiple_rollouts_seen': d['instances_with_multiple_rollouts_seen'],
+            'instances_analyzed': d['instances_analyzed'],
+            'aggregate': d['aggregate'],
+          }, sort_keys=True))
+          print(json.dumps(d['instances'], sort_keys=True))
           PY
