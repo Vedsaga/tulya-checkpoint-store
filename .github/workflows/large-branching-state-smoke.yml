@@ -1,0 +1,51 @@
+name: large-branching-state-smoke
+
+on:
+  push:
+    branches:
+      - feat/frontier-flip-zero-copy
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.80'
+          components: rustfmt, clippy
+      - name: Python syntax
+        run: python3 -m py_compile benchmarks/large_branching_state/run.py
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy example
+        run: cargo clippy --example large_branching_state_tulya --locked -- -D warnings
+      - name: Benchmark smoke
+        run: |
+          python3 benchmarks/large_branching_state/run.py \
+            --base-bytes 16777216 \
+            --edit-bytes 40960 \
+            --updates 64 \
+            --topology random \
+            --seed 1 \
+            --output-dir /tmp/large-branching-state-smoke \
+            --cleanup-heavy
+          python3 - <<'PY'
+          import json
+          p='/tmp/large-branching-state-smoke/summary.json'
+          d=json.load(open(p))
+          r=d['results'][0]
+          assert r['tulya']['verification']['failures'] == 0, r['tulya']['verification']
+          cow=next(x for x in r['baselines'] if x['backend']=='chunked-cow-tree-4k')
+          assert cow['verification_failures'] == 0, cow
+          assert r['tulya']['storage_bytes'] > 0
+          assert r['manifest']['changed_payload_floor_bytes'] == 16777216 + 64*40960
+          print(json.dumps({
+            'tulya_storage_bytes': r['tulya']['storage_bytes'],
+            'tulya_ratio': r['tulya']['storage_ratio_to_changed_payload_floor'],
+            'cow_storage_bytes': cow['storage_bytes'],
+            'cow_ratio': cow['storage_ratio_to_changed_payload_floor'],
+            'tulya_nodes_per_update': r['tulya']['node_allocation']['per_update_fresh_node_records'],
+          }, sort_keys=True))
+          PY
