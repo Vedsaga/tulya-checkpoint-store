@@ -1,0 +1,30 @@
+name: orchard-prefix-scout
+on:
+  push:
+    branches: [feat/frontier-flip-zero-copy]
+    paths:
+      - 'benchmarks/real_agent_trace/scout_orchard_prefix.py'
+      - '.github/workflows/orchard-prefix-scout.yml'
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax
+        run: python3 -m py_compile benchmarks/real_agent_trace/scout_orchard_prefix.py
+      - name: Live Orchard scout
+        run: |
+          python3 benchmarks/real_agent_trace/scout_orchard_prefix.py \
+            --output-dir /tmp/orchard-prefix \
+            --target-instances 2 \
+            --page-length 10 \
+            --max-rows 100
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/orchard-prefix/summary.json'))
+          assert d['instances_analyzed'] >= 1, d
+          print(json.dumps(d['aggregate'], sort_keys=True))
+          print(json.dumps(d['instances'][:2], sort_keys=True))
+          PY
